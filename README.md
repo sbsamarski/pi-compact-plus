@@ -25,7 +25,7 @@ Pi clones this repository and discovers the extension automatically (the `pi-pac
 this repo). Updates reconcile with `pi update --extensions`.
 
 **The manual way:** download **[pi-compact-plus.ts](./pi-compact-plus.ts)** into your pi extensions
-folder — Windows: `%USERPROFILE%\.pigent\extensions\`, Linux and macOS: `~/.pi/agent/extensions/` —
+folder — Windows: `%USERPROFILE%\.pi\agent\extensions\`, Linux and macOS: `~/.pi/agent/extensions/` —
 then start pi (or run `/reload`), and run `/compact-plus` to add the models that should write your
 summaries, best one first.
 
