@@ -4787,8 +4787,16 @@ function watcherTick(): void {
 	}
 }
 
-const watcherTimer = setInterval(watcherTick, WATCHER_INTERVAL_MS);
-(watcherTimer as unknown as { unref?: () => void })?.unref?.();
+let watcherTimer: ReturnType<typeof setInterval> | undefined;
+
+/** pi's docs: do not start timers in the factory, because some invocations load extensions without
+ *  a session (print mode, one-shot tries). Start the watcher lazily on the first live request
+ *  instead of at module load. */
+function ensureWatcherTimer(): void {
+	if (watcherTimer) return;
+	watcherTimer = setInterval(watcherTick, WATCHER_INTERVAL_MS);
+	(watcherTimer as unknown as { unref?: () => void })?.unref?.();
+}
 
 export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	// ELISION: rule-based stubbing of old tool results in every live request (see applyElision).
@@ -4797,6 +4805,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	// freshest extension ctx for the auto-compact watcher above.
 	pi.on("context", (event: any, ctx: any) => {
 		watcherCtx = ctx;
+		ensureWatcherTimer();
 		return applyElision(event.messages, ctx);
 	});
 
