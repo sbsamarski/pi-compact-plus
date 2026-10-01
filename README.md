@@ -124,45 +124,70 @@ for every one.
 
 ## Per-model settings
 
-Every model in your compaction list gets its own profile. Enter on a selected model in the board
-opens the full screen; here is what each setting means and why it is there.
+Every model on your compaction list gets its own profile. Enter on a selected model in the board
+to open its screen. Each setting, in plain words:
 
-- **Thinking level** — off, minimal, low, medium, high, xhigh, or max, wherever the model supports
-  it. Thinking consumes generation tokens, so the extension reserves extra room for it automatically
-  (from 4,096 tokens at minimal up to 20,480 at max) — a thinking model gets a bigger generation
-  permission for the same summary.
-- **Timeout** — any number of minutes per attempt. When it expires, the try is abandoned and the
-  next model on the list is asked. The default of ten minutes suits fast models; a local model
-  writing 10–20 tokens a second needs 11–22 minutes for a 13,000-token summary, so set it honestly
-  per machine.
-- **Summary aim (% of the folded region)** — the heart of the sizing. The aim is this percentage of
-  the material actually being folded *after elision*, so a 300k region at 10% aims for a 30,000-token
-  summary while a 30k region aims for 3,000 — the summary scales with the work, not with the window.
-  The **floor** (default 4,096) and **ceiling** (default 32,768) clamp the aim for very small and
-  very large regions. From the aim the extension derives the acceptance range: at least a quarter of
-  the aim, at most 125% of it.
-- **Draft mode** — off, mini, or full. A full draft asks the model to write a hidden analysis inside
-  the same request, *before* the summary, then strips it from the stored text. It costs output
-  tokens but organizes long summaries remarkably well — the model reads everything once in draft
-  form and writes the final text with a plan. Online models default to full; local ones to off.
-- **Tool stubs in input** — whether this model's input arrives with old tool results stubbed (on)
-  or raw (off). Off only makes sense for models with a very large window and nothing better to do.
-- **Tool-call arg cap** — whole files ride inside write and edit arguments, and a few of those can
-  eat a summarizer's attention. This caps each argument value in the summarizer's input (default
-  500 characters), keeping the beginning plus a marker. Set it to "full" for no capping.
-- **The four preserve levels** — tool calls, user prompts, assistant replies, assistant thinking:
-  each with its own verbatim / detailed / summary / brief setting. Because they are per model, a
-  fast cheap model can do brief summaries while your strongest model handles everything verbatim.
-- **Chain mode** — what this model does with the previous summary (the three modes below).
-- **No-think tag** — for local models switched by a marker in the prompt (a Qwen-style template's
-  think-off marker, for example): when thinking is off, the marker is appended so the model really
-  does not think.
-- **Sampling flags** — temperature, top-p, top-k, min-p, presence and repetition penalties, applied
-  to the compaction call only (your chat requests are never touched). Each can be set or "ignore"
-  (send nothing, let the server default apply), and there are built-in presets for Qwen-style
-  non-thinking models.
-- **Preview** — assembles the complete description this exact model would receive, with all of its
-  settings substituted into the template, opened read-only. Look before you compact.
+#### Thinking level
+
+Can be off, minimal, low, medium, high, xhigh, or max, wherever a model supports it. Thinking makes
+a model more careful but slower, and it eats into the space the summary needs — so the extension
+quietly reserves extra room for it: a little at low, more at max.
+
+#### Timeout
+
+How many minutes one attempt may take — any number you like. When time runs out, that model is
+skipped and the next one is asked. Fast online models are fine with ten minutes; a slow local
+machine writing a long summary may honestly need twenty or more.
+
+#### Summary aim (% of the folded region)
+
+How long the summary should be, as a share of the material being folded *after* the stubbing. A
+300k-token region at 10% aims for a 30k summary; a 30k region aims for 3k — the summary scales with
+the work, not with the window. The **floor** (4,096) and **ceiling** (32,768) keep tiny and huge
+regions sensible.
+
+#### Draft mode
+
+Off, mini, or full. With a full draft, the model first writes a hidden analysis of the material in
+the same request, then writes the final summary with that plan in mind — and the analysis itself is
+thrown away. It costs a little extra time, but long summaries come out noticeably better organized.
+Online models default to full; local ones to off.
+
+#### Tool stubs in input
+
+Whether this model sees old tool results in their slimmed-down stub form (on) or in full (off). Off
+only makes sense for a huge-window model with room to spare.
+
+#### Tool-call arg cap
+
+When a tool call carries a whole file inside its arguments, that file can eat the summarizer's
+attention. This trims each argument value to a set number of characters (default 500), keeping the
+beginning plus a marker. Set it to "full" for no trimming.
+
+#### The four preserve levels
+
+Tool calls, user prompts, assistant replies, assistant thinking — each with its own
+verbatim / detailed / summary / brief choice. Because this is per model, a cheap fast model can do
+brief summaries while your best model keeps everything word for word.
+
+#### Chain mode
+
+What this model does with the previous summary — the three modes are described just below.
+
+#### No-think tag
+
+Some local models switch their thinking off when they see a special marker in the prompt. When
+thinking is off, the extension appends that marker so the model truly stays quiet.
+
+#### Sampling flags
+
+Temperature and friends, applied only to the compaction call — your normal chats are never
+touched. Each flag can be given a value or left at "ignore" (the server's default applies).
+
+#### Preview
+
+Shows the complete instructions this exact model would receive, with all of the above filled in.
+Read-only — a look before you compact.
 
 ## Chaining compactions
 
