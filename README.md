@@ -217,8 +217,16 @@ The clamps matter on small windows. On a 130k local model, 18% and 20% land at 2
 tokens — sensible numbers, barely touched by the clamps. On a 1M online model they would be 180,000
 and 200,000, where the clamps bring them down to 80,000 and 100,000 — still generous, no longer
 absurd. Switch models mid-session — pause, change, continue — and every value recomputes from the
-new window immediately, with no reload. If the window is unknown, pi's classic 16,384 / 20,000 are
-used as safe fallbacks.
+new window immediately, with no reload. If the window is unknown, pi's classic 16,384 / 20,000
+figures are used as safe fallbacks.
+
+Two things are worth knowing here. First, **the extension ignores pi's own `reserveTokens` and
+`keepRecentTokens` settings completely** — it never reads them, so changing those numbers in pi's
+own settings has no effect while this extension is running. Its thresholds live entirely in this
+extension's own settings, and because the configuration is read fresh on every event, you can
+change them on the fly without any `/reload`. Second, those two percentages do not change how *big*
+the summaries are — that is the summary aim on each model, which measures the folded material
+itself, not the window.
 
 One more number belongs here: the **generation cap** on chat requests (default 65,536 tokens, set
 it to anything, 0 disables). Pi asks providers for an output permission of *window minus its
