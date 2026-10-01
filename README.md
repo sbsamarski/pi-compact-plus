@@ -167,12 +167,15 @@ beginning plus a marker. Set it to "full" for no trimming.
 #### The four preserve levels
 
 Tool calls, user prompts, assistant replies, assistant thinking — each with its own
-verbatim / detailed / summary / brief choice. Because this is per model, a cheap fast model can do
-brief summaries while your best model keeps everything word for word.
+verbatim / detailed / summary / brief choice. Because this is per model, a slow small model can do
+brief summaries while a fast big one keeps everything word for word, or anything in between.
 
 #### Chain mode
 
-What this model does with the previous summary — the three modes are described just below.
+When this model compacts, there is usually an older summary already in the session. This decides
+what happens to it: **fold** carries it forward (compact, slightly lossy), **attach** copies it
+word for word into the new summary so nothing is ever lost, **skip** drops it. All three are
+described in their own section below.
 
 #### No-think tag
 
