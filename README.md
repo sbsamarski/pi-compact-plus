@@ -33,12 +33,9 @@ file on first use and reads it live, so every change in its menus applies immedi
 
 ## What happens when your context fills
 
-1. **Old tool results collapse.** The biggest dead weight in a long session is raw tool output.
-   Once the context crosses a threshold you set, the oldest tool results are replaced with short
-   stubs that keep the command, the size, and the last lines of the output:
-   `[bash "bun test" - output elided: 203 lines / 13,238 chars - tail: "Command exited with code 1"]`
-   Crucially, this happens **only on the wire** — the request the model receives is slimmed down,
-   while your session file and your screen keep the originals. Nothing on disk is ever modified.
+1. **Old tool results collapse (elision).** Before each request, the oldest tool results are
+   replaced with short stubs — **only on the wire**; your session file and your screen keep the
+   originals. There is a whole section about this below, because it is the workhorse.
 2. **A watcher triggers compaction early.** While pi is idle, the context is checked every few
    seconds; near the danger line the extension compacts on its own, before providers start
    rejecting. Plain `/compact` goes through this extension too.
@@ -56,6 +53,49 @@ file on first use and reads it live, so every change in its menus applies immedi
    model *carries*, never what you *keep*.
 
 ---
+
+## Tool-call elision: keep the context low, much longer
+
+This is the quiet workhorse of the extension, and it deserves its own section. In a long session
+the single heaviest thing in your context is usually not your conversation — it is the raw output
+of tool calls made hours ago: file listings, test runs, whole documents you read once and never
+opened again. Left alone, that dead weight pushes your context toward the compaction trigger while
+adding nothing to the model's understanding of the present.
+
+Elision fixes this continuously and invisibly. Once your context crosses the starting percentage,
+every request gets its old tool results replaced by stubs that keep the essential three things —
+the command that ran, the size of the output, and the last few hundred characters:
+
+```
+[Tool result]: [read "src/main.ts" - output elided: 464 lines / 22,459 chars - tail: "..."]
+```
+
+The effect compounds. Instead of watching the context climb steadily toward the trigger line, you
+watch it get pulled back down every time dead weight accumulates — the same session keeps running
+for hours longer before a compaction is even needed, your history survives intact for much longer,
+and the model works from a smaller, sharper context the whole time. On a real 1M-token session this
+alone was the difference between compacting every couple of hours and barely compacting at all.
+
+And again, the safety rule that makes all of this comfortable: **stubs live only on the wire.**
+Your screen always shows the full originals, your session file is never modified, and if you exit
+and resume, everything is still there. Run `/compact-plus preview` any time to see the stubbed
+request exactly as the model would receive it.
+
+The settings, all reachable in the board's elision area and through `/compact-plus elision`:
+
+| Setting | What it does |
+|---|---|
+| **Start (%)** | the context-filling percentage where stubbing begins (default 20% of the window). Below it, nothing is touched. |
+| **Stub tail (chars)** | how much of each result's ending survives inside the stub (default 300 characters — usually where the outcome lives). |
+| **Protect (tokens)** | a protected window counted back from the newest message: tool results inside it are never stubbed, so the recent work stays fully intact. |
+| **Min batch results** | stubbing waits until at least this many results qualify (default 4) — no busywork for one lonely old test run. |
+| **Min batch savings** | a batch is only taken if it actually saves at least this many tokens (default 2,000). |
+| **Stop gap (tokens)** | stubbing refuses to push the wire size closer than this to the reserve line — it can never over-trim toward the danger zone. |
+
+A stub, once written, stays stubbed: the sweep does not churn. As the session grows and new tool
+results age past the protected window, later sweeps pick them up. The result is a steady state:
+the context hovers well below where it would naturally be, and compaction happens when *you* have
+accumulated enough genuine history to be worth summarizing — not because old logs crowded it out.
 
 ## The summary is a ledger, not a paragraph
 
@@ -84,10 +124,45 @@ for every one.
 
 ## Per-model settings
 
-Thinking level · timeout · summary aim (% of the folded region) · draft mode · stub and argument
-caps · the four preserve levels · chain mode · a no-think tag for local models · sampling flags —
-plus a **preview** that assembles the exact description that model would receive. Your own eyes
-before anything is sent.
+Every model in your compaction list gets its own profile. Enter on a selected model in the board
+opens the full screen; here is what each setting means and why it is there.
+
+- **Thinking level** — off, minimal, low, medium, high, xhigh, or max, wherever the model supports
+  it. Thinking consumes generation tokens, so the extension reserves extra room for it automatically
+  (from 4,096 tokens at minimal up to 20,480 at max) — a thinking model gets a bigger generation
+  permission for the same summary.
+- **Timeout** — any number of minutes per attempt. When it expires, the try is abandoned and the
+  next model on the list is asked. The default of ten minutes suits fast models; a local model
+  writing 10–20 tokens a second needs 11–22 minutes for a 13,000-token summary, so set it honestly
+  per machine.
+- **Summary aim (% of the folded region)** — the heart of the sizing. The aim is this percentage of
+  the material actually being folded *after elision*, so a 300k region at 10% aims for a 30,000-token
+  summary while a 30k region aims for 3,000 — the summary scales with the work, not with the window.
+  The **floor** (default 4,096) and **ceiling** (default 32,768) clamp the aim for very small and
+  very large regions. From the aim the extension derives the acceptance range: at least a quarter of
+  the aim, at most 125% of it.
+- **Draft mode** — off, mini, or full. A full draft asks the model to write a hidden analysis inside
+  the same request, *before* the summary, then strips it from the stored text. It costs output
+  tokens but organizes long summaries remarkably well — the model reads everything once in draft
+  form and writes the final text with a plan. Online models default to full; local ones to off.
+- **Tool stubs in input** — whether this model's input arrives with old tool results stubbed (on)
+  or raw (off). Off only makes sense for models with a very large window and nothing better to do.
+- **Tool-call arg cap** — whole files ride inside write and edit arguments, and a few of those can
+  eat a summarizer's attention. This caps each argument value in the summarizer's input (default
+  500 characters), keeping the beginning plus a marker. Set it to "full" for no capping.
+- **The four preserve levels** — tool calls, user prompts, assistant replies, assistant thinking:
+  each with its own verbatim / detailed / summary / brief setting. Because they are per model, a
+  fast cheap model can do brief summaries while your strongest model handles everything verbatim.
+- **Chain mode** — what this model does with the previous summary (the three modes below).
+- **No-think tag** — for local models switched by a marker in the prompt (a Qwen-style template's
+  think-off marker, for example): when thinking is off, the marker is appended so the model really
+  does not think.
+- **Sampling flags** — temperature, top-p, top-k, min-p, presence and repetition penalties, applied
+  to the compaction call only (your chat requests are never touched). Each can be set or "ignore"
+  (send nothing, let the server default apply), and there are built-in presets for Qwen-style
+  non-thinking models.
+- **Preview** — assembles the complete description this exact model would receive, with all of its
+  settings substituted into the template, opened read-only. Look before you compact.
 
 ## Chaining compactions
 
@@ -98,10 +173,33 @@ before anything is sent.
 
 ## Percentages, not magic numbers
 
-Reserve, keep-recent, elision thresholds — all percentages of the current window with clamps, so
-switching from a 95k local model to a 1M online model adapts everything on the spot. A generation
-cap on chat requests (default 65,536 tokens) keeps requests inside permissions providers actually
-honor — the overflow class that used to force emergency compactions is gone.
+Pi's built-in compaction numbers are absolute token counts — a reserve of 16,384 and a keep-recent
+of 20,000 — which were sized for small windows and quietly become wrong everywhere else. This
+extension computes every threshold from the current model's context window, as a percentage with
+minimum and maximum clamps:
+
+| Threshold | Default | Clamps | What it controls |
+|---|---|---|---|
+| **Reserve** | 18% of the window | 12,288 – 80,000 tokens | the room kept free at the top; the auto-compaction trigger fires when the context reaches *window − reserve*. |
+| **Keep recent** | 20% of the window | 16,384 – 100,000 tokens | the newest exchange kept verbatim outside the summary, so resuming feels continuous. |
+| **Elision start** | 20% of the window | — | where stubbing begins (see the elision section). |
+| **Elision stop gap** | 4,000 tokens | — | the safety distance from the reserve line that stubbing will not cross. |
+
+The clamps matter on small windows. On a 130k local model, 18% and 20% land at 23,400 and 26,000
+tokens — sensible numbers, barely touched by the clamps. On a 1M online model they would be 180,000
+and 200,000, where the clamps bring them down to 80,000 and 100,000 — still generous, no longer
+absurd. Switch models mid-session — pause, change, continue — and every value recomputes from the
+new window immediately, with no reload. If the window is unknown, pi's classic 16,384 / 20,000 are
+used as safe fallbacks.
+
+One more number belongs here: the **generation cap** on chat requests (default 65,536 tokens, set
+it to anything, 0 disables). Pi asks providers for an output permission of *window minus its
+estimate minus a small margin* — on a 1M-window model that can mean requesting nearly a million
+output tokens, and the provider rejects the whole request the moment its own count is slightly
+higher than pi's estimate. That exact failure forced the emergency compactions this extension was
+born from. With the cap, chat requests always fit until the real context reaches *window − cap* —
+the auto-compact trigger (window − reserve) sits comfortably below that line, so compaction wins
+the race by design.
 
 ---
 
