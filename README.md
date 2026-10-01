@@ -15,15 +15,19 @@ your choices: which model writes the summary, how much detail it keeps, and what
 
 ## Install
 
-1. Download **[pi-compact-plus.ts](./pi-compact-plus.ts)** into your pi extensions folder:
+**The one-command way** — from your terminal:
 
-   | OS | Folder |
-   |---|---|
-   | Windows | `%USERPROFILE%\.pi\agent\extensions\` |
-   | Linux / macOS | `~/.pi/agent/extensions/` |
+```bash
+pi install git:github.com/sbsamarski/pi-compact-plus
+```
 
-2. Start pi (or run `/reload`).
-3. Run `/compact-plus` and add the models that should write your summaries, best one first.
+Pi clones this repository and discovers the extension automatically (the `pi-package` manifest in
+this repo). Updates reconcile with `pi update --extensions`.
+
+**The manual way:** download **[pi-compact-plus.ts](./pi-compact-plus.ts)** into your pi extensions
+folder — Windows: `%USERPROFILE%\.pigent\extensions\`, Linux and macOS: `~/.pi/agent/extensions/` —
+then start pi (or run `/reload`), and run `/compact-plus` to add the models that should write your
+summaries, best one first.
 
 That's it. No build step, no extra keys — the extension compacts through pi's own model machinery
 (OpenRouter, Google, local llama.cpp servers — anything pi can reach). It creates its own config
