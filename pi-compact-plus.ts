@@ -918,9 +918,8 @@ function isSessionRef(ref: string): boolean {
 /**
  * Resolve a configured reference to a model, "session" included.
  *
- * Provider ids on this machine can contain slashes and colons themselves (the llama.cpp extension
- * registers "llama-server=http://127.0.0.1:9931" as a provider, so its refs look like
- * "llama-server=http://127.0.0.1:9931/E:\...gguf" and a naive split at the first "/" produces
+ * Provider ids can contain slashes and colons themselves (a llama.cpp provider registers refs like
+ * "llama-server=http://127.0.0.1:<port>/<path>...gguf", so a naive split at the first "/" produces
  * nonsense). So: first try an exact match over every model pi can see, then try find() at every
  * slash position.
  */
