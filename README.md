@@ -1,6 +1,6 @@
 # pi-compact-plus
 
-A context-compaction extension for the [pi coding agent](https://github.com/earendil-works/pi-coding-agent).
+A context-compaction extension for the [pi coding agent](https://github.com/earendil-works/pi).
 
 Pi is a terminal coding assistant, and like every coding assistant it eventually runs into a wall: the conversation grows until it no longer fits into the model's context window. When that happens, something has to shrink the history down — that something is called *compaction*. Pi already has a built-in compaction, but after living with it through some very long, very real working sessions, I found it had sharp edges: it could overflow the model's limits, it could hand the summary to a model that wasn't suited for it, it once came back in Chinese, and it always threw away far too much of the reasoning and tool work that led to the current state of things.
 
