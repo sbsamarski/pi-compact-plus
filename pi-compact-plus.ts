@@ -1164,7 +1164,7 @@ function postCompactionHeadroom(ctx: Ctx, preparation: any): number {
 /** Output tokens per visible word, measured on this session: Gemini 3.5 Flash Lite produced 1,106
  *  visible words from 2,212 visible output tokens. Two is the honest number for a model that is not
  *  thinking, and it is the number the token targets are divided by when the prompt speaks in words. */
-const TOKENS_PER_WORD = 2;
+const TOKENS_PER_WORD = 1.33;
 
 function wordsFor(tokens: number): number {
 	return Math.round(tokens / TOKENS_PER_WORD);
