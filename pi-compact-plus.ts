@@ -2992,7 +2992,7 @@ export class OrderList implements Component, Focusable {
  *   1. thinking (off..max, adjusted to what the model accepts)
  *   2. draft block (off / mini / full - a hidden analysis before the summary, stripped afterwards)
  *   3. timeout (2 min .. 60 min, unlimited)
- *   4. summary aim: percent of the folded region (post-elision size), with floor/ceiling clamps
+ *   4. summary aim: percent of the context getting compacted (post-elision size)
  *   5. summary floor (tokens)
  *   6. summary ceiling (tokens)
  *   7. no-think tag (the marker or empty)
@@ -3514,49 +3514,49 @@ class TemplateMenu implements Component, Focusable {
 		return [
 			{
 				id: "edit",
-				label: "Edit the template:",
+				label: "Edit the template",
 				currentValue: this.stateLabel(),
 				values: ["open"],
 				description: "Opens the editor with the ACTIVE text. Submit saves it as the active template; empty follows the user default; submit the lone word :extension or :user to restart the editor from that default.",
 			},
 			{
 				id: "previewActive",
-				label: "Preview: active template:",
+				label: "Preview active template:",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "The template as currently in effect (before the per-model {TOKEN} substitution). This is the text every model's request starts from.",
 			},
 			{
 				id: "previewUser",
-				label: "Preview: user default:",
+				label: "Preview user default:",
 				currentValue: !hasUser ? "(none saved)" : loadConfig().templateUserDefaults!.trim() === DEFAULT_TEMPLATE_TEXT.trim() ? "saved - same as extension default" : "saved (custom)",
 				values: ["preview"],
 				description: "Your saved USER default. When the active template is empty, this is what rides instead. Save one with 'Save current as user default'.",
 			},
 			{
 				id: "previewExt",
-				label: "Preview: extension default:",
+				label: "Preview extension default:",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "The built-in template as shipped - what 'Reset to extension default' pins the active to.",
 			},
 			{
 				id: "saveUser",
-				label: "Save current as user default:",
+				label: "Save current as user default",
 				currentValue: hasUser ? "replaces the saved one" : "not saved yet",
 				values: ["go"],
 				description: "The ACTIVE template becomes your USER default (a checkpoint). The active template itself does not change. Asks for confirmation.",
 			},
 			{
 				id: "resetUser",
-				label: "Reset to user default:",
+				label: "Reset to user default",
 				currentValue: hasUser ? "ready" : "(none saved)",
 				values: ["go"],
 				description: "Drops the active custom text; the template then follows the USER default (falls back to the extension default when none is saved). Asks for confirmation.",
 			},
 			{
 				id: "resetExt",
-				label: "Reset to extension default:",
+				label: "Reset to extension default",
 				currentValue: "ready",
 				values: ["go"],
 				description: "Pins the template to the built-in extension default (ignores the user default until you edit again). Asks for confirmation.",
@@ -4214,7 +4214,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push({
 			id: "order",
 			label: "Compaction models",
-			currentValue: rotationText(cfg, this.ctx),
+			currentValue: "",
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
 				new OrderList(this.tui, this.ctx, done, this.restore?.orderRef ? { optionsRef: this.restore.orderRef, optionKey: this.restore.optionKey } : undefined) as unknown as Component,
 			description:
@@ -4225,7 +4225,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push({
 			id: "autoMenu",
 			label: "Auto-compaction",
-			currentValue: "Press enter to open a submenu",
+			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
 				new AutoCompactionMenu(this.tui, this.ctx, (action: string) => {
@@ -4250,7 +4250,7 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "compactNow",
-			label: "Start compaction now:",
+			label: "Start compaction now",
 			currentValue: "Start the compaction now",
 			values: ["Start the compaction now"],
 			description:
@@ -4258,7 +4258,7 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "compactStock",
-			label: "Start pi's built-in compaction now:",
+			label: "Start pi's built-in compaction now",
 			currentValue: `Start pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
 			values: [`Start pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`],
 			description:
@@ -4292,7 +4292,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push({
 			id: "elisionMenu",
 			label: "Elision",
-			currentValue: "Press enter to open a submenu",
+			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
 				new ElisionMenu(this.tui, this.ctx, (action: string) => {
@@ -4305,7 +4305,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push({
 			id: "instruction",
 			label: "Summary template",
-			currentValue: this.templateStateLabel(),
+			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
 				new TemplateMenu(this.tui, this.ctx, (action: string) => {
@@ -4318,7 +4318,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push({
 			id: "catDesc",
 			label: "Category templates",
-			currentValue: CATEGORY_KINDS.every((k) => CATEGORY_LEVELS.every((l) => sentenceLayer(k.kind, l, sentenceFor(k.kind, l)) === "ext")) ? "all match the extension defaults" : "some slots changed",
+			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
 				new CategoryPick(
@@ -4336,7 +4336,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push({
 			id: "log",
 			label: "Log",
-			currentValue: "view",
+			currentValue: "",
 			submenu: (_current: string, done: (selectedValue?: string) => void) => new LogView(done),
 			description: `One line per try: status, model, time, tok in and out, and why something failed. File: ${LOG_PATH}`,
 		});
@@ -4758,8 +4758,8 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
 	let save: (v: number) => void = () => {};
 	let shown: (v: number) => string = (v) => fmt(v);
 	if (key === "summaryPct") {
-		title = "Summary % of region — default 10";
-		cur = o.summaryPercent; lo = 1; hi = 99; unit = "percent of the folded region";
+		title = "Summary aim — % of the context getting compacted — default 10";
+		cur = o.summaryPercent; lo = 1; hi = 99; unit = "percent of the context getting compacted";
 		save = (v) => setModelOptions(ref, { summaryPercent: v });
 		shown = (v) => `${v}%`;
 	} else if (key === "summaryMin") {
@@ -4952,7 +4952,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 				label: `Summary % of region - now ${o.summaryPercent}%`,
 				hint: "THE SUMMARY AIM: this percent of the region being folded (measured after the stubbing pass). Free numeric entry, 1-99.",
 				run: async () => {
-					const v = await askNumber(ctx, "Summary % of region — default 10 percent of the folded region", o.summaryPercent, 1, 99, "percent of the folded region");
+					const v = await askNumber(ctx, "Summary aim — % of the context getting compacted — default 10", o.summaryPercent, 1, 99, "percent");
 					if (v !== undefined) setModelOptions(ref, { summaryPercent: v });
 				},
 			},
