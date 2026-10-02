@@ -375,11 +375,11 @@ const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 function lengthBlock(sizes: Sizes, inputTokens: number): string {
 	const window =
 		sizes.min > 0
-			? `your summary must measure between ${fmt(sizes.min)} and ${fmt(sizes.max)} TOKENS (aim for about ${fmt(sizes.target)} tokens, roughly ${fmt(wordsFor(sizes.target))} words). A summary much shorter than ${fmt(sizes.min)} tokens is too thin: it will be REJECTED as a failure.`
-			: `aim for about ${fmt(sizes.target)} tokens (roughly ${fmt(wordsFor(sizes.target))} words); there is no hard minimum, but a very thin summary leaves the next request blind, so write freely and do not stop early. Your text is cut off at ${fmt(sizes.max)} tokens.`;
+			? `Aim for about ${fmt(sizes.target)} tokens (around ${fmt(wordsFor(sizes.target))} words). A summary under ${fmt(sizes.min)} tokens (around ${fmt(wordsFor(sizes.min))} words) or over ${fmt(sizes.max)} tokens (around ${fmt(wordsFor(sizes.max))} words) is rejected. If you approach the ${fmt(sizes.max)}-tok ceiling, tighten the least important details and land on a finished item, never mid-item.`
+		: `aim for about ${fmt(sizes.target)} tokens (roughly ${fmt(wordsFor(sizes.target))} words); there is no hard minimum, but a very thin summary leaves the next request blind, so write freely and do not stop early. Your text is cut off at ${fmt(sizes.max)} tok.`
 	return [
-		`This is a summary request. The conversation segment below is about ${fmt(inputTokens)} tokens and is the memory being replaced - the moment you stop writing, the original messages are deleted and the next model continues the work from your summary alone.`,
-		`IMPORTANT - length: ${window} Do not stop early and do not save tokens - stopping before the segment is fully covered is the one failure to avoid. If you approach the ${fmt(sizes.max)}-token ceiling, tighten the least important details and land on a finished list, never mid-item.`,
+		`This is a summary request. The conversation segment below is about ${fmt(inputTokens)} tok and is the memory being replaced - the moment you stop writing, the original messages are deleted and the next model continues the work from your summary alone.`,
+		`IMPORTANT - length: ${window} Do not stop early and do not save tok: covering the whole segment is the one thing that matters.`,
 		`Override: the line "Keep each section concise" in the instructions above does not apply to this job. It is written for a summary that sits beside the full transcript; here the transcript is deleted and your text is the only memory the next request has. Completeness beats brevity. Long bullet lists are good. Repeating an exact value twice is good. Splitting one vague sentence into five specific ones is the point. Vagueness and omission are the only failures.`,
 	].join("\n");
 }
