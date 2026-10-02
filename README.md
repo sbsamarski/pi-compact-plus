@@ -143,20 +143,19 @@ How many minutes one attempt may take — any number you like. When time runs ou
 skipped and the next one is asked. Fast online models are fine with ten minutes; a slow local
 machine writing a long summary may honestly need twenty or more.
 
-#### Summary aim (% of the folded region)
+#### Summary aim (% of context getting compacted)
 
-How long the summary should be, as a share of the material being folded *after* the stubbing — the
-"region" is simply what is left of the conversation once the stubbing pass has run. A 300k region at
-10% aims for a 30k summary; a 30k region aims for 3k — the summary scales with the work. The
-settings screen shows what your current context makes that worth right now.
+How long the summary should be, as a share of the context getting compacted — that is the session's
+context minus the preserved tail, after the stubbing pass has run. Example: ctx 441k with a 100k
+preserved tail leaves a 341k region; at 15% the aim is 51,150 tokens. The settings screen shows what
+your current context makes that worth right now.
 
-#### Summary min and max (% of window)
+#### Summary min and max limits (% of context getting compacted)
 
-The acceptance bounds, as percents of the model's window so they scale when you switch models: a
-summary below the min or above the max is thrown away and the next model is asked. The max never
-rises above the region itself (a summary longer than the source is pointless) and the min never
-rises above half of it. Defaults: 5% min, 50% max. The settings screen shows both as computed
-tokens right next to the percentages.
+The acceptance bounds: a summary below the min or above the max is thrown away and the next model is
+asked. As percents of the same region, so they scale with the material automatically — the same
+settings work on a 95k local session and on a 1M online session. Defaults: 5% min, 50% max. The
+settings screen shows both as computed tokens right next to the percentages.
 
 #### Draft mode
 
