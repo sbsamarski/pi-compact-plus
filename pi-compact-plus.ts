@@ -2952,7 +2952,7 @@ export class OrderList implements Component, Focusable {
 		if (!items.length) {
 			items.push({
 				id: "none",
-				label: "No models available;",
+				label: "No models available:",
 				currentValue: "",
 				description: "pi has no reachable models right now. Start a provider login or the local server, then come back.",
 			});
@@ -3011,14 +3011,14 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		const rows: SettingItem[] = [];
 		rows.push({
 			id: "thinking",
-			label: "Thinking method;",
+			label: "Thinking method:",
 			currentValue: o.thinking,
 			values: withCurrent(levels, o.thinking),
 			description: `Enter/Space cycles: ${levels.join(" → ")}. Private reasoning before it writes - it costs time, it does not make the summary longer. "off" also writes the no-think tag (row below) into the request for local models. A level the model does not have falls back to the nearest it has.`,
 		});
 		rows.push({
 			id: "draft",
-			label: "Draft block;",
+			label: "Draft block:",
 			currentValue: o.draft,
 			values: withCurrent(DRAFT_CYCLE, o.draft),
 			description:
@@ -3026,7 +3026,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "timeout",
-			label: "Summary timeout period;",
+			label: "Summary timeout period:",
 			currentValue: timeoutLabel(o.timeoutMs),
 			values: [EDIT_NUMBER, "unlimited"],
 			description:
@@ -3034,7 +3034,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryPct",
-			label: "Summary aim (% of ctx getting compacted);",
+			label: "Summary aim (% of ctx getting compacted):",
 			currentValue: `${o.summaryPercent}% (now: ~${fmt(Math.round((o.summaryPercent * regionNow) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
@@ -3042,7 +3042,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryMin",
-			label: "Summary min limit (% of ctx getting compacted);",
+			label: "Summary min limit (% of ctx getting compacted):",
 			currentValue: `${o.summaryMinPercent}% (now: ${fmt(Math.round((o.summaryMinPercent * regionNow) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
@@ -3050,7 +3050,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryMax",
-			label: "Summary max limit (% of ctx getting compacted);",
+			label: "Summary max limit (% of ctx getting compacted):",
 			currentValue: `${o.summaryMaxPercent}% (now: ${fmt(Math.round((o.summaryMaxPercent * regionNow) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
@@ -3058,7 +3058,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "inputstubs",
-			label: "Summarizer input;",
+			label: "Summarizer input:",
 			currentValue: o.inputStubs ? "stubs" : "raw",
 			values: withCurrent(["stubs", "raw"], o.inputStubs ? "stubs" : "raw"),
 			description:
@@ -3066,7 +3066,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "argcap",
-			label: "Tool-call arg cap;",
+			label: "Tool-call arg cap:",
 			currentValue: `${charCapLabel(o.argCap)}${o.argCap === "full" ? "" : " chars"}`,
 			values: [EDIT_NUMBER, "full"],
 			description:
@@ -3074,7 +3074,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "preservestubs",
-			label: "Tool stubs in summary;",
+			label: "Tool stubs in summary:",
 			currentValue: o.preserveStubs,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveStubs),
 			description:
@@ -3082,7 +3082,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "preserveuser",
-			label: "User prompts;",
+			label: "User prompts:",
 			currentValue: o.preserveUser,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveUser),
 			description:
@@ -3090,7 +3090,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "preservereply",
-			label: "Assistant replies;",
+			label: "Assistant replies:",
 			currentValue: o.preserveReplies,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveReplies),
 			description:
@@ -3098,7 +3098,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "preservethinking",
-			label: "Assistant thinking;",
+			label: "Assistant thinking:",
 			currentValue: o.preserveThinking,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveThinking),
 			description:
@@ -3106,7 +3106,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "chain",
-			label: "Chain previous summary;",
+			label: "Chain previous summary:",
 			currentValue: o.chainMode,
 			values: withCurrent(["fold", "attach", "skip"] as string[], o.chainMode),
 			description:
@@ -3114,7 +3114,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "previewDesc",
-			label: "Preview final description;",
+			label: "Preview final description:",
 			currentValue: "Enter shows it",
 			values: ["show"],
 			description:
@@ -3122,7 +3122,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "nothink",
-			label: "No-think tag;",
+			label: "No-think tag:",
 			currentValue: o.noThinkMarker || "(empty)",
 			values: withCurrent([DEFAULT_NO_THINK_TAG, "(empty)"], o.noThinkMarker || "(empty)"),
 			description:
@@ -3130,7 +3130,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "sampling",
-			label: "Sampling flags;",
+			label: "Sampling flags:",
 			currentValue: samplingLabel(o.sampling),
 			values: ["ignore all", "open flags"],
 			submenu: (_current: string, done: (selectedValue?: string) => void) => samplingScreen(ref, done) as unknown as Component,
@@ -3139,7 +3139,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "remove",
-			label: "Remove from the Compaction models order;",
+			label: "Remove from the Compaction models order:",
 			currentValue: "remove",
 			values: ["remove now"],
 			description: "Same as Space on the list: the model drops to its alphabetical place among the unselected ones and its stored options are deleted. Nothing is deleted from pi itself.",
@@ -3350,7 +3350,7 @@ class CategoryDescList implements Component, Focusable {
 				},
 				{
 					id: "__cancel",
-					label: "Cancel;",
+					label: "Cancel:",
 					currentValue: "Enter or Escape = keep everything as it is",
 					values: ["go"],
 					description: "Escape (or Enter here) returns to the sentences without changing anything.",
@@ -3360,14 +3360,14 @@ class CategoryDescList implements Component, Focusable {
 		base.push(
 			{
 				id: "__previewUser",
-				label: "Preview your user defaults (all 4);",
+				label: "Preview your user defaults (all 4):",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "Your saved user defaults for this category, one per level. '(no user default saved)' means that slot falls back to the extension default.",
 			},
 			{
 				id: "__previewExt",
-				label: "Preview the extension defaults (all 4);",
+				label: "Preview the extension defaults (all 4):",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "The built-in extension default sentences for this category - what Ctrl+R resets to.",
@@ -3514,49 +3514,49 @@ class TemplateMenu implements Component, Focusable {
 		return [
 			{
 				id: "edit",
-				label: "Edit the template;",
+				label: "Edit the template:",
 				currentValue: this.stateLabel(),
 				values: ["open"],
 				description: "Opens the editor with the ACTIVE text. Submit saves it as the active template; empty follows the user default; submit the lone word :extension or :user to restart the editor from that default.",
 			},
 			{
 				id: "previewActive",
-				label: "Preview: active template;",
+				label: "Preview: active template:",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "The template as currently in effect (before the per-model {TOKEN} substitution). This is the text every model's request starts from.",
 			},
 			{
 				id: "previewUser",
-				label: "Preview: user default;",
+				label: "Preview: user default:",
 				currentValue: !hasUser ? "(none saved)" : loadConfig().templateUserDefaults!.trim() === DEFAULT_TEMPLATE_TEXT.trim() ? "saved - same as extension default" : "saved (custom)",
 				values: ["preview"],
 				description: "Your saved USER default. When the active template is empty, this is what rides instead. Save one with 'Save current as user default'.",
 			},
 			{
 				id: "previewExt",
-				label: "Preview: extension default;",
+				label: "Preview: extension default:",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "The built-in template as shipped - what 'Reset to extension default' pins the active to.",
 			},
 			{
 				id: "saveUser",
-				label: "Save current as user default;",
+				label: "Save current as user default:",
 				currentValue: hasUser ? "replaces the saved one" : "not saved yet",
 				values: ["go"],
 				description: "The ACTIVE template becomes your USER default (a checkpoint). The active template itself does not change. Asks for confirmation.",
 			},
 			{
 				id: "resetUser",
-				label: "Reset to user default;",
+				label: "Reset to user default:",
 				currentValue: hasUser ? "ready" : "(none saved)",
 				values: ["go"],
 				description: "Drops the active custom text; the template then follows the USER default (falls back to the extension default when none is saved). Asks for confirmation.",
 			},
 			{
 				id: "resetExt",
-				label: "Reset to extension default;",
+				label: "Reset to extension default:",
 				currentValue: "ready",
 				values: ["go"],
 				description: "Pins the template to the built-in extension default (ignores the user default until you edit again). Asks for confirmation.",
@@ -3774,21 +3774,21 @@ class AutoCompactionMenu implements Component, Focusable {
 		return [
 			{
 				id: "startPct",
-				label: "Start auto-compaction at % of ctx window;",
+				label: "Start auto-compaction at % of ctx window:",
 				currentValue: `${cfg.scaling.startPercent}% (now: ${fmt(point)} tok, based on min/max limits and current ctx window of ${fmt(window)} tok)`,
 				values: ["edit"],
 				description: "The compaction starts when the ctx reaches this percent of the model's window (the value on the right is what that is right now, based on the min/max limits below). Enter opens a free numeric entry (1-99). Default 82.",
 			},
 			{
 				id: "resMin",
-				label: "Min reserve tok before auto-compaction;",
+				label: "Min reserve tok before auto-compaction:",
 				currentValue: `${fmt(cfg.scaling.reserveMin)} tok (Overrides the auto-compaction point if the % value is lower than this min limit)`,
 				values: ["edit"],
 				description: "The minimum space kept free at the top of the window. If the % above would leave less room than this, this minimum wins. Enter opens a free numeric entry. Default 12,288.",
 			},
 			{
 				id: "resMax",
-				label: "Max reserve tok before auto-compaction;",
+				label: "Max reserve tok before auto-compaction:",
 				currentValue: `${fmt(cfg.scaling.reserveMax)} tok (Overrides the auto-compaction point if the % value is higher than this max limit)`,
 				values: ["edit"],
 				description: "The maximum space kept free at the top of the window. If the % above would leave more room than this, this maximum wins (on a 1M window this is what caps the reserve). Enter opens a free numeric entry. Default 80,000.",
@@ -3855,21 +3855,21 @@ class PreserveMenu implements Component, Focusable {
 		return [
 			{
 				id: "keepPct",
-				label: "Preserve recent % of ctx window;",
+				label: "Preserve recent % of ctx window:",
 				currentValue: `${cfg.scaling.keepRecentPercent}% (now: ${fmt(keep)} tok, based on min/max limits and current ctx window of ${fmt(window)} tok)`,
 				values: ["edit"],
 				description: "The preserved tail as a percent of the model's window (the value on the right is what that is right now). Enter opens a free numeric entry (1-99). Default 20.",
 			},
 			{
 				id: "keepMin",
-				label: "Min preserve window limit in tok;",
+				label: "Min preserve window limit in tok:",
 				currentValue: `${fmt(cfg.scaling.keepRecentMin)} tok (Overrides the Preserve recent if the above value is lower than this min limit)`,
 				values: ["edit"],
 				description: "If the % above would preserve less than this, this minimum wins. Enter opens a free numeric entry. Default 16,384.",
 			},
 			{
 				id: "keepMax",
-				label: "Max preserve window limit in tok;",
+				label: "Max preserve window limit in tok:",
 				currentValue: `${fmt(cfg.scaling.keepRecentMax)} tok (Overrides the Preserve recent if the above value is higher than this max limit)`,
 				values: ["edit"],
 				description: "If the % above would preserve more than this, this maximum wins. Enter opens a free numeric entry. Default 100,000.",
@@ -3937,49 +3937,49 @@ class ElisionMenu implements Component, Focusable {
 		return [
 			{
 				id: "elisionOn",
-				label: "Elision on/off;",
+				label: "Elision on/off:",
 				currentValue: e.enabled ? "on" : "off",
 				values: ["on", "off"],
 				description: "Old tool results are replaced by short stubs in the requests the model receives, so the context stays much lower for much longer. Your screen and the session file always keep the originals - stubs exist only on the wire. Enter/Space toggles it.",
 			},
 			{
 				id: "elisionStart",
-				label: "Start auto-elision at % of ctx window;",
+				label: "Start auto-elision at % of ctx window:",
 				currentValue: `${e.softPercent}% (now: ${fmt(Math.round((e.softPercent * window) / 100))} tok)`,
 				values: ["edit"],
 				description: "Elision begins when the context reaches this percent of the model's window (the value on the right is what that is right now). Enter opens a free numeric entry (1-99). Default 20.",
 			},
 			{
 				id: "elisionProtect",
-				label: "Don't elide last x tok of ctx;",
+				label: "Don't elide last x tok of ctx:",
 				currentValue: `${fmt(e.protectRecentTokens)} tok`,
 				values: ["edit"],
 				description: "A protected window counted back from the newest message: tool results inside it are never stubbed, so the recent work stays fully intact. Enter opens a free numeric entry. Default 20,000.",
 			},
 			{
 				id: "elisionTail",
-				label: "Preserve last x chars of tool call results;",
+				label: "Preserve last x chars of tool call results:",
 				currentValue: `${typeof e.stubTailChars === "number" ? fmt(e.stubTailChars) : "full"} chars`,
 				values: ["edit"],
 				description: "How much of each tool result's ending survives inside its stub (the outcome usually lives there). Enter opens a free numeric entry (0 = none). Default 300.",
 			},
 			{
 				id: "elisionSavings",
-				label: "Auto-elide only if it saves at least x tok;",
+				label: "Auto-elide only if it saves at least x tok:",
 				currentValue: `${fmt(e.minSavingsTokens)} tok`,
 				values: ["edit"],
 				description: "A sweep is only taken if it actually saves at least this many tok - no busywork. Enter opens a free numeric entry. Default 2,000.",
 			},
 			{
 				id: "elisionResults",
-				label: "Auto-elide only when at least x results;",
+				label: "Auto-elide only when at least x results:",
 				currentValue: `${e.minResultsToStub} results`,
 				values: ["edit"],
 				description: "A sweep waits until at least this many tool results qualify - no churn for one lonely old test run. Enter opens a free numeric entry. Default 4.",
 			},
 			{
 				id: "elisionStop",
-				label: "Stop auto-eliding x tok before auto-compaction;",
+				label: "Stop auto-eliding x tok before auto-compaction:",
 				currentValue: `${fmt(e.stopGapTokens)} tok (now: ${fmt(Math.max(0, point - e.stopGapTokens))} tok)`,
 				values: ["edit"],
 				description: "A safety distance from the auto-compaction point: elision will not push the context closer than this (the value on the right is the effective stop line right now) - near compaction, sweeping would be wasted anyway. Enter opens a free numeric entry. Default 4,000.",
@@ -4205,7 +4205,7 @@ export class CompactionBoard implements Component, Focusable {
 		const rows: SettingItem[] = [];
 		rows.push({
 			id: "enabled",
-			label: "Extension active;",
+			label: "Extension active:",
 			currentValue: cfg.enabled ? "on" : "off",
 			values: ["on", "off"],
 			description:
@@ -4250,7 +4250,7 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "compactNow",
-			label: "Start compaction now;",
+			label: "Start compaction now:",
 			currentValue: "Start the compaction now",
 			values: ["Start the compaction now"],
 			description:
@@ -4258,7 +4258,7 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "compactStock",
-			label: "Start pi's built-in compaction now;",
+			label: "Start pi's built-in compaction now:",
 			currentValue: `Start pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
 			values: [`Start pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`],
 			description:
@@ -4266,7 +4266,7 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "piReserve",
-			label: "pi's reserveTokens (stock fallback);",
+			label: "pi's reserveTokens (stock fallback):",
 			currentValue: `${fmt(readPiReserveTokens())} tok`,
 			values: [EDIT_NUMBER],
 			description:
@@ -4275,7 +4275,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push(numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."));
 		rows.push({
 			id: "directRequest",
-			label: "Direct request;",
+			label: "Direct request:",
 			currentValue: cfg.directRequest ? "on" : "off",
 			values: ["on", "off"],
 			description:
@@ -4283,7 +4283,7 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "nothinkTag",
-			label: "No-think tag for local models;",
+			label: "No-think tag for local models:",
 			currentValue: cfg.noThinkMarker || "(empty)",
 			values: [EDIT_TEXT, "(empty)"],
 			description:
@@ -4457,7 +4457,7 @@ function templateMenu(done: (selectedValue?: string) => void): Component {
 	const rows: SettingItem[] = [
 		{
 			id: "edit",
-			label: "Edit in the text editor;",
+			label: "Edit in the text editor:",
 			currentValue: own ? "custom text saved" : "default text in use",
 			values: ["open the editor"],
 			description:
@@ -4465,7 +4465,7 @@ function templateMenu(done: (selectedValue?: string) => void): Component {
 		},
 		{
 			id: "reset",
-			label: "Reset to the default text;",
+			label: "Reset to the default text:",
 			currentValue: own ? own.split("\n")[0].slice(0, 44) : "already default",
 			values: ["reset now"],
 			description: "Throws away your custom text and puts the default Additional instruction back.",
@@ -4728,8 +4728,8 @@ async function editSamplingFlags(ctx: Ctx, ref: string): Promise<void> {
 				},
 			};
 		});
-		rows.push({ label: "Reset all to ignore;", hint: "Clears every flag for this model - nothing is sent.", run: () => setModelOptions(ref, { sampling: { ...SAMPLING_DEFAULTS } }) });
-		rows.push({ label: "Back;", hint: "Changes above are already saved.", run: () => {} });
+		rows.push({ label: "Reset all to ignore:", hint: "Clears every flag for this model - nothing is sent.", run: () => setModelOptions(ref, { sampling: { ...SAMPLING_DEFAULTS } }) });
+		rows.push({ label: "Back:", hint: "Changes above are already saved.", run: () => {} });
 		const row = await pickRow(ctx, `Sampling flags — ${ref}`, rows);
 		if (!row || row.label === "Back") return;
 		await row.run();
@@ -4889,7 +4889,7 @@ async function orderMenuFallback(ctx: Ctx): Promise<void> {
 			});
 		}
 		rows.push({
-			label: "Add a model from the list pi has available;",
+			label: "Add a model from the list pi has available:",
 			hint: "Defaults are applied (thinking off, 10 min, aim 0.8, min 0.1, max 0.9, tag as on the board). Open it afterwards to tune.",
 			run: async () => {
 				const pool = poolOf(ctx).filter((p) => !loadConfig().models[p.ref]);
@@ -4908,7 +4908,7 @@ async function orderMenuFallback(ctx: Ctx): Promise<void> {
 				void chosen;
 			},
 		});
-		rows.push({ label: "Back;", hint: "Changes above are already saved.", run: () => {} });
+		rows.push({ label: "Back:", hint: "Changes above are already saved.", run: () => {} });
 		const row = await pickRow(ctx, `Compaction models - ${rotationText(cfg, ctx)}`, rows);
 		if (!row || row.label === "Back") return;
 		await row.run();
@@ -5035,7 +5035,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 				hint: "Temperature / top_p / top_k / min_p / presence / repetition for THIS model's compaction request; each a number or ignore.",
 				run: () => editSamplingFlags(ctx, ref),
 			},
-			{ label: "Back;", hint: "Changes above are already saved.", run: () => {} },
+			{ label: "Back:", hint: "Changes above are already saved.", run: () => {} },
 		];
 		const row = await pickRow(ctx, `${slotLabel(ref, model)} — options`, rows);
 		if (!row || row.label === "Back") return;
@@ -5077,7 +5077,7 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 				hint: "Old tool results become informative stubs in live requests; calls stay; originals stay on disk. Tune with: /compact-plus elision ...",
 				run: () => update((c) => void (c.elision = { ...c.elision, enabled: !c.elision.enabled })),
 			},
-			{ label: "Additional instruction;", hint: cfg.additionalInstruction ? "Custom text saved - Enter to edit or reset." : "Default text in use - Enter to edit a copy.", run: () => editInstruction(ctx) },
+			{ label: "Additional instruction:", hint: cfg.additionalInstruction ? "Custom text saved - Enter to edit or reset." : "Default text in use - Enter to edit a copy.", run: () => editInstruction(ctx) },
 			{ label: "Log", hint: `Status, model, time, tok in/out for every try. File: ${LOG_PATH}`, run: () => ctx.ui.notify(tailLogPretty(16), "info") },
 		];
 		const row = await pickRow(ctx, "Compaction models", rows);
