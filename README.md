@@ -213,40 +213,34 @@ Read-only — a look before you compact.
 ## Percentages, not magic numbers
 
 Pi's built-in compaction numbers are absolute token counts — a reserve of 16,384 and a keep-recent
-of 20,000 — which were sized for small windows and quietly become wrong everywhere else. This
-extension computes every threshold from the current model's context window, as a percentage with
-minimum and maximum clamps:
+of 20,000 — sized for small windows and quietly wrong everywhere else. This extension ignores those
+two settings completely and computes every threshold from the current model's context window, as a
+percentage with clamps. The board groups them into two submenus:
 
-| Threshold | Default | Clamps | What it controls |
-|---|---|---|---|
-| **Reserve** | 18% of the window | 12,288 – 80,000 tokens | the room kept free at the top; the auto-compaction trigger fires when the context reaches *window − reserve*. |
-| **Keep recent** | 20% of the window | 16,384 – 100,000 tokens | the newest exchange kept verbatim outside the summary, so resuming feels continuous. |
-| **Elision start** | 20% of the window | — | where stubbing begins (see the elision section). |
-| **Elision stop gap** | 4,000 tokens | — | the safety distance from the reserve line that stubbing will not cross. |
+**Auto-compaction** — when compaction starts by itself:
 
-The clamps matter on small windows. On a 130k local model, 18% and 20% land at 23,400 and 26,000
-tokens — sensible numbers, barely touched by the clamps. On a 1M online model they would be 180,000
-and 200,000, where the clamps bring them down to 80,000 and 100,000 — still generous, no longer
-absurd. Switch models mid-session — pause, change, continue — and every value recomputes from the
-new window immediately, with no reload. If the window is unknown, pi's classic 16,384 / 20,000
-figures are used as safe fallbacks.
+| Setting | Default | What it controls |
+|---|---|---|
+| Start at % of window | 82% | the trigger point; the context crossing this share starts the compaction. |
+| Min / Max reserve tokens | 12,288 / 80,000 | clamps on the space kept free — on a 1M window the max caps it at 80,000. |
 
-Two things are worth knowing here. First, **the extension ignores pi's own `reserveTokens` and
-`keepRecentTokens` settings completely** — it never reads them, so changing those numbers in pi's
-own settings has no effect while this extension is running. Its thresholds live entirely in this
-extension's own settings, and because the configuration is read fresh on every event, you can
-change them on the fly without any `/reload`. Second, those two percentages do not change how *big*
-the summaries are — that is the summary aim on each model, which measures the folded material
-itself, not the window.
+**Preserve recent tokens** — what stays word for word:
 
-One more number belongs here: the **generation cap** on chat requests (default 65,536 tokens, set
-it to anything, 0 disables). Pi asks providers for an output permission of *window minus its
-estimate minus a small margin* — on a 1M-window model that can mean requesting nearly a million
-output tokens, and the provider rejects the whole request the moment its own count is slightly
-higher than pi's estimate. That exact failure forced the emergency compactions this extension was
-born from. With the cap, chat requests always fit until the real context reaches *window − cap* —
-the auto-compact trigger (window − reserve) sits comfortably below that line, so compaction wins
-the race by design.
+| Setting | Default | What it controls |
+|---|---|---|
+| Preserve recent % | 20% | the newest tail kept outside every summary (and protected from elision). |
+| Min / Max preserve tokens | 16,384 / 100,000 | clamps on that tail. |
+
+Both submenus open with a **read-only line showing the current computed value** — the actual trigger
+point and the actual preserved window, in tokens, for the active model, right now. Switch models
+mid-session and every value recomputes instantly, no reload. If the window is unknown, pi's classic
+16,384 / 20,000 figures are used as safe fallbacks.
+
+One more number: the **generation cap** on chat requests (default 65,536 tokens, 0 disables). Pi asks
+providers for an output permission of *window minus its estimate minus a small margin* — on a 1M
+model that can mean requesting nearly a million output tokens, which providers reject the moment
+their own count disagrees slightly. The overflow class that forced the emergency compactions is gone
+with the cap.
 
 ---
 
