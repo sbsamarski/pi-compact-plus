@@ -1,6 +1,6 @@
 {
   "name": "pi-compact-plus",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A context-compaction extension for the pi coding agent: model rotation, tool-call elision, percent-based triggers, editable summary instructions, and a full settings UI.",
   "license": "MIT",
   "keywords": [

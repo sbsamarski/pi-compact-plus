@@ -145,10 +145,18 @@ machine writing a long summary may honestly need twenty or more.
 
 #### Summary aim (% of the folded region)
 
-How long the summary should be, as a share of the material being folded *after* the stubbing. A
-300k-token region at 10% aims for a 30k summary; a 30k region aims for 3k — the summary scales with
-the work, not with the window. The **floor** (4,096) and **ceiling** (32,768) keep tiny and huge
-regions sensible.
+How long the summary should be, as a share of the material being folded *after* the stubbing — the
+"region" is simply what is left of the conversation once the stubbing pass has run. A 300k region at
+10% aims for a 30k summary; a 30k region aims for 3k — the summary scales with the work. The
+settings screen shows what your current context makes that worth right now.
+
+#### Summary min and max (% of window)
+
+The acceptance bounds, as percents of the model's window so they scale when you switch models: a
+summary below the min or above the max is thrown away and the next model is asked. The max never
+rises above the region itself (a summary longer than the source is pointless) and the min never
+rises above half of it. Defaults: 5% min, 50% max. The settings screen shows both as computed
+tokens right next to the percentages.
 
 #### Draft mode
 
