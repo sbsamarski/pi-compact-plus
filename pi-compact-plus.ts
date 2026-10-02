@@ -149,8 +149,8 @@ type ModelOptions = {
 	thinking: Level;
 	/** Abort the request after this long. 0 = unlimited. */
 	timeoutMs: number;
-	/** THE SUMMARY AIM: this percent of the region BEING FOLDED (the context getting compacted:
-	 *  the session ctx minus the preserved tail, measured after the stubbing pass). */
+	/** THE SUMMARY AIM: this percent of the model's ctx window (2026-10-03: everything - aim, min,
+	 *  max - is a window percent; the numbers the settings show are the numbers enforced). */
 	summaryPercent: number;
 	/** THE LIMITS (2026-10-03): percent of the model's WINDOW, used DIRECTLY as the acceptance
 	 *  bounds - a summary below min or above max is thrown away. The aim is clamped inside them,
@@ -1215,14 +1215,14 @@ function draftAllowance(draft: Draft | undefined): number {
 
 export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; historyTokens: number; headroom: number; overflow: boolean; draft?: Draft; windowTokens?: number }, prevTokens = 0): Sizes {
 	const notes: string[] = [];
-	// The REGION: the context getting compacted (the session ctx minus the preserved tail,
-	// measured after the stubbing pass). The AIM is a percent of it.
+	// The REGION: the material being folded (the session ctx minus the preserved tail, measured
+	// after the stubbing pass) - kept only for the sanity cap and the unknown-window fallback.
 	const region = Math.max(0, Math.round(opts.inputTokens));
 	const window = Math.max(0, Math.round(opts.windowTokens ?? 0));
-	// THE LIMITS (2026-10-03): percents of the model's WINDOW, used DIRECTLY as the acceptance
-	// bounds - 23% of a 95k window means 21,850 tok, and the same settings scale on a 1M model.
-	// A summary longer than the source is pointless, so the max is capped by the region; the min
-	// never rises above the max (and yields to it on tiny regions).
+	// THE AIM AND THE LIMITS (2026-10-03): ALL percents of the model's WINDOW, used directly - the
+	// numbers the settings show are the numbers the checks enforce, and the same settings scale
+	// across models. A summary longer than the source is pointless, so the max is capped by the
+	// region; the min never rises above the max (and yields to it on tiny regions).
 	let max = window > 0 ? Math.round((profile.summaryMaxPercent * window) / 100) : Math.max(4_096, region);
 	if (max > Math.max(region, 1_024)) {
 		max = Math.max(region, 1_024);
@@ -1230,9 +1230,7 @@ export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; his
 	}
 	let min = window > 0 ? Math.round((profile.summaryMinPercent * window) / 100) : 1_024;
 	min = Math.min(min, max);
-	// The aim: percent of the region, clamped INTO the acceptance bounds, so the instructions
-	// always ask for something the checks would accept.
-	let target = clamp(Math.round((profile.summaryPercent * region) / 100), min, max);
+	let target = clamp(Math.round((profile.summaryPercent * (window > 0 ? window : region)) / 100), min, max);
 	if (prevTokens > 0 && profile.chainMode === "attach") {
 		// The verbatim previous summary rides INSIDE the summary: raise the ceiling by its size and
 		// demand it in the minimum too - a lazy model cannot pass by returning only the previous
@@ -3001,16 +2999,13 @@ export class OrderList implements Component, Focusable {
  *   1. thinking (off..max, adjusted to what the model accepts)
  *   2. draft block (off / mini / full - a hidden analysis before the summary, stripped afterwards)
  *   3. timeout (2 min .. 60 min, unlimited)
- *   4. summary aim: percent of the context getting compacted (post-elision size)
+ *   4. summary aim: percent of the ctx window (the same base as the min/max limits)
  *   5. summary floor (tokens)
  *   6. summary ceiling (tokens)
  *   7. no-think tag (the marker or empty)
  * Esc goes back; changes save the moment they are made.
  */
 export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: () => void, onExit?: (action: string) => void, initialKey?: string): Component {
-	// The region estimate for the inline computed values: the current context minus the preserved
-	// tail - the same material the aim and the limits measure.
-	const regionNow = Math.max(0, Math.round(((ctx?.getContextUsage?.()?.tokens ?? 0) - extKeepRecent(ctx))));
 	const buildItems = (): SettingItem[] => {
 		const cfg = loadConfig();
 		const o = optionsFor(cfg, ref, model);
@@ -3043,8 +3038,8 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryPct",
-			label: "Summary aim (% of ctx to compact):",
-			currentValue: `${o.summaryPercent}% (now: ~${fmt(Math.round((o.summaryPercent * regionNow) / 100))} tok)`,
+			label: "Summary aim (% of ctx window):",
+			currentValue: `${o.summaryPercent}% (now: ~${fmt(Math.round((o.summaryPercent * (ctx?.model?.contextWindow ?? 0)) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
 				"THE SUMMARY AIM: this percent of the context GETTING COMPACTED - the session ctx minus the preserved tail, after the stubbing pass. The value on the right is what this percent aims for right now (example: ctx 441k, preserve 100k, region 341k; 15% aims 51,150 tok). The acceptance bounds are the min/max rows below. Enter opens a free numeric entry (1-99). Default 10.",
@@ -4247,7 +4242,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push({
 			id: "preserveMenu",
 			label: "Preserve recent tok",
-			currentValue: "Press enter to open a submenu",
+			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
 				new PreserveMenu(this.tui, this.ctx, (action: string) => {
@@ -4767,8 +4762,8 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
 	let save: (v: number) => void = () => {};
 	let shown: (v: number) => string = (v) => fmt(v);
 	if (key === "summaryPct") {
-		title = "Summary aim — % of the context getting compacted — default 10";
-		cur = o.summaryPercent; lo = 1; hi = 99; unit = "percent of the context getting compacted";
+		title = "Summary aim — % of the ctx window — default 10";
+		cur = o.summaryPercent; lo = 1; hi = 99; unit = "percent of the ctx window";
 		save = (v) => setModelOptions(ref, { summaryPercent: v });
 		shown = (v) => `${v}%`;
 	} else if (key === "summaryMin") {
@@ -4961,7 +4956,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 				label: `Summary % of region - now ${o.summaryPercent}%`,
 				hint: "THE SUMMARY AIM: this percent of the region being folded (measured after the stubbing pass). Free numeric entry, 1-99.",
 				run: async () => {
-					const v = await askNumber(ctx, "Summary aim — % of the context getting compacted — default 10", o.summaryPercent, 1, 99, "percent");
+					const v = await askNumber(ctx, "Summary aim — % of the ctx window — default 10", o.summaryPercent, 1, 99, "percent");
 					if (v !== undefined) setModelOptions(ref, { summaryPercent: v });
 				},
 			},
@@ -5110,7 +5105,7 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 		const o = optionsFor(cfg, ref, model);
 		const th = model ? effectiveThinking(o.thinking, model) : { level: o.thinking, note: "" };
 		lines.push(
-			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of the ctx window, thinking ${th.level}, draft ${o.draft}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
+			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${o.summaryPercent}% of the ctx window, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of it, thinking ${th.level}, draft ${o.draft}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
 		);
 	});
 	lines.push(`retries: ${cfg.retries} per model, ${cfg.retryDelaySeconds}s apart · no-think tag: ${cfg.noThinkMarker || "(empty)"} · additional instruction: ${cfg.additionalInstruction ? "custom" : "default (turn ledger)"} · transcript pointer: ${cfg.transcriptPointer ? "on" : "off"}`);
@@ -5324,7 +5319,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 								.map((ref, i) => {
 									const model = lookupRef(ref, ctx);
 									const o = optionsFor(loadConfig(), ref, model);
-									return `${i + 1}. ${ref} — summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of the ctx window, ${timeoutLabel(o.timeoutMs)}, ${o.thinking}`;
+									return `${i + 1}. ${ref} — summary aim ${o.summaryPercent}% of the ctx window, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of it, ${timeoutLabel(o.timeoutMs)}, ${o.thinking}`;
 								})
 								.join("\n"),
 						);
@@ -5351,7 +5346,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (parts.length === 2) {
 						const model = lookupRef(ref, ctx);
 						const o = optionsFor(loadConfig(), ref, model);
-						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of the ctx window, draft ${o.draft}, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
+						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${o.summaryPercent}% of the ctx window, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of it, draft ${o.draft}, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
 					}
 					const patch: Partial<ModelOptions> = {};
 					for (let i = 2; i < parts.length; i += 2) {
@@ -5378,7 +5373,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (!loadConfig().models[ref]) rotateAdd(ref);
 					setModelOptions(ref, patch);
 					const o2 = optionsFor(loadConfig(), ref, lookupRef(ref, ctx));
-					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${o2.summaryPercent}% of the compacted region, limits min ${o2.summaryMinPercent}% / max ${o2.summaryMaxPercent}% of the ctx window, draft ${o2.draft}, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
+					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${o2.summaryPercent}% of the ctx window, limits min ${o2.summaryMinPercent}% / max ${o2.summaryMaxPercent}% of it, draft ${o2.draft}, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
 				}
 				case "elision": {
 					const sub = (parts[1] ?? "").toLowerCase();
