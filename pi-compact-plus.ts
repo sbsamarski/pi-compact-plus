@@ -3364,14 +3364,14 @@ class CategoryDescList implements Component, Focusable {
 		base.push(
 			{
 				id: "__previewUser",
-				label: "Preview your user defaults (all 4):",
+				label: "Preview all user defaults",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "Your saved user defaults for this category, one per level. '(no user default saved)' means that slot falls back to the extension default.",
 			},
 			{
 				id: "__previewExt",
-				label: "Preview the extension defaults:",
+				label: "Preview all extension defaults",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "The built-in extension default sentences for this category - what Ctrl+R resets to.",
