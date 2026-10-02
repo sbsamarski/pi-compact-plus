@@ -3745,13 +3745,8 @@ async function previewDescription(ctx: Ctx, ref: string): Promise<void> {
 		customInstructions: undefined,
 	});
 	await ctx.ui?.editor?.(
-		`FINAL summary description for ${ref} — READ-ONLY PREVIEW`,
-		[
-			`READ-ONLY PREVIEW - this is what ${ref} would receive. Nothing is sent; ANY changes made in this editor are DISCARDED when you close it (the submit/newline/external-editor keys below belong to the TEMPLATE editors, not to this preview).`,
-			`The real request adds the conversation region (numbered turns + stubs + the previous summary) below this description.`,
-			``,
-			text,
-		].join("\n"),
+		`READ-ONLY PREVIEW — this is what ${ref} would receive. Nothing is sent; ANY changes made in this editor are DISCARDED when you close it (the submit/newline/external-editor keys below belong to the template editors, not to this preview). The real request adds the conversation region (numbered turns + stubs + the previous summary) below this description.`,
+		text,
 	);
 }
 
@@ -4504,8 +4499,8 @@ async function previewTemplate(ctx: Ctx, which: string): Promise<void> {
 				? usr ?? "(no user default saved)\n\nWhen the active template is empty, this slot follows the extension default. Save one with 'Save current as user default' in the template submenu."
 				: active;
 	await ctx.ui?.editor?.(
-		`READ-ONLY PREVIEW — summary template (${which === "ext" ? "extension default" : which === "user" ? "user default" : "active"})`,
-		[`READ-ONLY PREVIEW - changes are DISCARDED; nothing is sent.`, ``, text].join("\n"),
+		`READ-ONLY PREVIEW — the summary template (${which === "ext" ? "extension default" : which === "user" ? "user default" : "active"}). Nothing is sent; changes are DISCARDED when you close it.`,
+		text,
 	);
 }
 
@@ -4555,8 +4550,8 @@ async function previewCategoryDefaults(ctx: Ctx, kind: string, target: string): 
 		return `${label} — ${level} (${tag}):\n${u}`;
 	}).join("\n\n");
 	await ctx.ui?.editor?.(
-		`READ-ONLY PREVIEW — ${label}: ${target === "ext" ? "extension" : "user"} defaults`,
-		[`READ-ONLY PREVIEW - changes are DISCARDED; nothing is sent.`, ``, lines].join("\n"),
+		`READ-ONLY PREVIEW — ${label}: ${target === "ext" ? "extension" : "user"} defaults. Nothing is sent; changes are DISCARDED when you close it.`,
+		lines,
 	);
 }
 
