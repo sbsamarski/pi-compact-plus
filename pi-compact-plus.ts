@@ -3118,8 +3118,8 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "previewDesc",
-			label: "Preview final description:",
-			currentValue: "Enter shows it",
+			label: "Preview final description",
+			currentValue: "Press enter to preview",
 			values: ["show"],
 			description:
 				"The COMPLETE description THIS model would receive on the next compaction: the size block, the draft instruction, and the summary template with this model's {TOKENS} substituted (its thinking level, its preserve levels, its chain mode, the category sentences as customized on the board). Read-only preview - nothing is sent; edits in the editor are discarded.",
@@ -3143,7 +3143,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "remove",
-			label: "Remove from the Compaction models order:",
+			label: "Remove from compaction models order",
 			currentValue: "remove",
 			values: ["remove now"],
 			description: "Same as Space on the list: the model drops to its alphabetical place among the unselected ones and its stored options are deleted. Nothing is deleted from pi itself.",
