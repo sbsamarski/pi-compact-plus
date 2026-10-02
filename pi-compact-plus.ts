@@ -150,12 +150,11 @@ type ModelOptions = {
 	/** Abort the request after this long. 0 = unlimited. */
 	timeoutMs: number;
 	/** THE SUMMARY AIM: this percent of the region BEING FOLDED (the context getting compacted:
-	 *  the session ctx minus the preserved tail, measured after the stubbing pass) - clamped into
-	 *  [summaryMinPercent, summaryMaxPercent] of that same region. */
+	 *  the session ctx minus the preserved tail, measured after the stubbing pass). */
 	summaryPercent: number;
-	/** THE LIMITS (2026-10-02): percent of the region (the context getting compacted), used
-	 *  DIRECTLY as the acceptance bounds - a summary below min or above max is thrown away. The
-	 *  aim is clamped inside them. */
+	/** THE LIMITS (2026-10-03): percent of the model's WINDOW, used DIRECTLY as the acceptance
+	 *  bounds - a summary below min or above max is thrown away. The aim is clamped inside them,
+	 *  so at a 95k window 23% means 21,850 tokens, and the same settings scale on a 1M model. */
 	summaryMinPercent: number;
 	summaryMaxPercent: number;
 	/** Hidden analysis written before the summary in the same call, stripped before storing:
@@ -899,7 +898,7 @@ function tailLogPretty(lines = 16): string {
 						tokIn !== undefined || tokOut !== undefined
 							? `${tokIn !== undefined ? `${fmt(tokIn)} tok in` : ""}${tokIn !== undefined && tokOut !== undefined ? ", " : ""}${tokOut !== undefined ? `${fmt(tokOut)} tok out` : ""}${typeof d.reasoning === "number" && d.reasoning > 0 ? ` (thinking ${fmt(d.reasoning)})` : ""}`
 							: "";
-					const window = typeof d.min === "number" && typeof d.max === "number" ? `window ${fmt(d.min)}-${fmt(d.max)}` : "";
+					const window = typeof d.min === "number" && typeof d.max === "number" ? `accept ${fmt(d.min)}-${fmt(d.max)} tok (min ${d.minPct ?? "?"}% / max ${d.maxPct ?? "?"}% of the ${fmt(d.window ?? 0)} tok window)` : "";
 					const status =
 						d.event === "ok"
 							? "OK"
@@ -1174,15 +1173,14 @@ function wordsFor(tokens: number): number {
 /**
  * The size window one summarisation attempt is governed by, all in tokens.
  *
- * THE LIMITS (2026-10-02): summaryMin%/summaryMax% of the REGION (the context getting compacted:
- * the session ctx minus the preserved tail, measured after the stubbing pass) are the ACCEPTANCE
- * BOUNDS, used directly - the numbers the settings show are the numbers the checks enforce. The
- * AIM (what the instructions request) = summaryPercent% of that same region, clamped into
- * [min, max]:
- *   - max    = summaryMax% × region — never above the source (maxPct <= 99); the generation
- *             request is capped a little above max (GEN_MARGIN) so a summary landing exactly on
- *             max is not killed by pi's length-stop;
- *   - min    = summaryMin% × region, never above max — a thinner summary is thrown away.
+ * THE LIMITS (2026-10-03): summaryMin%/summaryMax% of the model's WINDOW are the ACCEPTANCE
+ * BOUNDS, used directly - 23% of a 95k window means 21,850 tok; the same settings scale on a 1M
+ * model. The AIM (what the instructions request) = summaryPercent% of the region BEING FOLDED
+ * (the session ctx minus the preserved tail, after the stubbing pass), clamped into [min, max]:
+ *   - max    = min(summaryMax% × window, the region itself) — a summary longer than the source is
+ *             pointless; the generation request is capped a little above max (GEN_MARGIN) so a
+ *             summary landing exactly on max is not killed by pi's length-stop;
+ *   - min    = min(summaryMin% × window, max) — a thinner summary is thrown away.
  * Then trimmed down where reality demands it: an overflow compaction (pi refuses a summary longer
  * than the history it replaces) and the room actually left in the session window after compaction.
  */
@@ -1215,16 +1213,23 @@ function draftAllowance(draft: Draft | undefined): number {
 	return 0;
 }
 
-export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; historyTokens: number; headroom: number; overflow: boolean; draft?: Draft }, prevTokens = 0): Sizes {
+export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; historyTokens: number; headroom: number; overflow: boolean; draft?: Draft; windowTokens?: number }, prevTokens = 0): Sizes {
 	const notes: string[] = [];
 	// The REGION: the context getting compacted (the session ctx minus the preserved tail,
-	// measured after the stubbing pass). Everything below is a percent of it.
+	// measured after the stubbing pass). The AIM is a percent of it.
 	const region = Math.max(0, Math.round(opts.inputTokens));
-	// THE LIMITS (2026-10-02): percents of the region used DIRECTLY as the acceptance bounds - the
-	// numbers the settings show are the numbers the checks enforce. maxPct <= 99, so the max can
-	// never exceed the source itself; the min never rises above the max.
-	let max = Math.round((profile.summaryMaxPercent * region) / 100);
-	let min = Math.min(Math.round((profile.summaryMinPercent * region) / 100), max);
+	const window = Math.max(0, Math.round(opts.windowTokens ?? 0));
+	// THE LIMITS (2026-10-03): percents of the model's WINDOW, used DIRECTLY as the acceptance
+	// bounds - 23% of a 95k window means 21,850 tok, and the same settings scale on a 1M model.
+	// A summary longer than the source is pointless, so the max is capped by the region; the min
+	// never rises above the max (and yields to it on tiny regions).
+	let max = window > 0 ? Math.round((profile.summaryMaxPercent * window) / 100) : Math.max(4_096, region);
+	if (max > Math.max(region, 1_024)) {
+		max = Math.max(region, 1_024);
+		notes.push("max capped to the region itself (a summary longer than the source is pointless)");
+	}
+	let min = window > 0 ? Math.round((profile.summaryMinPercent * window) / 100) : 1_024;
+	min = Math.min(min, max);
 	// The aim: percent of the region, clamped INTO the acceptance bounds, so the instructions
 	// always ask for something the checks would accept.
 	let target = clamp(Math.round((profile.summaryPercent * region) / 100), min, max);
@@ -1936,7 +1941,7 @@ export async function directCompact(args: {
 	const dKwargs = refLooksLocal(args.ref) ? chatTemplateKwargsFor(args.thinking) : undefined;
 	if (dParams || dKwargs) requestOptions.samplingParams = { ...(dParams ?? {}), ...(dKwargs ?? {}) };
 	const response: any = await registry.streamSimple(model, context, requestOptions).result();
-	if (response?.stopReason === "length") throw new Error("generation hit the token cap and the summary is incomplete");
+	if (response?.stopReason === "length") throw new Error(`generation hit the token cap (${sizes.genCap} tok: acceptance max ${sizes.max} tok + margins) and the summary is incomplete - the model wrote ~${fmt(response?.usage?.output ?? 0)} tok. Raise Summary max, or set the draft to off/mini.`);
 	if (response?.stopReason === "error") throw new Error(response?.errorMessage || "provider error");
 	if (response?.stopReason === "aborted") throw new Error("aborted");
 	if ((response?.content ?? []).some((b: any) => b?.type === "toolCall")) throw new Error("the model tried to call a tool");
@@ -2177,6 +2182,7 @@ export async function summarizeWithRotation(
 			headroom: overflow ? 0 : postCompactionHeadroom(ctx, preparation),
 			overflow,
 			draft: profile.draft,
+			windowTokens: ctx?.model?.contextWindow ?? 0,
 		}, prevSummaryTokens(preparation));
 		for (const note of sizes.notes) logLine(cfg, { event: "note", ref: c.ref, note });
 
@@ -2208,7 +2214,7 @@ export async function summarizeWithRotation(
 		// A local chat template can hold thinking on whatever the request asks for. When we asked for
 		// thinking off, also say it inside the message, because that is where such a template looks.
 		const realInput = summariserInputTokens(prep);
-		const realSizes = prep === preparation ? sizes : sizesFor(profile, { inputTokens: realInput, historyTokens: historyTokensOnly(prep), headroom: overflow ? 0 : postCompactionHeadroom(ctx, prep), overflow, draft: profile.draft }, prevSummaryTokens(prep));
+		const realSizes = prep === preparation ? sizes : sizesFor(profile, { inputTokens: realInput, historyTokens: historyTokensOnly(prep), headroom: overflow ? 0 : postCompactionHeadroom(ctx, prep), overflow, draft: profile.draft, windowTokens: ctx?.model?.contextWindow ?? 0 }, prevSummaryTokens(prep));
 		const genCapFinal = realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0);
 		let instructions = buildInstructions({
 			sizes: realSizes,
@@ -2228,6 +2234,9 @@ export async function summarizeWithRotation(
 			min: realSizes.min,
 			target: realSizes.target,
 			max: realSizes.max,
+			minPct: profile.summaryMinPercent,
+			maxPct: profile.summaryMaxPercent,
+			window: ctx?.model?.contextWindow ?? 0,
 			genCap: genCapFinal,
 			draft: profile.draft,
 			thinking: th.level,
@@ -2271,8 +2280,8 @@ export async function summarizeWithRotation(
 				};
 				if (timedOut) throw dFail(`timed out with a half written summary`);
 				if (!summary || summary.trim().length < 80) throw dFail("empty summary");
-				if (measured.tokens < realSizes.min) throw dFail(`too thin - ~${fmt(measured.tokens)} tok, needed at least ${fmt(realSizes.min)}`);
-				if (measured.tokens > realSizes.max) throw dFail(`too long - ~${fmt(measured.tokens)} tok, ceiling is ${fmt(realSizes.max)}`);
+				if (measured.tokens < realSizes.min) throw dFail(`too thin - the summary is ~${fmt(measured.tokens)} tok vs the acceptance min ${fmt(realSizes.min)} tok (summary min ${profile.summaryMinPercent}% of the ${fmt(ctx?.model?.contextWindow ?? 0)} tok window). Raise Summary min, or lower the aim %.`);
+				if (measured.tokens > realSizes.max) throw dFail(`too long - the summary is ~${fmt(measured.tokens)} tok vs the acceptance max ${fmt(realSizes.max)} tok (summary max ${profile.summaryMaxPercent}% of the ${fmt(ctx?.model?.contextWindow ?? 0)} tok window). Raise Summary max, or lower the aim %.`);
 				if (cfg.shapeGate) {
 					const sh = shapeCheck(summary);
 					if (!sh.ok) throw dFail(`shape: ${sh.reason}`);
@@ -3042,16 +3051,16 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryMin",
-			label: "Summary min (% of ctx to compact):",
-			currentValue: `${o.summaryMinPercent}% (now: ${fmt(Math.round((o.summaryMinPercent * regionNow) / 100))} tok)`,
+			label: "Summary min (% of ctx window):",
+			currentValue: `${o.summaryMinPercent}% (now: ${fmt(Math.round((o.summaryMinPercent * (ctx?.model?.contextWindow ?? 0)) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
-				"THE ACCEPTANCE MINIMUM: a summary shorter than this is thrown away and the next model is asked. Percent of the context GETTING COMPACTED (the ctx minus the preserved tail), so it scales with the material automatically - the value on the right is what it is right now. Never rises above the max. Enter opens a free numeric entry (1-99). Default 5.",
+				"THE ACCEPTANCE MINIMUM: a summary shorter than this is thrown away and the next model is asked. Percent of the model's ctx window, so it scales when you switch models - the value on the right is what it is right now. Never rises above the max, and yields to it on tiny regions. Enter opens a free numeric entry (1-99). Default 5.",
 		});
 		rows.push({
 			id: "summaryMax",
-			label: "Summary max (% of ctx to compact):",
-			currentValue: `${o.summaryMaxPercent}% (now: ${fmt(Math.round((o.summaryMaxPercent * regionNow) / 100))} tok)`,
+			label: "Summary max (% of ctx window):",
+			currentValue: `${o.summaryMaxPercent}% (now: ${fmt(Math.round((o.summaryMaxPercent * (ctx?.model?.contextWindow ?? 0)) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
 				"Upper clamp on the summary aim - generation-time guard (a 968k region at 10% would ask for a 97k summary; the ceiling caps it) and the hard cap on the accepted summary. Free entry. Default 32,768.",
@@ -3730,7 +3739,7 @@ async function previewDescription(ctx: Ctx, ref: string): Promise<void> {
 	const msgs: any[] = (projection?.messages ?? []).filter((m: any) => m?.role !== "system");
 	const chars = msgs.reduce((a: number, m: any) => a + contentTextOf(m.content).length, 0);
 	const inputTokens = Math.ceil((chars * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
-	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false }, 0);
+	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: ctx?.model?.contextWindow ?? 0 }, 0);
 	const text = buildInstructions({
 		sizes,
 		inputTokens,
@@ -4957,18 +4966,18 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 				},
 			},
 			{
-				label: `Summary min - now ${o.summaryMinPercent}% of the compacted region`,
-				hint: "The acceptance minimum: a summary shorter than this is thrown away. Percent of the ctx getting compacted. Free numeric entry.",
+				label: `Summary min - now ${o.summaryMinPercent}% of the ctx window`,
+				hint: "The acceptance minimum: a summary shorter than this is thrown away. Percent of the model's ctx window. Free numeric entry.",
 				run: async () => {
-					const v = await askNumber(ctx, "Summary min — % of the context getting compacted (default 5)", o.summaryMinPercent, 1, 99, "percent");
+					const v = await askNumber(ctx, "Summary min — % of the ctx window (default 5)", o.summaryMinPercent, 1, 99, "percent");
 					if (v !== undefined) setModelOptions(ref, { summaryMinPercent: v });
 				},
 			},
 			{
-				label: `Summary max - now ${o.summaryMaxPercent}% of the compacted region`,
-				hint: "The acceptance maximum: a summary longer than this is thrown away. Percent of the ctx getting compacted. Free numeric entry.",
+				label: `Summary max - now ${o.summaryMaxPercent}% of the ctx window`,
+				hint: "The acceptance maximum: a summary longer than this is thrown away. Percent of the model's ctx window. Free numeric entry.",
 				run: async () => {
-					const v = await askNumber(ctx, "Summary max — % of the context getting compacted (default 50)", o.summaryMaxPercent, 1, 99, "percent");
+					const v = await askNumber(ctx, "Summary max — % of the ctx window (default 50)", o.summaryMaxPercent, 1, 99, "percent");
 					if (v !== undefined) setModelOptions(ref, { summaryMaxPercent: v });
 				},
 			},
@@ -5101,7 +5110,7 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 		const o = optionsFor(cfg, ref, model);
 		const th = model ? effectiveThinking(o.thinking, model) : { level: o.thinking, note: "" };
 		lines.push(
-			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of it, thinking ${th.level}, draft ${o.draft}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
+			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of the ctx window, thinking ${th.level}, draft ${o.draft}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
 		);
 	});
 	lines.push(`retries: ${cfg.retries} per model, ${cfg.retryDelaySeconds}s apart · no-think tag: ${cfg.noThinkMarker || "(empty)"} · additional instruction: ${cfg.additionalInstruction ? "custom" : "default (turn ledger)"} · transcript pointer: ${cfg.transcriptPointer ? "on" : "off"}`);
@@ -5315,7 +5324,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 								.map((ref, i) => {
 									const model = lookupRef(ref, ctx);
 									const o = optionsFor(loadConfig(), ref, model);
-									return `${i + 1}. ${ref} — summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of it, ${timeoutLabel(o.timeoutMs)}, ${o.thinking}`;
+									return `${i + 1}. ${ref} — summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of the ctx window, ${timeoutLabel(o.timeoutMs)}, ${o.thinking}`;
 								})
 								.join("\n"),
 						);
@@ -5342,7 +5351,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (parts.length === 2) {
 						const model = lookupRef(ref, ctx);
 						const o = optionsFor(loadConfig(), ref, model);
-						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of it, draft ${o.draft}, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
+						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${o.summaryPercent}% of the compacted region, limits min ${o.summaryMinPercent}% / max ${o.summaryMaxPercent}% of the ctx window, draft ${o.draft}, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
 					}
 					const patch: Partial<ModelOptions> = {};
 					for (let i = 2; i < parts.length; i += 2) {
@@ -5369,7 +5378,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (!loadConfig().models[ref]) rotateAdd(ref);
 					setModelOptions(ref, patch);
 					const o2 = optionsFor(loadConfig(), ref, lookupRef(ref, ctx));
-					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${o2.summaryPercent}% of the compacted region, limits min ${o2.summaryMinPercent}% / max ${o2.summaryMaxPercent}% of it, draft ${o2.draft}, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
+					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${o2.summaryPercent}% of the compacted region, limits min ${o2.summaryMinPercent}% / max ${o2.summaryMaxPercent}% of the ctx window, draft ${o2.draft}, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
 				}
 				case "elision": {
 					const sub = (parts[1] ?? "").toLowerCase();
@@ -5448,7 +5457,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						const main = serializeRegion(region, { startTurn: prevTurn.lastTurn, inputStubs: profile.inputStubs, argCap: profile.argCap });
 						const keptText = kept.map((m: any) => `[${String(m.role)} - kept]: ${contentTextOf(m.content).slice(0, 200)}`).join("\n");
 						const inputTokens = Math.ceil((main.text.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
-						const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false }, 0);
+						const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: ctx?.model?.contextWindow ?? 0 }, 0);
 						const instructions = buildInstructions({ sizes, inputTokens, kind: isLocalModel(model) ? "local" : "online", options: profile, additionalInstruction: cfg2.additionalInstruction, customInstructions: undefined });
 						const text = [
 							"PREVIEW - what the direct summarization request would contain (approximation: the real region is chosen by pi's cut logic at compaction time; the last two messages stand in for the kept tail).",
