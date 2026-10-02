@@ -3034,7 +3034,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryPct",
-			label: "Summary aim (% of ctx getting compacted):",
+			label: "Summary aim (% of ctx to compact):",
 			currentValue: `${o.summaryPercent}% (now: ~${fmt(Math.round((o.summaryPercent * regionNow) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
@@ -3042,7 +3042,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryMin",
-			label: "Summary min limit (% of ctx getting compacted):",
+			label: "Summary min (% of ctx to compact):",
 			currentValue: `${o.summaryMinPercent}% (now: ${fmt(Math.round((o.summaryMinPercent * regionNow) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
@@ -3050,7 +3050,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 		});
 		rows.push({
 			id: "summaryMax",
-			label: "Summary max limit (% of ctx getting compacted):",
+			label: "Summary max (% of ctx to compact):",
 			currentValue: `${o.summaryMaxPercent}% (now: ${fmt(Math.round((o.summaryMaxPercent * regionNow) / 100))} tok)`,
 			values: [EDIT_NUMBER],
 			description:
@@ -3367,7 +3367,7 @@ class CategoryDescList implements Component, Focusable {
 			},
 			{
 				id: "__previewExt",
-				label: "Preview the extension defaults (all 4):",
+				label: "Preview the extension defaults:",
 				currentValue: "read-only",
 				values: ["preview"],
 				description: "The built-in extension default sentences for this category - what Ctrl+R resets to.",
@@ -3774,21 +3774,21 @@ class AutoCompactionMenu implements Component, Focusable {
 		return [
 			{
 				id: "startPct",
-				label: "Start auto-compaction at % of ctx window:",
+				label: "Start auto-compaction at % of ctx:",
 				currentValue: `${cfg.scaling.startPercent}% (now: ${fmt(point)} tok, based on min/max limits and current ctx window of ${fmt(window)} tok)`,
 				values: ["edit"],
 				description: "The compaction starts when the ctx reaches this percent of the model's window (the value on the right is what that is right now, based on the min/max limits below). Enter opens a free numeric entry (1-99). Default 82.",
 			},
 			{
 				id: "resMin",
-				label: "Min reserve tok before auto-compaction:",
+				label: "Min reserve tok before auto-comp.:",
 				currentValue: `${fmt(cfg.scaling.reserveMin)} tok (Overrides the auto-compaction point if the % value is lower than this min limit)`,
 				values: ["edit"],
 				description: "The minimum space kept free at the top of the window. If the % above would leave less room than this, this minimum wins. Enter opens a free numeric entry. Default 12,288.",
 			},
 			{
 				id: "resMax",
-				label: "Max reserve tok before auto-compaction:",
+				label: "Max reserve tok before auto-comp.:",
 				currentValue: `${fmt(cfg.scaling.reserveMax)} tok (Overrides the auto-compaction point if the % value is higher than this max limit)`,
 				values: ["edit"],
 				description: "The maximum space kept free at the top of the window. If the % above would leave more room than this, this maximum wins (on a 1M window this is what caps the reserve). Enter opens a free numeric entry. Default 80,000.",
@@ -3944,7 +3944,7 @@ class ElisionMenu implements Component, Focusable {
 			},
 			{
 				id: "elisionStart",
-				label: "Start auto-elision at % of ctx window:",
+				label: "Start auto-elision at % of ctx:",
 				currentValue: `${e.softPercent}% (now: ${fmt(Math.round((e.softPercent * window) / 100))} tok)`,
 				values: ["edit"],
 				description: "Elision begins when the context reaches this percent of the model's window (the value on the right is what that is right now). Enter opens a free numeric entry (1-99). Default 20.",
@@ -3958,28 +3958,28 @@ class ElisionMenu implements Component, Focusable {
 			},
 			{
 				id: "elisionTail",
-				label: "Preserve last x chars of tool call results:",
+				label: "Preserve last x chars of results:",
 				currentValue: `${typeof e.stubTailChars === "number" ? fmt(e.stubTailChars) : "full"} chars`,
 				values: ["edit"],
 				description: "How much of each tool result's ending survives inside its stub (the outcome usually lives there). Enter opens a free numeric entry (0 = none). Default 300.",
 			},
 			{
 				id: "elisionSavings",
-				label: "Auto-elide only if it saves at least x tok:",
+				label: "Auto-elide if it saves x tok:",
 				currentValue: `${fmt(e.minSavingsTokens)} tok`,
 				values: ["edit"],
 				description: "A sweep is only taken if it actually saves at least this many tok - no busywork. Enter opens a free numeric entry. Default 2,000.",
 			},
 			{
 				id: "elisionResults",
-				label: "Auto-elide only when at least x results:",
+				label: "Auto-elide only at x results:",
 				currentValue: `${e.minResultsToStub} results`,
 				values: ["edit"],
 				description: "A sweep waits until at least this many tool results qualify - no churn for one lonely old test run. Enter opens a free numeric entry. Default 4.",
 			},
 			{
 				id: "elisionStop",
-				label: "Stop auto-eliding x tok before auto-compaction:",
+				label: "Stop eliding x tok before trigger:",
 				currentValue: `${fmt(e.stopGapTokens)} tok (now: ${fmt(Math.max(0, point - e.stopGapTokens))} tok)`,
 				values: ["edit"],
 				description: "A safety distance from the auto-compaction point: elision will not push the context closer than this (the value on the right is the effective stop line right now) - near compaction, sweeping would be wasted anyway. Enter opens a free numeric entry. Default 4,000.",
