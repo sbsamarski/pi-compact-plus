@@ -1519,6 +1519,44 @@ export function preprocessForSummariser(prep: any, options: { inputStubs: boolea
  * moments later.
  */
 const elisionStateBySession = new Map<string, { applied: Map<string, { stub: string; savedTokens: number }> }>();
+
+/** The elision state persists per session (the stubbed tool-call ids + their stubs): a pi restart
+ *  used to wipe it, so the same batch re-fired with identical numbers after every resume (the
+ *  repeating log lines). Stored under ~/.pi/agent/pi-compact-plus-state/<sessionId>.json; files
+ *  older than 3 days are ignored (a stale session's ids are stale). */
+const ELISION_STATE_DIR = join(AGENT_DIR, "pi-compact-plus-state");
+
+function elisionStatePath(sessionId: string): string {
+	const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "session";
+	return join(ELISION_STATE_DIR, `${safe}.json`);
+}
+
+function loadElisionState(sessionId: string): { applied: Map<string, { stub: string; savedTokens: number }> } {
+	const applied = new Map<string, { stub: string; savedTokens: number }>();
+	try {
+		const file = elisionStatePath(sessionId);
+		if (Date.now() - statSync(file).mtimeMs > 3 * 86_400_000) return { applied }; // a stale session's state
+		const raw = JSON.parse(readFileSync(file, "utf8"));
+		for (const [key, entry] of Object.entries(raw?.applied ?? {})) {
+			const e = entry as any;
+			if (typeof e?.stub === "string" && typeof e?.savedTokens === "number") applied.set(key, { stub: e.stub, savedTokens: e.savedTokens });
+		}
+	} catch {
+		/* no state yet - fresh session */
+	}
+	return { applied };
+}
+
+function saveElisionState(sessionId: string, state: { applied: Map<string, { stub: string; savedTokens: number }> }): void {
+	try {
+		mkdirSync(ELISION_STATE_DIR, { recursive: true });
+		const obj: Record<string, { stub: string; savedTokens: number }> = {};
+		for (const [k, v] of state.applied) obj[k] = v;
+		writeFileSync(elisionStatePath(sessionId), JSON.stringify({ applied: obj }, null, 0), "utf8");
+	} catch {
+		/* state persistence is best-effort */
+	}
+}
 const lastGateNoteMs = new Map<string, number>();
 
 export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | undefined {
@@ -1556,7 +1594,7 @@ export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | u
 	})();
 
 	if (!state) {
-		state = { applied: new Map() };
+		state = loadElisionState(sessionId);
 		elisionStateBySession.set(sessionId, state);
 	}
 	// Prune applied stubs whose result no longer exists (after a compaction or /clear).
@@ -1614,7 +1652,10 @@ export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | u
 	}
 	if (newCandidates.length >= el.minResultsToStub && newSavings >= el.minSavingsTokens && postBatchWire < stopTokens) {
 		for (const c of newCandidates) state!.applied.set(c.key, { stub: c.stub, savedTokens: c.savedTokens });
-		logLine(cfg, { event: "elision", applied: newCandidates.length, savedTokens: newSavings, effTokens, postBatchWire, softTokens, stopTokens, window, protectRecentTokens: el.protectRecentTokens });
+		saveElisionState(sessionId, state!);
+		const resultsTok = newCandidates.reduce((sum, c) => sum + Math.round(msgTokens(messages[c.index])), 0);
+		const stubTok = resultsTok - newSavings;
+		logLine(cfg, { event: "elision", applied: newCandidates.length, resultsTokens: resultsTok, stubTokens: stubTok, savedTokens: newSavings, effTokens, postBatchWire });
 		ctx?.ui?.notify?.(`elision: ${newCandidates.length} tool result${newCandidates.length === 1 ? "" : "s"} stubbed · ${fmt(effTokens)} → ${fmt(postBatchWire)} tokens`, "info");
 	}
 
@@ -4357,7 +4398,7 @@ export class CompactionBoard implements Component, Focusable {
 			id: "log",
 			label: "Log",
 			currentValue: "",
-			submenu: (_current: string, done: (selectedValue?: string) => void) => new LogView(done),
+			submenu: (_current: string, done: (selectedValue?: string) => void) => new LogView(this.tui, done),
 			description: `One line per try: status, model, time, tok in and out, and why something failed. File: ${LOG_PATH}`,
 		});
 		return rows;
@@ -4457,14 +4498,30 @@ export class CompactionBoard implements Component, Focusable {
 
 /** Read-only view of the last log lines; Esc closes. */
 export class LogView implements Component {
-	constructor(private done: () => void) {}
-	invalidate(): void {}
+	constructor(private tui: any, private done: () => void) {}
 	handleInput(data: string): void {
 		const k = keyOf(data);
 		if (k === "escape" || k === "enter" || k === "q") this.done();
+		else if (k === "up") { this.offset = Math.max(0, this.offset - 1); this.tui?.requestRender?.(); }
+		else if (k === "down") { this.offset += 1; this.tui?.requestRender?.(); }
+		else if (k === "pgup") { this.offset = Math.max(0, this.offset - 30); this.tui?.requestRender?.(); }
+		else if (k === "pgdn") { this.offset += 30; this.tui?.requestRender?.(); }
 	}
+	private offset = 0;
+
+	invalidate(): void {}
+
 	render(width: number): string[] {
-		const lines = ["Log — Esc to go back", "", ...tailLogPretty(16).split("\n")];
+		const all = tailLogPretty(200).split("\n");
+		const perPage = 30;
+		const maxOffset = Math.max(0, all.length - perPage);
+		this.offset = Math.min(this.offset, maxOffset);
+		const shown = all.slice(this.offset, this.offset + perPage);
+		const lines = [
+			`Log — showing ${all.length - this.offset - shown.length + 1}-${all.length - this.offset} of ${all.length} recent lines — Up/Down or PgUp/PgDn to scroll, Esc to go back`,
+			"",
+			...shown,
+		];
 		return lines.map((l) => truncateToWidth(l, Math.max(60, width)));
 	}
 }
@@ -5233,7 +5290,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			changed = true;
 		}
 		if (!changed) return undefined;
-		logLine(loadConfig(), { event: "cap", model: String(p.model ?? "").slice(0, 80), capped: cap });
+		/* no log line: the cap fires on most big-window requests - pure noise in the log */
 		return p;
 	});
 
