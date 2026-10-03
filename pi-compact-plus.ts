@@ -1656,7 +1656,10 @@ export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | u
 		const resultsTok = newCandidates.reduce((sum, c) => sum + Math.round(msgTokens(messages[c.index])), 0);
 		const stubTok = resultsTok - newSavings;
 		logLine(cfg, { event: "elision", applied: newCandidates.length, resultsTokens: resultsTok, stubTokens: stubTok, savedTokens: newSavings, effTokens, postBatchWire });
-		ctx?.ui?.notify?.(`elision: ${newCandidates.length} tool result${newCandidates.length === 1 ? "" : "s"} stubbed · ${fmt(effTokens)} → ${fmt(postBatchWire)} tokens`, "info");
+		let totalResults = state!.applied.size;
+		let totalSaved = 0;
+		for (const [, entry] of state!.applied) totalSaved += entry.savedTokens;
+		ctx?.ui?.notify?.(`Elision: ${newCandidates.length} new tool call${newCandidates.length === 1 ? "" : "s"} stubbed, ${fmt(newSavings)} tok saved. Total: ${fmt(totalResults)} tool results stubbed, ${fmt(totalSaved)} tok saved.`, "info");
 	}
 
 	if (state.applied.size === 0) return undefined;
@@ -4507,7 +4510,7 @@ export class LogView implements Component {
 		else if (k === "pgup") { this.offset = Math.max(0, this.offset - 30); this.tui?.requestRender?.(); }
 		else if (k === "pgdn") { this.offset += 30; this.tui?.requestRender?.(); }
 	}
-	private offset = 0;
+	private offset = -1; // -1 = start at the newest page
 
 	invalidate(): void {}
 
@@ -4515,6 +4518,7 @@ export class LogView implements Component {
 		const all = tailLogPretty(200).split("\n");
 		const perPage = 30;
 		const maxOffset = Math.max(0, all.length - perPage);
+		if (this.offset < 0) this.offset = maxOffset; // the first open shows the NEWEST entries
 		this.offset = Math.min(this.offset, maxOffset);
 		const shown = all.slice(this.offset, this.offset + perPage);
 		const lines = [
