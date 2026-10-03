@@ -1557,7 +1557,6 @@ function saveElisionState(sessionId: string, state: { applied: Map<string, { stu
 		/* state persistence is best-effort */
 	}
 }
-const lastGateNoteMs = new Map<string, number>();
 
 export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | undefined {
 	const cfg = loadConfig();
@@ -1636,20 +1635,6 @@ export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | u
 	const stopTokens = Math.max(softTokens, compactionPoint - el.stopGapTokens);
 	const appliedSaved = [...state!.applied.values()].reduce((s, e) => s + e.savedTokens, 0);
 	const postBatchWire = effTokens - appliedSaved - newSavings;
-	// WHY a sweep is waiting (the gate visibility): not armed, or armed but refused - throttled to
-	// once a minute per session, so the log always answers "why didn't elision fire?".
-	const waitReasons: string[] = [];
-	if (effTokens < softTokens) waitReasons.push(`the ctx estimate ${fmt(effTokens)} tok is below the start line ${fmt(softTokens)} tok (${el.softPercent}% of the ${fmt(window)} tok window)`);
-	if (newCandidates.length > 0 && newCandidates.length < el.minResultsToStub) waitReasons.push(`${newCandidates.length} candidate${newCandidates.length === 1 ? "" : "s"} waiting (the setting wants ${el.minResultsToStub})`);
-	if (newCandidates.length > 0 && newSavings < el.minSavingsTokens) waitReasons.push(`the savings would be ~${fmt(newSavings)} tok (the setting wants ${fmt(el.minSavingsTokens)})`);
-	if (newCandidates.length > 0 && !(postBatchWire < stopTokens)) waitReasons.push(`the post-batch wire ${fmt(postBatchWire)} tok would sit above the stop line ${fmt(stopTokens)} tok (the ctx window ${fmt(window)}, the compaction point ${fmt(compactionPoint)}, the stop gap ${fmt(el.stopGapTokens)})`);
-	if (waitReasons.length) {
-		const now = Date.now();
-		if (now - (lastGateNoteMs.get(sessionId) ?? 0) > 60_000) {
-			lastGateNoteMs.set(sessionId, now);
-			logLine(cfg, { event: "elision_wait", reasons: waitReasons.join("; "), effTokens, softTokens, window });
-		}
-	}
 	if (newCandidates.length >= el.minResultsToStub && newSavings >= el.minSavingsTokens && postBatchWire < stopTokens) {
 		for (const c of newCandidates) state!.applied.set(c.key, { stub: c.stub, savedTokens: c.savedTokens });
 		saveElisionState(sessionId, state!);
