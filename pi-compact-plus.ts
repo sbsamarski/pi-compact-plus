@@ -914,7 +914,9 @@ function tailLogPretty(lines = 16): string {
 												? "START"
 												: String(d.event ?? "").toUpperCase();
 					const why = d.reason ?? (d.error ? String(d.error).split("\n")[0].slice(0, 90) : "");
-					return [stamp, status, ref ?? "", seconds, transfer, window, why].filter(Boolean).join(" · ");
+					// The elision events carry their own figures.
+					const elision = d.event === "elision" ? [`${fmt(d.applied ?? 0)} result${d.applied === 1 ? "" : "s"} elided`, `${fmt(d.resultsTokens ?? 0)} tok -> ${fmt(d.stubTokens ?? 0)} tok`, `saved ${fmt(d.savedTokens ?? 0)} tok`, `ctx ~${fmt(d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`].join(" · ") : "";
+					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why].filter(Boolean).join(" · ");
 				} catch {
 					return l.slice(0, 160);
 				}
