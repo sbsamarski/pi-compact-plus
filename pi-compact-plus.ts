@@ -63,7 +63,10 @@ const AGENT_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_PATH = process.env.COMPACTION_PLUS_CONFIG?.trim()
 	? resolve(process.env.COMPACTION_PLUS_CONFIG.trim())
 	: join(AGENT_DIR, "pi-compact-plus.json");
-const LOG_PATH = join(AGENT_DIR, "pi-compact-plus.log");
+// The log and the state dir live next to the config: the tests (COMPACTION_PLUS_CONFIG pointed at a
+// scratch dir) then never write to the user's real log (the 2026-10-04 bug: test-run elision events
+// with fake-context numbers polluted the live log and looked like real sessions failing).
+const LOG_PATH = join(CONFIG_PATH, "..", "pi-compact-plus.log");
 const LOG_MAX_BYTES = 1_000_000;
 
 /** Pseudo model reference meaning "the model pi is using right now". */
@@ -1526,7 +1529,7 @@ const elisionStateBySession = new Map<string, { applied: Map<string, { stub: str
  *  used to wipe it, so the same batch re-fired with identical numbers after every resume (the
  *  repeating log lines). Stored under ~/.pi/agent/pi-compact-plus-state/<sessionId>.json; files
  *  older than 3 days are ignored (a stale session's ids are stale). */
-const ELISION_STATE_DIR = join(AGENT_DIR, "pi-compact-plus-state");
+const ELISION_STATE_DIR = join(CONFIG_PATH, "..", "pi-compact-plus-state");
 
 function elisionStatePath(sessionId: string): string {
 	const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "session";
@@ -1642,7 +1645,7 @@ export function applyElision(messages: any[], ctx: Ctx, opts?: { force?: boolean
 		saveElisionState(sessionId, state!);
 		const resultsTok = newCandidates.reduce((sum, c) => sum + Math.round(msgTokens(messages[c.index])), 0);
 		const stubTok = resultsTok - newSavings;
-		logLine(cfg, { event: "elision", applied: newCandidates.length, resultsTokens: resultsTok, stubTokens: stubTok, savedTokens: newSavings, effTokens, postBatchWire });
+		logLine(cfg, { event: "elision", sid: String(sessionId).slice(-8), applied: newCandidates.length, resultsTokens: resultsTok, stubTokens: stubTok, savedTokens: newSavings, effTokens, postBatchWire });
 		let totalResults = state!.applied.size;
 		let totalSaved = 0;
 		for (const [, entry] of state!.applied) totalSaved += entry.savedTokens;
