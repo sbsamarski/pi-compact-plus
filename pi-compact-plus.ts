@@ -1560,7 +1560,7 @@ function saveElisionState(sessionId: string, state: { applied: Map<string, { stu
 	}
 }
 
-export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | undefined {
+export function applyElision(messages: any[], ctx: Ctx, opts?: { force?: boolean }): { messages: any[] } | undefined {
 	const cfg = loadConfig();
 	const el = cfg.elision;
 	const sessionId = String(ctx?.sessionManager?.getSessionId?.() ?? "session");
@@ -1606,7 +1606,7 @@ export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | u
 	// Eligible = tool results before the protected window, oldest first, not yet applied, big
 	// enough for a stub to pay for itself (the stub itself costs ~60-100 tokens).
 	const candidates: Array<{ index: number; key: string; stub: string; savedTokens: number }> = [];
-	if (effTokens >= softTokens) {
+	if (opts?.force || effTokens >= softTokens) {
 		for (let i = 0; i < messages.length && i < protectedFrom; i++) {
 			const m = messages[i];
 			if (!isToolResult(m)) continue;
@@ -1637,7 +1637,7 @@ export function applyElision(messages: any[], ctx: Ctx): { messages: any[] } | u
 	const stopTokens = Math.max(softTokens, compactionPoint - el.stopGapTokens);
 	const appliedSaved = [...state!.applied.values()].reduce((s, e) => s + e.savedTokens, 0);
 	const postBatchWire = effTokens - appliedSaved - newSavings;
-	if (newCandidates.length >= el.minResultsToStub && newSavings >= el.minSavingsTokens && postBatchWire < stopTokens) {
+	if (opts?.force || (newCandidates.length >= el.minResultsToStub && newSavings >= el.minSavingsTokens && postBatchWire < stopTokens)) {
 		for (const c of newCandidates) state!.applied.set(c.key, { stub: c.stub, savedTokens: c.savedTokens });
 		saveElisionState(sessionId, state!);
 		const resultsTok = newCandidates.reduce((sum, c) => sum + Math.round(msgTokens(messages[c.index])), 0);
@@ -4300,6 +4300,14 @@ export class CompactionBoard implements Component, Focusable {
 				"WHAT STAYS WORD FOR WORD: the newest tail of the conversation kept outside every summary (and protected from elision), so resuming feels continuous. The submenu shows the live preserved window (read-only) and its three settings. Enter opens it; Enter on a setting opens its editor.",
 		});
 		rows.push({
+			id: "elisionNow",
+			label: "Start elision now",
+			currentValue: "Run the elision now",
+			values: ["Run the elision now"],
+			description:
+			"Runs an elision sweep RIGHT NOW, regardless of the start percentage and the batch thresholds: every tool result outside the preserved tail becomes a stub (the board closes, the stubs persist in the session state, and the next request carries them). Use it when you can see the context climbing and do not want to wait for the sweep to accumulate candidates.",
+		});
+		rows.push({
 			id: "compactNow",
 			label: "Start compaction now",
 			currentValue: "Start the compaction now",
@@ -4437,6 +4445,11 @@ export class CompactionBoard implements Component, Focusable {
 			update((c) => void (c.elision = { ...c.elision, enabled: value === "on" }));
 		} else if (id === "chatCap") {
 			update((c) => void (c.chatMaxTokensCap = value === "no cap" ? 0 : Number(String(value).replace(/[^0-9]/g, "")) || 0));
+		} else if (id === "elisionNow") {
+			// A manual sweep: the board closes, the sweep runs against the current session, and the
+			// stubs persist in the state (the next request carries them).
+			this.finish({ action: "elision-now" });
+			return;
 		} else if (id === "compactNow") {
 			// Manual compaction through pi (same as /compact): it fires session_before_compact and the
 			// fork's rotation answers. Close the board first so the progress is visible.
@@ -4687,6 +4700,19 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		if (result.action?.startsWith("preview-template:")) {
 			await previewTemplate(ctx, result.action.slice("preview-template:".length));
 			restore = { rowId: "instruction" };
+			continue;
+		}
+		if (result.action === "elision-now") {
+			const projection: any = ctx?.sessionManager?.buildSessionProjection?.();
+			const msgs: any[] = (projection?.messages ?? []).filter((m: any) => m?.role !== "system");
+			const r = applyElision(structuredClone(msgs), ctx, { force: true });
+			ctx?.ui?.notify?.(
+				r
+					? `Elision done - ${fmt(r.messages.length)} messages processed; the stubs are live from the next request.`
+					: "Nothing to elide - no eligible tool results outside the preserved tail.",
+				"info",
+			);
+			restore = { rowId: "elisionNow" };
 			continue;
 		}
 		if (result.action === "compact-stock-now") {
