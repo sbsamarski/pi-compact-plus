@@ -288,3 +288,7 @@ no dependencies beyond what pi already ships.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+> **Note on `tsconfig.json`:** it exists only for optional type-checking on the maintainer's machine
+> (its `paths` entries point at the maintainer's global pi install). It is never used at runtime and
+> does not affect loading, running, or installing this extension on another computer.
