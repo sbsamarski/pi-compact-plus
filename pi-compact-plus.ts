@@ -4301,7 +4301,7 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "elisionNow",
-			label: "Start elision now",
+			label: "Run elision now",
 			currentValue: "Run the elision now",
 			values: ["Run the elision now"],
 			description:
@@ -4309,17 +4309,17 @@ export class CompactionBoard implements Component, Focusable {
 		});
 		rows.push({
 			id: "compactNow",
-			label: "Start compaction now",
-			currentValue: "Start the compaction now",
-			values: ["Start the compaction now"],
+			label: "Run compaction now",
+			currentValue: "Run the compaction now",
+			values: ["Run the compaction now"],
 			description:
 				"Starts a compaction RIGHT NOW: pi prepares the session and the Compaction models rotation answers it (the board closes so you can watch the progress). The automatic starter lives in the Auto-compaction submenu's trigger point - when the ctx crosses it while pi is idle, the same compaction starts by itself.",
 		});
 		rows.push({
 			id: "compactStock",
-			label: "Start pi's built-in compaction now",
-			currentValue: `Start pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
-			values: [`Start pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`],
+			label: "Run pi's built-in compaction now",
+			currentValue: `Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
+			values: [`Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`],
 			description:
 				"Runs pi's OWN compaction once, bypassing the rotation: pi prepares the session and summarizes with the active model, aiming at 0.8 x its reserveTokens (the number on the right). Use it to compare pi's stock summary with the extension's. Everything else (the rotation, the gates) stays in place for the next compaction.",
 		});
