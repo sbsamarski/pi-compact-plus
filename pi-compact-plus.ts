@@ -5244,18 +5244,20 @@ function watcherTick(): void {
 		const window = (ctx as any)?.model?.contextWindow ?? 0;
 		if (!(window > 0)) return;
 		if ((ctx as any)?.isIdle?.() === false) return; // never abort a running generation
-		const usage = (ctx as any)?.getContextUsage?.();
-		let tokens = typeof usage?.tokens === "number" ? usage.tokens : 0;
-		if (typeof tokens !== "number" || !(tokens > 0)) {
-			// pi's getContextUsage defaults to undefined until the session wires it (the local-model
-			// resume case, 2026-10-04: the auto-compact could never fire without this). Fall back to
-			// the fork's message-sum estimate - the same number the elision gate uses.
-			const projection: any = ctx?.sessionManager?.buildSessionProjection?.();
-			const msgs: any[] = (projection?.messages ?? []).filter((m: any) => m?.role !== "system");
-			const sum = msgs.reduce((acc: number, m: any) => acc + msgTokens(m), 0);
-			if (!(sum > 0)) return;
-			tokens = sum;
-		}
+	// The compaction's pressure is what the model ACTUALLY processes - the elided requests.
+	// pi's number IS that number (the last elided request's tokens - the one the user watches
+	// on the status bar). The raw session size does not pressure the requests; the elision
+	// handles that. Only fall back to the message-sum estimate when pi's number is unwired
+	// (some sessions never wire getContextUsage - the 2026-10-04 local-resume case).
+	const usage = (ctx as any)?.getContextUsage?.();
+	let tokens = typeof usage?.tokens === "number" && usage.tokens > 0 ? usage.tokens : 0;
+	if (!(tokens > 0)) {
+		const projection: any = ctx?.sessionManager?.buildSessionProjection?.();
+		const msgs: any[] = (projection?.messages ?? []).filter((m: any) => m?.role !== "system");
+		const sum = msgs.reduce((acc: number, m: any) => acc + msgTokens(m), 0);
+		if (!(sum > 0)) return; // nothing to measure at all
+		tokens = sum;
+	}
 		const line = window - extReserve(ctx);
 		if (tokens < line) return;
 		const now = Date.now();
