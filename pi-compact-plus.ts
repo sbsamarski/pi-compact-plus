@@ -375,16 +375,12 @@ const DEFAULT_KEEP_RECENT_TOKENS = 20000;
  * words delivered 1,668 with two headings left nearly empty. The text below names that line and
  * says what replaces it, then pins the size.
  */
-function lengthBlock(sizes: Sizes, inputTokens: number): string {
-	const window =
-		sizes.min > 0
-			? `Aim for about ${fmt(sizes.target)} tokens (around ${fmt(wordsFor(sizes.target))} words). A summary under ${fmt(sizes.min)} tokens (around ${fmt(wordsFor(sizes.min))} words) or over ${fmt(sizes.max)} tokens (around ${fmt(wordsFor(sizes.max))} words) is rejected. If you approach the ${fmt(sizes.max)}-tok ceiling, tighten the least important details and land on a finished item, never mid-item.`
-		: `aim for about ${fmt(sizes.target)} tokens (roughly ${fmt(wordsFor(sizes.target))} words); there is no hard minimum, but a very thin summary leaves the next request blind, so write freely and do not stop early. Your text is cut off at ${fmt(sizes.max)} tok.`
-	return [
-		`This is a summary request. The conversation segment below is about ${fmt(inputTokens)} tok and is the memory being replaced - the moment you stop writing, the original messages are deleted and the next model continues the work from your summary alone.`,
-		`IMPORTANT - length: ${window} Do not stop early and do not save tok: covering the whole segment is the one thing that matters.`,
-		`Override: the line "Keep each section concise" in the instructions above does not apply to this job. It is written for a summary that sits beside the full transcript; here the transcript is deleted and your text is the only memory the next request has. Completeness beats brevity. Long bullet lists are good. Repeating an exact value twice is good. Splitting one vague sentence into five specific ones is the point. Vagueness and omission are the only failures.`,
-	].join("\n");
+/** The computed length fragment, substituted into the template's {LENGTH INSTRUCTIONS} token. */
+function lengthFragment(sizes: Sizes, inputTokens: number): string {
+	if (sizes.min > 0) {
+		return `Aim for about ${fmt(sizes.target)} tokens (around ${fmt(wordsFor(sizes.target))} words). A summary under ${fmt(sizes.min)} tokens (around ${fmt(wordsFor(sizes.min))} words) or over ${fmt(sizes.max)} tokens (around ${fmt(wordsFor(sizes.max))} words) is rejected. If you approach the ${fmt(sizes.max)}-tok ceiling, tighten the least important details and land on a finished item, never mid-item.`;
+	}
+	return `aim for about ${fmt(sizes.target)} tokens (roughly ${fmt(wordsFor(sizes.target))} words); there is no hard minimum, but a very thin summary leaves the next request blind, so write freely and do not stop early. Your text is cut off at ${fmt(sizes.max)} tok.`;
 }
 /**
  * Instruction sentences per preservation level, per content type. The template's RULES section is
@@ -460,6 +456,11 @@ function draftBlock(mode: Draft): string {
  * Overrides block cancels the pi prompt lines that fight this shape.
  */
 export const DEFAULT_TEMPLATE_TEXT = [
+	`This is a summary request. The conversation segment below is about {SEGMENT SIZE} tok and is the memory being replaced - the moment you stop writing, the original messages are deleted and the next model continues the work from your summary alone.`,
+	`{LENGTH INSTRUCTIONS}`,
+	`Do not stop early and do not save tokens: covering the whole segment is the one thing that matters.`,
+	`Override: the line "Keep each section concise" in the instructions above does not apply to this job. It is written for a summary that sits beside the full transcript; here the transcript is deleted and your text is the only memory the next request has. Completeness beats brevity. Long bullet lists are good. Repeating an exact value in multiple turns is fine. Splitting one vague sentence into five specific ones is the point. Vagueness and omission are the only failures.`,
+	`{DRAFT INSTRUCTIONS}`,
 	`OUTPUT FORMAT - the format block above is replaced by this one. Use only the sections below, in this order, no preamble, no closing remarks.`,
 	``,
 	`## CURRENT STATE (the newest truth - where anything below conflicts with this section, THIS section wins)`,
@@ -467,14 +468,15 @@ export const DEFAULT_TEMPLATE_TEXT = [
 	`- Where things stand: done / in progress / blocked, with file paths.`,
 	`- Next step: the exact next action, with its parameters.`,
 	``,
-	`## TURN LEDGER (chronological; newer turns get more detail, oldest may tighten to one line)`,
-	`Every user turn gets one entry, in order, numbered with the word Turn and its number - exactly "Turn 12", never "12." or "1." alone.`,
-	`Turn 12 - user asked: "<the user's words, per the USER PROMPTS rule in Rules below>"`,
-	`    did: what the assistant concluded and did.`,
-	`    tools: <per the TOOL CALLS rule in Rules below; when that rule says VERBATIM, copy each stub whole onto its own indented line>`,
+	`## TURN LEDGER (Chronological; Newer turns get more detail, oldest may tighten to one line; Every user turn gets one entry, in ascending order, numbered with the word Turn and its number - use "Turn 12", never "12." alone; Shorten older turns but never drop them; Drop a sub-line when there is nothing to say in it)`,
+	`Turn 12`,
+	`    user: the user's words, per the USER PROMPTS rule in Rules below.`,
+	`    assistant thinking: what the assistant was thinking, per ASSISTANT THINKING SUMMARY rules in Rules below.`,
+	`    assistant replies: what the assistant replied, per ASSISTANT REPLIES SUMMARY rules in Rules below.`,
+	`    tools: per the TOOL CALLS rule in Rules below; when that rule says VERBATIM, copy each stub in full.`,
 	`    errors & fixes: what broke and how it was fixed.`,
-	`    decided: X over Y because ...`,
-	`(older turns tighten but are never dropped; leave a sub-line out when it has nothing to say)`,
+	`    decided: the choice made over the alternative, and why.`,
+	``,
 	``,
 	`## FILES & DATA`,
 	`- every file read, created or edited: full path, what it is, why it matters.`,
@@ -483,7 +485,7 @@ export const DEFAULT_TEMPLATE_TEXT = [
 	`- each choice and why it was picked over the alternatives, cross-referenced like "(Turn 12)".`,
 	``,
 	`## NEXT STEPS`,
-	`1. the exact next action, with the parameters needed to take it.`,
+	`- the exact next action, with needed parameters.`,
 	``,
 	`## CRITICAL CONTEXT`,
 	`- every number, version, model name, setting key, path and quota verbatim; error messages quoted exactly.`,
@@ -494,16 +496,16 @@ export const DEFAULT_TEMPLATE_TEXT = [
 	`{USER PROMPT SUMMARY}`,
 	`{ASSISTANT REPLIES SUMMARY}`,
 	`{ASSISTANT THINKING SUMMARY}`,
-	`- One concrete fact per bullet; never drop a file path, a number, or an error message to save space - when a heading looks thin, list the concrete items you saw instead of summarising them away.`,
+	`- One concrete fact per bullet; never drop a file path, a number, or an error message to save space - when a heading looks thin, list the concrete items you saw instead of summarising them.`,
 	`- If a later turn changes an earlier one, KEEP the earlier line and tag it: "(superseded by Turn N)" for a full reversal, "(amended by Turn N)" for a partial change. Never delete history.`,
 	`- Several user prompts can arrive while the assistant is still working - each is its own Turn, even a short one. In a chain of refinements, the newest wording is the current instruction; earlier ones stay, tagged against the turn that changed them.`,
 	`{STUB EXAMPLE RULE}`,
 	`- No wall-clock times exist in the input; order is expressed ONLY by the turn numbers.`,
 	`{PREVIOUS SUMMARY RULE}`,
 	``,
-	`Overrides - these lines in the instructions above do not apply here:`,
-	`- The format block and "Keep each section concise": the transcript is deleted the moment you stop writing and your text is the only memory the next request has - completeness beats brevity; long lists are good; splitting one vague sentence into five specific ones is the point; vagueness and omission are the only failures.`,
-	`- "If something is no longer relevant, you may remove it" and "UPDATE the Progress section": history is tagged, never deleted; CURRENT STATE is the progress section.`,
+	`Overrides - lines in the instructions above do not apply here:`,
+	`- The format block and "Keep each section concise": the transcript is deleted the moment you stop writing and your text is the only memory the next request has - completeness beats brevity; long lists are good; vagueness and omission are failures.`,
+	`- "If something is no longer relevant, you may remove it" and "UPDATE the Progress section": history is tagged, never deleted; CURRENT STATE is the progress section.`
 ].join("\n");
 
 /** The previous-summary section, attached mode only. */
@@ -547,7 +549,7 @@ export function layerTag(kind: "stubs" | "user" | "replies" | "thinking", level:
 /** Substitute the {TOKENS} in a template source for one model's options. Tokens that the source
  *  lost are auto-added at the end under a visible note - a user edit can never silently drop a
  *  preserve rule, and a hand-written source still yields a complete instruction. */
-export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean): string {
+export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean, extra?: { sizes?: Sizes; inputTokens?: number; draft?: Draft }): string {
 	let out = String(src ?? "");
 	const missing: string[] = [];
 	const sub = (token: string, value: string): void => {
@@ -573,6 +575,11 @@ export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean)
 				: "",
 	);
 	sub("{PREVIOUS SUMMARY SECTION}", o.chainMode === "attach" ? PREVIOUS_SECTION_TEXT : "");
+	// The computed fragments: the segment size, the length numbers, and the draft instruction (empty
+	// when a model's draft is off - the line then just disappears from the request).
+	sub("{SEGMENT SIZE}", extra?.inputTokens ? fmt(extra.inputTokens) : "");
+	sub("{LENGTH INSTRUCTIONS}", extra?.sizes ? lengthFragment(extra.sizes, extra.inputTokens ?? 0) : "");
+	sub("{DRAFT INSTRUCTIONS}", extra?.draft && extra.draft !== "off" ? draftBlock(extra.draft) : "");
 	if (missing.length) out += `\n\nRules the template lost (auto-added here; restore their {PLACEHOLDER} tokens to place them properly):\n${missing.join("\n")}`;
 	return out;
 }
@@ -607,8 +614,7 @@ export function buildInstructions(args: {
 	customInstructions?: string;
 }): string {
 	const { sizes, inputTokens, kind, options } = args;
-	const parts = [lengthBlock(sizes, inputTokens)];
-	if (options.draft !== "off") parts.push(draftBlock(options.draft));
+	const parts: string[] = [];
 	// THE SUMMARY TEMPLATE: the stored text (or the default) is the SOURCE; the per-model options
 	// substitute its {PLACEHOLDER} tokens. The template is always sent; the user may reword
 	// anything except the tokens (lost tokens are auto-added with a visible note).
@@ -618,7 +624,7 @@ export function buildInstructions(args: {
 		args.additionalInstruction !== undefined && args.additionalInstruction !== null
 			? args.additionalInstruction.trim() || DEFAULT_TEMPLATE_TEXT
 			: args.userDefault?.trim() || DEFAULT_TEMPLATE_TEXT;
-	parts.push(applyTemplate(tplSource, options, options.inputStubs));
+	parts.push(applyTemplate(tplSource, options, options.inputStubs, { sizes, inputTokens, draft: options.draft }));
 	if (args.customInstructions) parts.push(`Extra focus for this summary, from the user's own /compact note: ${args.customInstructions}`);
 	if (options.thinking === "off" && kind === "local" && options.noThinkMarker) parts.push(options.noThinkMarker);
 	return parts.filter(Boolean).join("\n\n");
