@@ -1964,6 +1964,11 @@ export async function directCompact(args: {
 	thinking: Level;
 	prevTurn: number;
 	customInstructions?: string;
+	/** The main template: the ACTIVE text (or null to follow the user default / the extension
+	 *  default). The direct request builds its own instructions, so these must ride in.
+	 */
+	additionalInstruction?: string | null;
+	userDefault?: string | null;
 }): Promise<{ text: string; usage: any; lastTurn: number; inputText: string }> {
 	const { preparation, model, registry, sizes, options } = args;
 	const startTurn = args.prevTurn > 0 ? args.prevTurn : 0;
@@ -1974,7 +1979,7 @@ export async function directCompact(args: {
 	const regionText = [main.text, prefix.text].filter(Boolean).join("\n\n");
 	const coverLine = `The conversation segment below covers Turns ${startTurn + 1}-${Math.max(main.lastTurn, prefix.lastTurn)} (already numbered - use those numbers).`;
 	const inputTokens = Math.ceil((regionText.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
-	const instructions = buildInstructions({ sizes, inputTokens, kind: args.kind, options, additionalInstruction: null, customInstructions: args.customInstructions });
+	const instructions = buildInstructions({ sizes, inputTokens, kind: args.kind, options, additionalInstruction: args.additionalInstruction ?? null, userDefault: args.userDefault, customInstructions: args.customInstructions });
 	const promptText = [
 		prevBlock,
 		prevBlock ? coverLine : coverLine,
@@ -2313,6 +2318,8 @@ export async function summarizeWithRotation(
 					signal: combined.signal,
 					thinking: th.level,
 					prevTurn: prevTurn.lastTurn,
+					additionalInstruction: cfg.additionalInstruction,
+					userDefault: cfg.templateUserDefaults,
 					customInstructions,
 					ref: c.ref,
 					kind: c.kind,
