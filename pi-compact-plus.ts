@@ -5245,8 +5245,17 @@ function watcherTick(): void {
 		if (!(window > 0)) return;
 		if ((ctx as any)?.isIdle?.() === false) return; // never abort a running generation
 		const usage = (ctx as any)?.getContextUsage?.();
-		const tokens = usage?.tokens;
-		if (typeof tokens !== "number" || !(tokens > 0)) return; // unknown until the next response
+		let tokens = typeof usage?.tokens === "number" ? usage.tokens : 0;
+		if (typeof tokens !== "number" || !(tokens > 0)) {
+			// pi's getContextUsage defaults to undefined until the session wires it (the local-model
+			// resume case, 2026-10-04: the auto-compact could never fire without this). Fall back to
+			// the fork's message-sum estimate - the same number the elision gate uses.
+			const projection: any = ctx?.sessionManager?.buildSessionProjection?.();
+			const msgs: any[] = (projection?.messages ?? []).filter((m: any) => m?.role !== "system");
+			const sum = msgs.reduce((acc: number, m: any) => acc + msgTokens(m), 0);
+			if (!(sum > 0)) return;
+			tokens = sum;
+		}
 		const line = window - extReserve(ctx);
 		if (tokens < line) return;
 		const now = Date.now();
