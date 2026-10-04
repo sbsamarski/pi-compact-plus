@@ -1640,6 +1640,7 @@ export function applyElision(messages: any[], ctx: Ctx, opts?: { force?: boolean
 	const stopTokens = Math.max(softTokens, compactionPoint - el.stopGapTokens);
 	const appliedSaved = [...state!.applied.values()].reduce((s, e) => s + e.savedTokens, 0);
 	const postBatchWire = effTokens - appliedSaved - newSavings;
+	if (opts?.force && newCandidates.length === 0) return undefined; // nothing new to elide
 	if (opts?.force || (newCandidates.length >= el.minResultsToStub && newSavings >= el.minSavingsTokens && postBatchWire < stopTokens)) {
 		for (const c of newCandidates) state!.applied.set(c.key, { stub: c.stub, savedTokens: c.savedTokens });
 		saveElisionState(sessionId, state!);
