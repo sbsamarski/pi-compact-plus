@@ -461,6 +461,7 @@ export const DEFAULT_TEMPLATE_TEXT = [
 	`Do not stop early and do not save tokens: covering the whole segment is the one thing that matters.`,
 	`Override: the line "Keep each section concise" in the instructions above does not apply to this job. It is written for a summary that sits beside the full transcript; here the transcript is deleted and your text is the only memory the next request has. Completeness beats brevity. Long bullet lists are good. Repeating an exact value in multiple turns is fine. Splitting one vague sentence into five specific ones is the point. Vagueness and omission are the only failures.`,
 	`{DRAFT INSTRUCTIONS}`,
+	``,
 	`OUTPUT FORMAT - the format block above is replaced by this one. Use only the sections below, in this order, no preamble, no closing remarks.`,
 	``,
 	`## CURRENT STATE (the newest truth - where anything below conflicts with this section, THIS section wins)`,
@@ -4292,7 +4293,7 @@ export class CompactionBoard implements Component, Focusable {
 		rows.push(numberRow("retryWait", "Wait between retries", `${cfg.retryDelaySeconds} s`, [], "Seconds before each retry (the next wait doubles). Free entry: type any number of seconds. Default 5 s."));
 		rows.push({
 			id: "autoMenu",
-			label: "Auto-compaction",
+			label: "Auto-compaction limits",
 			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
