@@ -5018,7 +5018,7 @@ class CompactionMenu implements Component, Focusable {
 					return;
 				}
 				if (id === "nothinkTag") {
-					this.onAction("__exit:edit-nothinktag");
+					this.onAction("__exit:edit-nothinktag:menu");
 					return;
 				}
 				if (id === "summaryPct" || id === "summaryMin" || id === "summaryMax" || id === "argcap") {
@@ -6028,9 +6028,14 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			restore = { orderRef: ref, optionKey: "previewDesc" };
 			continue;
 		}
-		if (result.action === "edit-nothinktag") {
+		if (result.action === "edit-nothinktag" || result.action === "edit-nothinktag:menu") {
 			await editNoThinkTag(ctx);
-			restore = { rowId: "marker" };
+			// 2026-10-07 BUG FIX: this restored to { rowId: "marker" }, a row id that does not exist, so the
+			// board came back on its FIRST row - the "it takes me to the previous menu" report. The row is
+			// "nothinkTag"; the all-models copy of it lives in the Compaction settings submenu and says so.
+			// The tag's row lives in the Compaction settings submenu (id "nothinkTag"), so that is where both
+			// paths come back - the all-models copy and the board-level text-row path, which is the same row.
+			restore = { compactionMenu: true };
 			continue;
 		}
 		if (result.action?.startsWith("edit-sampling:")) {
