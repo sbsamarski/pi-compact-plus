@@ -3041,8 +3041,87 @@ function rotateRemove(ref: string): void {
 	});
 }
 
-function toggleEnabled(): void {
+/** THE ONE-COMPACTOR RULE (2026-10-07, on request). A second context manager in the same session is not
+ *  a cosmetic problem: pi has no plugin priority mechanism, the `context` event is a pipeline, and two
+ *  compressors rewrite the same message list and clobber each other's work - the other manager's own
+ *  README says to keep exactly one installed. So this extension refuses to switch itself ON while another
+ *  compaction extension is present, and says what to do about it. Detection, strongest first: the
+ *  sidecar file the other manager writes next to the LIVE session log (proof it is running, not just
+ *  installed), pi's `packages` list in settings.json, and the extensions / package folders. */
+const OTHER_COMPACTOR_NAMES = ["billion-context", "acp-context", "pi-compactor", "pi-compact-pro", "context-mode", "pi-context-manager", "pi-compressor"];
+
+function otherCompactorDetected(): string | null {
+	try {
+		const sf = (process.env.PI_SESSION_FILE ?? "").trim();
+		if (sf) {
+			statSync(`${sf}.acp.json`);
+			return "billion-context-pi - its sidecar is next to this session's log, so it is running here";
+		}
+	}
+	catch { /* no sidecar: not running on this session (statSync throws when the file is missing) */ }
+	try {
+		const raw = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
+		const pkgs: unknown[] = Array.isArray(raw?.packages) ? raw.packages : [];
+		for (const p of pkgs) {
+			const s = String(p).toLowerCase();
+			for (const n of OTHER_COMPACTOR_NAMES) if (s.includes(n)) return String(p);
+		}
+	}
+	catch { /* settings.json unreadable: nothing detected from it */ }
+	for (const dir of [join(AGENT_DIR, "extensions"), join(AGENT_DIR, "npm", "node_modules")]) {
+		try {
+			for (const e of readdirSync(dir)) {
+				const s = String(e).toLowerCase();
+				for (const n of OTHER_COMPACTOR_NAMES) if (s.includes(n)) return `${e} (in ${dir})`;
+			}
+		}
+	catch { /* folder missing */ }
+	}
+	return null;
+}
+
+/** THE GATE used by every path that would switch this extension's compaction ON: the menu row, the
+ *  settings screen, the fallback board and the /compact-plus on command. Returns the name of the other
+ *  manager when the switch must be refused (and says so on screen + in the log), null when it may go on. */
+function enableBlockedByOtherCompactor(): string | null {
+	if (loadConfig().enabled) return null; // already on: nothing is being enabled here
+	const other = otherCompactorDetected();
+	if (!other) return null;
+	try {
+		logLine(loadConfig(), { event: "enable_refused", note: `another context manager is present: ${other}` });
+	}
+	catch { /* the log must never block a menu */ }
+	watcherCtx?.ui?.notify?.(
+		`NOT ENABLED - another context manager is present (${other}). Only ONE compaction extension can run in a session: they rewrite the same context and destroy each other's work. Disable that one first - take it out of "packages" in pi's settings.json (or out of the extensions folder) and /reload - then switch this extension on.`,
+		"warning",
+	);
+	return other;
+}
+
+/** The startup half of the rule: the config can say `enabled: true` while another manager is installed
+ *  (a hand edit, a config copied from another machine, the other manager installed afterwards). Warn
+ *  once per session and say what to switch off; do NOT write anybody's settings behind the user's back. */
+let otherCompactorWarned = false;
+function warnOnceAboutTwoCompactors(ctx: any): void {
+	if (otherCompactorWarned) return;
+	otherCompactorWarned = true;
+	try {
+		if (!loadConfig().enabled) return;
+		const other = otherCompactorDetected();
+		if (!other) return;
+		logLine(loadConfig(), { event: "two_compactors", note: `this extension is enabled while another context manager is present: ${other}` });
+		ctx?.ui?.notify?.(
+			`WARNING - TWO COMPACTORS: this extension's compaction is ON while ${other} is present. They rewrite the same context and destroy each other's work. Switch this extension OFF (with both switches off it is completely inert and touches nothing) - or remove the other manager and /reload.`,
+			"warning",
+		);
+	}
+	catch { /* a warning never breaks a request */ }
+}
+
+function toggleEnabled(): boolean {
+	if (enableBlockedByOtherCompactor()) return false;
 	update((c) => void (c.enabled = !c.enabled));
+	return true;
 }
 
 function cycleRetries(dir: number): void {
@@ -4166,13 +4245,23 @@ class UserTemplateMenu implements Component, Focusable {
 		const cfg = loadConfig();
 		const active = this.activeText();
 		const extActive = active === DEFAULT_TEMPLATE_TEXT.trim();
+		// The model that would be asked: number 1 in the compaction try order. Its own settings fill the tags
+		// of the request preview below (2026-10-07, on request).
+		const firstRef = Object.keys(cfg.models)[0] ?? "";
 		const items: SettingItem[] = [
 			{
+				id: "__req",
+				label: "View the summary request",
+				currentValue: firstRef ? firstRef.split("/").pop() ?? "?" : "no model",
+				values: ["open"],
+				description: "ENTER OPENS IT: the WHOLE text the summarizer gets, exactly as it is sent - the active template with every tag filled in for this session (the size block, the preserve rules, the draft block), the previous-summary line, the cover line, the conversation region between the tags, and the system prompt that rides above it all. Read-only, nothing is sent. The name on the right is the first model in the compaction try order: it is the one that would be asked, and its settings are what fill the tags.",
+			},
+			{
 				id: "__ext",
-				label: "Extension default (preview only)",
+				label: "View the default template",
 				currentValue: `${extActive ? "ACTIVE • " : ""}${DEFAULT_TEMPLATE_TEXT.split("\n").length} lines`,
 				values: ["open"],
-				description: "The template built into the extension - fixed, always available to revert to. Enter shows it in the editor; anything typed there is discarded. Ctrl+K saves its text as a new user template you can edit, Ctrl+A makes it the active template, Ctrl+Y copies it.",
+				description: "ENTER OPENS IT: the template built into the extension - fixed, the reference you can always go back to. Read-only. Ctrl+K saves its text as a new user template you can edit, Ctrl+A makes it the active template, Ctrl+Y copies it.",
 			},
 		];
 		for (const t of cfg.userTemplates) {
@@ -4189,6 +4278,12 @@ class UserTemplateMenu implements Component, Focusable {
 		this.items = items;
 		this.list = new SettingsList(items, Math.min(items.length + 2, 14), getSettingsListTheme(), (id: string, value: string) => {
 			if (value !== "open") return;
+			// The request row is not a template: it opens the real request text (the board loop's
+			// preview-request: handler). 2026-10-07, on request.
+			if (id === "__req") {
+				this.onDone(`preview-request:${encodeURIComponent(firstRef)}`);
+				return;
+			}
 			// 2026-10-07 CRASH FIX: the editor is a modal dialog. Opening one while this list is mounted
 			// leaves the terminal with no focused input - the "empty prompt, I cannot type anything, force
 			// close" report. Every dialog goes to the board loop now, which runs it over the plain chat.
@@ -4200,7 +4295,7 @@ class UserTemplateMenu implements Component, Focusable {
 	private selectedTarget(): string | null | undefined {
 		const i = (this.list as unknown as { selectedIndex?: number })?.selectedIndex ?? 0;
 		const it = this.items[i];
-		if (!it || it.id === "keys") return undefined;
+		if (!it || it.id === "keys" || it.id === "__req") return undefined;
 		return it.id === "__ext" ? null : it.id.slice(2);
 	}
 
@@ -4341,9 +4436,11 @@ class TemplateMenu implements Component, Focusable {
 		private restoreKey?: string,
 	) {
 		this.rebuild();
-		// The board reopens this menu after an edit; with the key set, it also steps into the template
-		// library, so leaving the library lands back here (not on the main board) - request 2026-10-07.
-		if (this.restoreKey === "userTemplates") this.openUserTemplates();
+		// 2026-10-07 FLATTENED (on request): this menu used to hold two rows - "User templates" and
+		// "Preview the active template" - so a whole submenu level existed to reach one option. The list of
+		// templates IS this menu now: the summary request on top, the extension default below it, then the
+		// user templates. There is no level below it, so leaving the list closes the menu.
+		this.openUserTemplates();
 	}
 
 	/** The library, shown in place of this menu's list (the pattern the categories screen uses). */
@@ -4353,13 +4450,8 @@ class TemplateMenu implements Component, Focusable {
 			// No action (Esc) = swap back to this menu's own list, inside the same mounted screen - safe.
 			// With an action = hand it to the board: the board closes, the loop runs the dialog over the
 			// plain chat, and the board reopens on the library. Dialogs never open over a mounted screen.
-			if (!action) {
-				this.inUserTemplates = false;
-				this.rebuild();
-				this.tui.requestRender();
-				return;
-			}
-			this.onAction(action);
+			// No level below the list any more: Esc closes the menu, an action goes to the board loop.
+			this.onAction(action ?? "__close");
 		}) as unknown as SettingsList;
 	}
 
@@ -5072,6 +5164,12 @@ class CompactionMenu implements Component, Focusable {
 			(id: string, value: string) => {
 				if (id === "compactionOn") {
 					const on = value === "on";
+					// ONE COMPACTOR (2026-10-07): refused while another context manager is present; the row is
+					// redrawn from the config, which still says off.
+					if (on && enableBlockedByOtherCompactor()) {
+						(this as unknown as { rebuild?: () => void }).rebuild?.();
+						return;
+					}
 					const piWasOn = readPiCompactionEnabled();
 					update((c) => void (c.enabled = on));
 					// 2026-10-07: switching us ON stops pi's own compaction (one compactor at a time - pi's
@@ -5513,7 +5611,11 @@ export class CompactionBoard implements Component, Focusable {
 			return;
 		}
 		if (id === "enabled") {
-			update((c) => void (c.enabled = value === "on"));
+			// ONE COMPACTOR (2026-10-07): the switch is refused while another manager is present.
+			if (value === "on" && enableBlockedByOtherCompactor()) {
+				(this as unknown as { rebuild?: () => void }).rebuild?.();
+				return;
+			}
 		} else if (id === "directRequest") {
 			update((c) => void (c.directRequest = value === "on"));
 		} else if (id === "retries") {
@@ -6010,7 +6112,7 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		// edit-instruction branch above, where it could never be reached - that is why picking a model in
 		// the template menu closed the menu and showed nothing.
 		if (result.action?.startsWith("preview-request:")) {
-			await previewRequest(ctx, result.action.slice("preview-request:".length));
+			await previewRequest(ctx, decodeURIComponent(result.action.slice("preview-request:".length)));
 			restore = { templateMenu: true };
 			continue;
 		}
@@ -6555,6 +6657,7 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 				run: () => {
 					const piWasOn = readPiCompactionEnabled();
 					const on = !loadConfig().enabled;
+					if (on && enableBlockedByOtherCompactor()) return; // ONE COMPACTOR (2026-10-07)
 					update((c) => void (c.enabled = on));
 					if (on && piWasOn) writePiCompactionEnabled(false);
 					ctx.ui?.notify?.(on ? "COMPACTION IS ON" + (piWasOn ? " - AND PI'S OWN COMPACTION WAS SWITCHED OFF IN THE SAME ACTION: ONE COMPACTOR AT A TIME." : ".") + " pi reads its own settings.json at startup, so /reload to make pi's side stick." : "THIS EXTENSION'S COMPACTION IS OFF. pi's own compaction stays as it is - if it was off too, NOTHING COMPACTS ANY MORE until one of the two is on.", "info");
@@ -6936,6 +7039,8 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		// off for this session and says so (it is a context helper, not something allowed to eat the
 		// session). /compact-plus elision on (or a /reload) switches it back on.
 		watcherCtx = ctx;
+		// ONE COMPACTOR (2026-10-07): the startup check, once per session, over the freshest ctx.
+		warnOnceAboutTwoCompactors(ctx);
 		// The watcher runs when either side could need it; with both switches off it is never started.
 		if (cfgForHookTimer()) ensureWatcherTimer();
 		// 2026-10-07: THE TRIGGER IS DRIVEN BY THIS EVENT, not only by the timer. The `context` event
@@ -7184,8 +7289,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				case "status":
 					return say(describe(cfg, ctx));
 				case "on":
-					// ONE compactor is ever on: turning this extension's compaction on turns pi's own off.
+					// ONE compactor is ever on: turning this extension's compaction on turns pi's own off - and
+					// it is refused outright while a THIRD one (another manager) is installed (2026-10-07).
 					{
+						const blocked = enableBlockedByOtherCompactor();
+						if (blocked) return say(`NOT ENABLED: ${blocked} is present. Only one compaction extension can run in a session - disable that one first, then turn this on.`);
 						const piWasOn = readPiCompactionEnabled();
 						update((c) => void (c.enabled = true));
 						if (piWasOn) writePiCompactionEnabled(false);
