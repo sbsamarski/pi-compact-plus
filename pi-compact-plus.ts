@@ -4251,10 +4251,17 @@ class UserTemplateMenu implements Component, Focusable {
 		const items: SettingItem[] = [
 			{
 				id: "__req",
-				label: "View the summary request",
+				label: "View the summary request (template, prompt, session digest)",
 				currentValue: firstRef ? firstRef.split("/").pop() ?? "?" : "no model",
 				values: ["open"],
 				description: "ENTER OPENS IT: the WHOLE text the summarizer gets, exactly as it is sent - the active template with every tag filled in for this session (the size block, the preserve rules, the draft block), the previous-summary line, the cover line, the conversation region between the tags, and the system prompt that rides above it all. Read-only, nothing is sent. The name on the right is the first model in the compaction try order: it is the one that would be asked, and its settings are what fill the tags.",
+			},
+			{
+				id: "__reqfull",
+				label: "View the summary request with the full conversation",
+				currentValue: firstRef ? firstRef.split("/").pop() ?? "?" : "no model",
+				values: ["open"],
+				description: "The same request as the row above, with the conversation region UNABRIDGED - every message of the region, tool calls and results included, exactly as the summarizer receives them. It is long: in a session full of code and logs this is a wall of text, which is why the digest version is the one on top.",
 			},
 			{
 				id: "__ext",
@@ -4278,10 +4285,10 @@ class UserTemplateMenu implements Component, Focusable {
 		this.items = items;
 		this.list = new SettingsList(items, Math.min(items.length + 2, 14), getSettingsListTheme(), (id: string, value: string) => {
 			if (value !== "open") return;
-			// The request row is not a template: it opens the real request text (the board loop's
-			// preview-request: handler). 2026-10-07, on request.
-			if (id === "__req") {
-				this.onDone(`preview-request:${encodeURIComponent(firstRef)}`);
+			// The two request rows are not templates: they open the real request text (the board loop's
+			// preview-request: / preview-request-full: handlers). 2026-10-07, on request.
+			if (id === "__req" || id === "__reqfull") {
+				this.onDone(`${id === "__req" ? "preview-request" : "preview-request-full"}:${encodeURIComponent(firstRef)}`);
 				return;
 			}
 			// 2026-10-07 CRASH FIX: the editor is a modal dialog. Opening one while this list is mounted
@@ -4295,7 +4302,7 @@ class UserTemplateMenu implements Component, Focusable {
 	private selectedTarget(): string | null | undefined {
 		const i = (this.list as unknown as { selectedIndex?: number })?.selectedIndex ?? 0;
 		const it = this.items[i];
-		if (!it || it.id === "keys" || it.id === "__req") return undefined;
+		if (!it || it.id === "keys" || it.id === "__req" || it.id === "__reqfull") return undefined;
 		return it.id === "__ext" ? null : it.id.slice(2);
 	}
 
@@ -5925,7 +5932,7 @@ async function editField(ctx: Ctx, title: string, value: string): Promise<string
  * filled in for this session, plus the block order and the system prompt. This is what the Summary
  * template menu previews - the point of a preview is to see the request, not the template source.
  */
-async function previewRequest(ctx: Ctx, ref: string): Promise<void> {
+async function previewRequest(ctx: Ctx, ref: string, full = false): Promise<void> {
 	const cfg = loadConfig();
 	const model = lookupRef(ref, ctx);
 	if (!model) {
@@ -5947,25 +5954,34 @@ async function previewRequest(ctx: Ctx, ref: string): Promise<void> {
 	const inputTokens = Math.ceil((main.text.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
 	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, draft: profile.draft, windowTokens: (ctx as any)?.model?.contextWindow ?? 0 }, 0);
 	const instructions = buildInstructions({ sizes, inputTokens, kind: isLocalModel(model) ? "local" : "online", options: profile, additionalInstruction: cfg.additionalInstruction ?? null, userDefault: cfg.templateUserDefaults, customInstructions: undefined });
+	// 2026-10-07 ORDER FIX ("it shows random code, not the request"): the conversation region used to come
+	// FIRST, and in a session full of scripts and JSON that is a wall of code, with the filled template
+	// pushed off the bottom. The request is presented in the order a reader wants it: the INSTRUCTIONS (the
+	// active template with every tag filled in), then the SYSTEM PROMPT, then the conversation region - and
+	// the region is DIGESTED by default (counts, turns, a peek at the ends), because it is the user's own
+	// session, not something the template preview is for. The extra row shows it unabridged.
+	const peek = (m: any) => `[${String(m?.role)}]: ${contentTextOf(m?.content).replace(/\s+/g, " ").slice(0, 180)}`;
+	const conv = full
+		? ['<conversation>', main.text, '</conversation>']
+		: [
+			`<conversation>  (${region.length} messages, Turns ${String(prevTurn.lastTurn + 1)}-${String(main.lastTurn)}, about ${fmt(inputTokens)} tok - YOUR OWN SESSION, left out of this preview so the template is readable. "View the summary request with the full conversation" shows it all.)`,
+			`  first message -> ${peek(region[0])}`,
+			`  last message  -> ${peek(region[region.length - 1])}`,
+			`</conversation>`,
+		];
 	const text = [
-		`REQUEST PREVIEW - exactly what ${ref} would be asked to summarize (nothing is sent).`,
-		`The template below is the ACTIVE one, already filled in for this session: the size block, the preserve rules and the draft block are the ones this model would get.`,
-		'',
-		labeledPreviousSummary(undefined, prevTurn.lastTurn, prevTurn.lastTurn + 1),
-		`The conversation segment below covers Turns ${String(prevTurn.lastTurn + 1)}-${String(main.lastTurn)} (about ${fmt(inputTokens)} tok).`,
-		'<conversation>',
-		main.text,
-		'</conversation>',
-		'[kept tail, for reference - NOT part of the summarized region:]',
-		keptText,
-		'',
-		'--- the instructions that ride with it -------------------------------------------',
+		`REQUEST PREVIEW - everything ${ref} would receive for a compaction of this session (nothing is sent).`,
+		`PART 1 OF 3 - THE INSTRUCTIONS: the ACTIVE template with every tag filled in for this session - the size block, the preserve rules, the draft block, the previous-summary rule, your extra instruction.`,
 		instructions,
-		'',
-		`[system prompt that would ride above all this:]`,
+		`PART 2 OF 3 - THE SYSTEM PROMPT that rides above everything:`,
 		COMPACTOR_SYSTEM_PROMPT,
+		`PART 3 OF 3 - THE CONVERSATION REGION to summarize. ${labeledPreviousSummary(undefined, prevTurn.lastTurn, prevTurn.lastTurn + 1)}`,
+		...conv,
+		`[kept tail, for the summarizer's context - NOT part of the summarized region:]`,
+		full ? keptText : `${peek(kept[0])}
+  ... ${kept.length} kept messages in the real request`,
 	].filter(Boolean).join("\n\n");
-	await showText(ctx, `What ${ref} would be asked - the real request (${fmt(text.length)} chars)`, text, false);
+	await showText(ctx, `What ${ref} would receive - the real request (${full ? "full" : "digest"}, ${fmt(text.length)} chars)`, text, false);
 }
 
 /** One of the stored templates, as stored. */
@@ -6111,8 +6127,8 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		// The request preview: the filled-in template, not the template source. It used to sit inside the
 		// edit-instruction branch above, where it could never be reached - that is why picking a model in
 		// the template menu closed the menu and showed nothing.
-		if (result.action?.startsWith("preview-request:")) {
-			await previewRequest(ctx, decodeURIComponent(result.action.slice("preview-request:".length)));
+		if (result.action?.startsWith("preview-request-full:")) {
+			await previewRequest(ctx, decodeURIComponent(result.action.slice("preview-request-full:".length)), true);
 			restore = { templateMenu: true };
 			continue;
 		}
