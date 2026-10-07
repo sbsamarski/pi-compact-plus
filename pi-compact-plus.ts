@@ -4163,7 +4163,7 @@ class UserTemplateMenu implements Component, Focusable {
 			{
 				id: "__ext",
 				label: "Extension default (built-in reference)",
-				currentValue: extActive ? "ACTIVE" : "reference",
+				currentValue: `${extActive ? "ACTIVE • " : ""}${DEFAULT_TEMPLATE_TEXT.split("\n").length} lines`,
 				values: ["open"],
 				description: "The template built into the extension - fixed, always available to revert to. Enter shows it in the editor; anything typed there is discarded. Ctrl+K saves its text as a new user template you can edit, Ctrl+A makes it the active template, Ctrl+Y copies it.",
 			},
@@ -4172,7 +4172,9 @@ class UserTemplateMenu implements Component, Focusable {
 			items.push({
 				id: `t:${t.name}`,
 				label: t.name,
-				currentValue: !extActive && t.text.trim() === active ? "ACTIVE" : `${t.text.split("\n").length} lines`,
+				// The active template showed only "ACTIVE" - the line count was dropped for it, so the column
+				// read differently on exactly the row you use (2026-10-07 report). One format for every row.
+				currentValue: `${!extActive && t.text.trim() === active ? "ACTIVE • " : ""}${t.text.split("\n").length} lines`,
 				values: ["open"],
 				description: "Enter opens it in the editor (Enter saves, Esc discards). Ctrl+A makes this the active template, Ctrl+K copies it under a new name, Ctrl+D deletes it after asking, Ctrl+Y puts its text on the clipboard.",
 			});
@@ -4361,7 +4363,6 @@ class TemplateMenu implements Component, Focusable {
 
 	private rows(): SettingItem[] {
 		const cfg = loadConfig();
-		const hasUser = Boolean(cfg.templateUserDefaults?.trim());
 		return [
 			{
 				id: "userTemplates",
@@ -4389,20 +4390,10 @@ class TemplateMenu implements Component, Focusable {
 				values: ["preview"],
 				description: "ENTER OPENS IT: the template built into the extension - fixed, it cannot be edited. Compare it with the active one above; 'Reset to extension default' below pins the active template to this text.",
 			},
-			{
-				id: "saveUser",
-				label: "Keep a copy of this template",
-				currentValue: hasUser ? "replaces the saved one" : "not saved yet",
-				values: ["go"],
-				description: "The ACTIVE template becomes your USER default (a checkpoint). The active template itself does not change. Asks for confirmation.",
-			},
-			{
-				id: "resetUser",
-				label: "Restore the kept copy",
-				currentValue: hasUser ? "ready" : "(none saved)",
-				values: ["go"],
-				description: "Drops the active custom text; the template then follows the USER default (falls back to the extension default when none is saved). Asks for confirmation.",
-			},
+			// 2026-10-07: "Keep a copy of this template" and "Restore the kept copy" removed on request -
+			// leftovers from before the library existed. Ctrl+A assigns a template as the active one, and
+			// "Reset to extension default" is the one revert. The user-default field stays in the config as
+			// the fallback an unassigned template follows; only the two menu rows are gone.
 			{
 				id: "resetExt",
 				label: "Reset to extension default",
@@ -5403,6 +5394,19 @@ export class CompactionBoard implements Component, Focusable {
 				"WHAT STAYS WORD FOR WORD: the newest tail of the conversation kept outside every summary (and protected from elision), so resuming feels continuous. The submenu shows the live preserved window (read-only) and its three settings. Enter opens it; Enter on a setting opens its editor.",
 		});
 		rows.push({
+			id: "elisionMenu",
+			label: "Elision settings",
+			currentValue: "",
+			values: [],
+			submenu: (_current: string, done: (selectedValue?: string) => void) =>
+				new ElisionMenu(this.tui, this.ctx, (action: string) => {
+					if (action === "__close") done();
+					done(action);
+				}) as unknown as Component,
+			description:
+				"Old tool results are replaced by short stubs in the requests the model receives, so the context stays much lower for much longer; your screen and the session file always keep the originals. The submenu holds the on/off toggle and all six settings. Enter opens it; Enter on a setting opens its editor (over the plain chat, with the position restored afterwards).",
+		});
+		rows.push({
 			id: "elisionNow",
 			label: "Run elision now",
 			currentValue: "Run the elision now",
@@ -5435,19 +5439,6 @@ export class CompactionBoard implements Component, Focusable {
 				"Writes pi's OWN settings.json (compaction.reserveTokens) - the number the row above aims with. Applies ONLY to pi's built-in compaction (the row above, or the fallback when this extension is disabled or EVERY model failed). This extension itself never reads it (its own trigger lives in the Auto-compaction submenu above). pi caches its settings, so /reload is needed for the change to take effect.",
 		});
 		rows.push(numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."));
-		rows.push({
-			id: "elisionMenu",
-			label: "Elision settings",
-			currentValue: "",
-			values: [],
-			submenu: (_current: string, done: (selectedValue?: string) => void) =>
-				new ElisionMenu(this.tui, this.ctx, (action: string) => {
-					if (action === "__close") done();
-					else done(action);
-				}) as unknown as Component,
-			description:
-				"Old tool results are replaced by short stubs in the requests the model receives, so the context stays much lower for much longer; your screen and the session file always keep the originals. The submenu holds the on/off toggle and all six settings. Enter opens it; Enter on a setting opens its editor (over the plain chat, with the position restored afterwards).",
-		});
 		rows.push({
 			id: "instruction",
 			label: "Summary template",
