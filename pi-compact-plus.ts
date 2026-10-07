@@ -6744,8 +6744,9 @@ function syncTriggerClock(ctx: any, cfg: Config): void {
 	}
 }
 
-// 2026-10-07: the watchdog floor. After a pass that clears the safe-point gates, the next one is
-// not before this stamp, so a session sitting over the line is not re-checked every five seconds.
+// 2026-10-07: THE START FLOOR, not a measuring floor. The context itself is measured on every tick and
+// on every request; this stamp only says how soon a compaction may be STARTED after the last one that
+// cleared the safe-point gates.
 let nextCheckAtMs = 0;
 
 function watcherTick(): void {
@@ -6800,8 +6801,8 @@ function watcherTick(): void {
 			const secSinceTool = (ctx as any)?.compaction?.getSecondsSinceLastToolCall?.();
 			if (typeof secSinceTool === "number" && secSinceTool < ((ctx as any)?.compaction?.getStartCompactionAfterToolCallMs?.() ?? 1000) / 1000) return;
 			if (typeof (ctx as any)?.compaction?.getStartTurn === "function" && (ctx as any).compaction.getStartTurn() > nowMs) return;
-			if (nextCheckAtMs > nowMs) return;
-			nextCheckAtMs = nowMs + 30_000;
+			// 2026-10-07: the 30 s floor used to sit HERE, in front of the measurement, so a check that ran
+			// on an event was blind for 30 s afterwards. Measuring is cheap - it moved down to the START.
 		}
 	// WHAT THE SERVER HOLDS IS THE MEASURE: the elided request the model actually sees, the same figure
 	// the status line shows first. The raw transcript on disk is bigger and is never the measure.
@@ -6827,6 +6828,11 @@ function watcherTick(): void {
 	}
 		const now = Date.now();
 		if (now - lastAutoTriggerMs < 60_000) return; // one trigger per minute, no hammering
+		// THE START FLOOR: over the line is checked on every request and every five-second tick, but a
+		// compaction is started at most once every 30 s (the 60 s floor above and the circuit breaker sit
+		// on top of this).
+		if (now < nextCheckAtMs) return;
+		nextCheckAtMs = now + 30_000;
 		// A failed auto-compaction is retried ONCE, 3 minutes later; the second failure stops it (see
 		// pauseAutoCompaction), so a broken compaction cannot re-upload the whole context all night.
 		if (autoFailure.retryAtMs > 0) {
@@ -6932,6 +6938,21 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		watcherCtx = ctx;
 		// The watcher runs when either side could need it; with both switches off it is never started.
 		if (cfgForHookTimer()) ensureWatcherTimer();
+		// 2026-10-07: THE TRIGGER IS DRIVEN BY THIS EVENT, not only by the timer. The `context` event
+		// fires before EVERY request - after every tool batch, after every assistant block - which makes it
+		// the one hook in pi that runs in the middle of a long job; that is how the other context manager
+		// triggers with pi's own compaction switched off. Running the tick here means the trigger line is
+		// checked at the exact moment the next request is built, not up to five seconds later. Safe to call
+		// on every request: measuring is cheap, and STARTING a compaction is gated by pi's safe-point rules
+		// plus the 30 s start floor, the one-per-minute floor and the circuit breaker. The five-second
+		// timer stays as the backstop for one very long generation with no requests in between.
+		if (cfgForHookTimer()) {
+			try {
+				watcherTick();
+			} catch {
+				/* the trigger must never block a live request */
+			}
+		}
 		if (!cfgForHookElision()) return undefined; // elision has its own switch; off means the request is untouched
 		if (elisionFailure.off) return undefined;
 		if (elisionFailure.retryAtMs > 0) {
