@@ -4077,6 +4077,15 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 		ctx.ui.notify(text === undefined ? `${n} added to the library EMPTY (Esc in the editor does not delete it).` : `${n} saved to the library. Ctrl+A on its row makes it the active template.`, "info");
 		return back;
 	}
+	if (kind === "tpl-previewext") {
+		// 2026-10-07: the built-in default is READ-ONLY by request - it used to open in the editor with
+		// a note that the text is discarded, which read like an editable template. It opens in the same
+		// read-only preview screen the other previews use; Ctrl+K is the way to get an editable copy.
+		await previewTemplate(ctx, "ext");
+		ctx.ui.notify("The built-in default is fixed - preview only. Ctrl+K on its row saves it as a new user template you can edit, rename and delete.", "info");
+		return back;
+	}
+
 	if (kind === "tpl-dup") {
 		const src = name ? cfg.userTemplates.find((t) => t.name === name)?.text ?? "" : DEFAULT_TEMPLATE_TEXT;
 		const n = nextUserTemplateName(cfg.userTemplates);
@@ -4159,15 +4168,8 @@ class UserTemplateMenu implements Component, Focusable {
 		const extActive = active === DEFAULT_TEMPLATE_TEXT.trim();
 		const items: SettingItem[] = [
 			{
-				id: "keys",
-				label: "Enter opens · Ctrl+N new · Ctrl+K duplicate · Ctrl+D delete · Ctrl+A set active · Ctrl+Y clipboard",
-				currentValue: `${cfg.userTemplates.length} saved`,
-				values: [],
-				description: "Names are automatic: 'User template #N', one above the highest number in the list. The row marked ACTIVE holds the text the summarizer reads. In the editor: Enter saves, Shift+Enter is a newline, Esc leaves the template unchanged.",
-			},
-			{
 				id: "__ext",
-				label: "Extension default (built-in reference)",
+				label: "Extension default (preview only)",
 				currentValue: `${extActive ? "ACTIVE • " : ""}${DEFAULT_TEMPLATE_TEXT.split("\n").length} lines`,
 				values: ["open"],
 				description: "The template built into the extension - fixed, always available to revert to. Enter shows it in the editor; anything typed there is discarded. Ctrl+K saves its text as a new user template you can edit, Ctrl+A makes it the active template, Ctrl+Y copies it.",
@@ -4190,7 +4192,7 @@ class UserTemplateMenu implements Component, Focusable {
 			// 2026-10-07 CRASH FIX: the editor is a modal dialog. Opening one while this list is mounted
 			// leaves the terminal with no focused input - the "empty prompt, I cannot type anything, force
 			// close" report. Every dialog goes to the board loop now, which runs it over the plain chat.
-			this.onDone(id === "__ext" ? "tpl-edit:" : `tpl-edit:${encodeURIComponent(id.slice(2))}`);
+			this.onDone(id === "__ext" ? "tpl-previewext" : `tpl-edit:${encodeURIComponent(id.slice(2))}`);
 		}, () => this.onDone());
 	}
 
@@ -4305,7 +4307,13 @@ class UserTemplateMenu implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
-		return this.list ? this.list.render(width) : [];
+		// 2026-10-07: the key list used to be the FIRST ROW of the library, so it could be highlighted
+		// and 'opened' - it is an instruction, not an option. Printed above the list now, with the count.
+		const head = truncateToWidth(
+			`  Enter opens - Ctrl+N new - Ctrl+K duplicate - Ctrl+D delete - Ctrl+A set active - Ctrl+Y clipboard - ${loadConfig().userTemplates.length} saved`,
+			Math.max(20, width),
+		);
+		return this.list ? [head, "", ...this.list.render(width)] : [];
 	}
 
 	get focused(): boolean {
@@ -4388,24 +4396,10 @@ class TemplateMenu implements Component, Focusable {
 				values: ["preview"],
 				description: "ENTER OPENS IT: the template in use right now, word for word, as the summarizer reads it (the {TOKENS} are still tokens here - they are filled per model in the request). Esc closes it and brings this menu back on the same row.",
 			},
-			{
-				id: "previewExt",
-				label: "Preview the extension default template:",
-				currentValue: "read-only",
-				values: ["preview"],
-				description: "ENTER OPENS IT: the template built into the extension - fixed, it cannot be edited. Compare it with the active one above; 'Reset to extension default' below pins the active template to this text.",
-			},
 			// 2026-10-07: "Keep a copy of this template" and "Restore the kept copy" removed on request -
 			// leftovers from before the library existed. Ctrl+A assigns a template as the active one, and
 			// "Reset to extension default" is the one revert. The user-default field stays in the config as
 			// the fallback an unassigned template follows; only the two menu rows are gone.
-			{
-				id: "resetExt",
-				label: "Reset to extension default",
-				currentValue: "ready",
-				values: ["go"],
-				description: "Pins the template to the built-in extension default (ignores the user default until you edit again). Asks for confirmation.",
-			},
 		];
 	}
 
@@ -4929,15 +4923,29 @@ class CompactionMenu implements Component, Focusable {
 				currentValue: cfg.enabled ? "on" : "off",
 				values: ["on", "off"],
 				description:
-					"ON = the summary is written by the first model in the Compaction models list that answers. OFF = this extension never compacts. The trigger is pi's own check, which runs between turns INSIDE a long run (after a tool batch, before the next model call), so a working session compacts on its own instead of reaching the end of the window; this extension writes every summary and pi's own summarizer never runs. pi reads its settings file at startup - /reload after a change.",
+					"ON = the plugin writes the summary with the first model in the Compaction models list that answers, and the size check runs on its own (see 'When auto-compaction fires' below). OFF = this extension never compacts, and nothing of it touches pi's settings.",
 			},
-			// 2026-10-07: "Who pulls the auto-compaction trigger" REMOVED. It asked who notices that the
-			// line has been crossed, and the answer is always pi's own check now: pi looks between turns -
-			// after a tool batch, before the next model call - which is the only point inside a long job
-			// where a compaction can start without aborting the run. The extension's idle watcher cannot do
-			// that (it stands down during a run), so offering it as a trigger was offering a mode that
-			// overflows. The watcher stays as a backstop for when the settings line cannot be written, and
-			// "nothing automatic" is exactly what the Compaction on/off switch OFF means - one switch.
+			{
+				// Read-only, on purpose (2026-10-07). The old "Who pulls the auto-compaction trigger" row
+				// offered three modes - pi's check, this extension's idle-only watcher, nothing - and all
+				// three were the same thing now: the plugin's own check before every model call. The idle
+				// watcher was the reason the row existed (a long tool-calling run used to overflow, because
+				// the watcher stands down mid-run and pi's own compaction was switched off to keep its
+				// summarizer quiet); with the check on the request path the run is covered, so the row, its
+				// handler and the settings.json trigger line all go away. Nothing automatic = the switch above.
+				id: "trigger",
+				label: "When auto-compaction fires",
+				currentValue: cfg.enabled
+					? `checked before every model call - fires at ${cfg.scaling.startPercent}% of the window`
+					: "nothing fires automatically",
+				values: [],
+				description:
+					"The plugin measures the context before every request to the model - including the requests inside a long tool-calling run - and compacts when the line is passed, so a working session compacts on its own instead of reaching the end of the window. Nothing to switch here: the switch above starts and stops it, and the start point in Auto-compaction settings is the line. The same check runs on a timer while the agent is idle, which covers a model switch: a bigger window moves the line at once.",
+			},
+			// 2026-10-07: the settings.json trigger line (syncTriggerClock) is NO LONGER CALLED - see the
+			// trigger row above. Its helpers stay: releasePiTriggerLine() is called on shutdown and on
+			// startup, so a session that starts with this extension off hands back any line an earlier
+			// version wrote, and pi's own block is restored if nobody changed it.
 			numberRow("retries", "Retries per model", String(cfg.retries), [], "How many times the next model in the list is tried when one fails."),
 			numberRow("retryWait", "Wait between retries", `${cfg.retryDelaySeconds} s`, [], "Seconds to wait before trying the next model."),
 			{
@@ -5040,7 +5048,19 @@ class CompactionMenu implements Component, Focusable {
 				values: ["fold", "attach", "skip"],
 				description:
 					"What the previous compaction summary becomes in the new one: folded into its own turn, attached whole, or dropped.",
-			},		];
+			},
+			// 2026-10-07: moved here from the main board on request - both are compaction sizing, they
+			// belong next to the compaction switches, not on the top level.
+			{
+				id: "piReserve",
+				label: "pi's reserveTokens (stock fallback):",
+				currentValue: `${fmt(readPiReserveTokens())} tok`,
+				values: [EDIT_NUMBER],
+				description:
+					"Writes pi's OWN settings.json (compaction.reserveTokens) - the number the row above aims with. Applies ONLY to pi's built-in compaction (the row above, or the fallback when this extension is disabled or EVERY model failed). This extension itself never reads it (its own trigger lives in the Auto-compaction submenu above). pi caches its settings, so /reload is needed for the change to take effect.",
+			},
+			numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."),
+		];
 	}
 
 	private rebuild(): void {
@@ -5054,17 +5074,16 @@ class CompactionMenu implements Component, Focusable {
 					const on = value === "on";
 					const piWasOn = readPiCompactionEnabled();
 					update((c) => void (c.enabled = on));
+					// 2026-10-07: switching us ON stops pi's own compaction (one compactor at a time - pi's
+					// summarizer must never be the one writing the summary). Switching us OFF hands pi's file
+					// back untouched, so any other manager keeps what it set (the fully-off rule of 2026-10-06).
 					if (on && piWasOn) writePiCompactionEnabled(false);
-					// Arm the trigger with the switch (2026-10-07: one switch, the piCompaction row is gone).
-					// ON writes pi's compaction block with THIS extension's line, so pi's between-turn check
-					// pulls the trigger inside a long run and this extension answers with its own summary;
-					// OFF releases the file back to pi (the fully-off rule of 2026-10-06).
-					syncTriggerClock(this.ctx, loadConfig());
+					if (!on) releasePiTriggerLine(loadConfig());
 					this.onAction(
 						"__exit:notice:" +
 							(on
-								? "COMPACTION IS ON. THE TRIGGER IS PI'S OWN CHECK, WHICH RUNS BETWEEN TURNS INSIDE A RUN (after a tool batch, before the next model call) - so a long job compacts instead of overflowing. THIS EXTENSION WRITES EVERY SUMMARY; pi's own summarizer is answered by this extension every time and never runs. pi reads its settings file at startup, so /reload TO MAKE IT STICK."
-								: "THIS EXTENSION'S COMPACTION IS OFF, and its trigger line is given back to pi. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS ANY MORE UNTIL ONE OF THE TWO IS ON."),
+								? "COMPACTION IS ON. THE TRIGGER IS THIS EXTENSION'S OWN CHECK: it measures the context on every tick, including during a long tool-calling run, and compacts when your start point is passed. No pi setting is involved. THIS EXTENSION WRITES EVERY SUMMARY."
+								: "THIS EXTENSION'S COMPACTION IS OFF, and nothing of it touches pi's settings. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS UNTIL ONE OF THE TWO IS ON."),
 					);
 					return;
 				}
@@ -5336,7 +5355,7 @@ export class CompactionBoard implements Component, Focusable {
 			description:
 				"THE COMPACTION SWITCHES. ONE compactor is ever on: turning this extension's compaction on turns pi's own compaction off, and the other way round; both can be off, then nothing compacts. Elision has its own submenu and runs whichever compactor is picked. pi's switch is a file on disk, so changing it does nothing until you /reload.",
 		});
-		rows.push({
+			rows.push({
 			id: "order",
 			label: "Compaction models",
 			currentValue: "",
@@ -5417,17 +5436,8 @@ export class CompactionBoard implements Component, Focusable {
 				"Runs pi's OWN compaction once, bypassing the rotation: pi prepares the session and summarizes with the active model, aiming at 0.8 x its reserveTokens (the number on the right). Use it to compare pi's stock summary with the extension's. Everything else (the rotation, the gates) stays in place for the next compaction.",
 		});
 		rows.push({
-			id: "piReserve",
-			label: "pi's reserveTokens (stock fallback):",
-			currentValue: `${fmt(readPiReserveTokens())} tok`,
-			values: [EDIT_NUMBER],
-			description:
-				"Writes pi's OWN settings.json (compaction.reserveTokens) - the number the row above aims with. Applies ONLY to pi's built-in compaction (the row above, or the fallback when this extension is disabled or EVERY model failed). This extension itself never reads it (its own trigger lives in the Auto-compaction submenu above). pi caches its settings, so /reload is needed for the change to take effect.",
-		});
-		rows.push(numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."));
-		rows.push({
 			id: "instruction",
-			label: "Summary template",
+			label: "Summary template settings",
 			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
@@ -6117,7 +6127,7 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		// The template library's dialogs (2026-10-07). The library is a mounted screen; an editor, a copy
 		// or a confirmation opened over a mounted screen leaves the TUI with no focused input. The library
 		// asks, the work happens HERE, over the plain chat, and the board comes back on the library list.
-		if (result.action === "tpl-new" || result.action.startsWith("tpl-edit") || result.action.startsWith("tpl-dup:") || result.action.startsWith("tpl-del:")) {
+		if (result.action === "tpl-new" || result.action === "tpl-previewext" || result.action.startsWith("tpl-edit") || result.action.startsWith("tpl-dup:") || result.action.startsWith("tpl-del:")) {
 			restore = await templateLibraryAction(ctx, String(result.action));
 			continue;
 		}
@@ -6243,10 +6253,24 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
 		const cur0 = (o.sampling as any)[sk];
 		title = `Sampling flag ${key} - this model's compaction call only, your chat is never touched`;
 		cur = typeof cur0 === "number" ? cur0 : 0; lo = rng[0]; hi = rng[1];
-		unit = "(0 = ignore: send nothing, the server default applies)";
-		save = (v) => setModelOptions(ref, { sampling: { ...o.sampling, [sk]: v === 0 ? null : v } });
-		shown = (v) => (v === 0 ? "ignore" : String(v));
-		const fv = await askNumber(ctx, title, cur, lo, hi, unit, true);
+		unit = `a number (${rng[0]} to ${rng[1]}) - 0 is a real value; the word "ignore" (or an empty box) is the only way to clear the flag`;
+		// 2026-10-07 BUG FIX (min_p): the box was a number field whose contract read "0 = ignore", and the
+		// save wrote `v === 0 ? null : v` - so min_p 0 (the value Qwen3.8-Flash-Next recommends), top_k 0
+		// and presence_penalty 0 were stored as "ignore" and the row snapped back: "I change it and it
+		// doesn't change". A number is a number now, 0 included; ignore is a word, typed on purpose.
+		const res0 = await ctx.ui.input(`Sampling flag ${key} - a number (${rng[0]} to ${rng[1]}), or "ignore"`, typeof cur0 === "number" ? String(cur0) : "ignore");
+		if (res0 === undefined) return;
+		const txt = String(res0).trim();
+		if (!txt || ["ignore", "none", "off"].includes(txt.toLowerCase())) {
+			setModelOptions(ref, { sampling: { ...o.sampling, [sk]: null } });
+			ctx.ui?.notify?.(`${key} = ignore for ${ref.split("/").pop()} - nothing is sent, the server default applies.`, "info");
+			return;
+		}
+		const parsed0 = Number(txt);
+		if (!Number.isFinite(parsed0)) { ctx.ui?.notify?.(`Not a number: ${txt} - nothing saved.`, "error"); return; }
+		const fv = clamp(parsed0, rng[0], rng[1]);
+		setModelOptions(ref, { sampling: { ...o.sampling, [sk]: fv } });
+		ctx.ui?.notify?.(`${key} = ${fv} for ${ref.split("/").pop()} - saved${fv === 0 ? " (0 is a real value: it is sent to the server)" : ""}.`, "info");
 		if (fv === undefined) return;
 		save(fv);
 		ctx.ui?.notify?.(`${key} = ${shown(fv)} for ${ref.split("/").pop()} - saved.`, "info");
@@ -6720,6 +6744,10 @@ function syncTriggerClock(ctx: any, cfg: Config): void {
 	}
 }
 
+// 2026-10-07: the watchdog floor. After a pass that clears the safe-point gates, the next one is
+// not before this stamp, so a session sitting over the line is not re-checked every five seconds.
+let nextCheckAtMs = 0;
+
 function watcherTick(): void {
 	const ctx = watcherCtx;
 	if (!ctx) return;
@@ -6740,9 +6768,10 @@ function watcherTick(): void {
 		if (fullyOff(cfg)) releasePiTriggerLine(cfg);
 		return;
 	}
-	// Keep pi's pre-request line equal to ours while this extension IS the compactor: pi's own check is
-	// the only point where a compaction can start mid-run, and it reads its reserve from settings.json.
-	if (cfg.triggerClockByPi) syncTriggerClock(ctx, cfg);
+	// 2026-10-07: the settings.json trigger clock is GONE. The mid-run trigger is this watchdog itself:
+	// it measures the context during work, on pi's safe points (see the gates in the try block below),
+	// so pi's own compaction flag is no longer borrowed as a clock and this extension leaves pi's
+	// settings file alone - on the way out it hands back any line an earlier version wrote.
 	// A parked trigger arms itself again after half an hour (2026-10-06: a park used to last until a
 	// manual compaction, and one session sat parked for eight hours).
 	if (cfg.autoCompactPaused) {
@@ -6760,7 +6789,20 @@ function watcherTick(): void {
 	try {
 		const window = (ctx as any)?.model?.contextWindow ?? 0;
 		if (!(window > 0)) return;
-		if ((ctx as any)?.isIdle?.() === false) return; // never abort a running generation
+		// 2026-10-07: the idle gate is GONE - the check runs during work too, that is the whole point. In
+		// its place, pi's own safe-point rules, so a compaction is never started where pi would not start
+		// one: not within startCompactionAfterToolCallMs of a tool call (default 1000 ms, pi types.d.ts),
+		// not before startTurn, and not more than once every 30 s. The tick fires every five seconds, so a
+		// gate that is shut now is caught by the next tick; measuring is free, STARTING is what needs a safe
+		// point. A compaction pi starts on its own is answered by our hook, so pi's summarizer never runs.
+		{
+			const nowMs = Date.now();
+			const secSinceTool = (ctx as any)?.compaction?.getSecondsSinceLastToolCall?.();
+			if (typeof secSinceTool === "number" && secSinceTool < ((ctx as any)?.compaction?.getStartCompactionAfterToolCallMs?.() ?? 1000) / 1000) return;
+			if (typeof (ctx as any)?.compaction?.getStartTurn === "function" && (ctx as any).compaction.getStartTurn() > nowMs) return;
+			if (nextCheckAtMs > nowMs) return;
+			nextCheckAtMs = nowMs + 30_000;
+		}
 	// WHAT THE SERVER HOLDS IS THE MEASURE: the elided request the model actually sees, the same figure
 	// the status line shows first. The raw transcript on disk is bigger and is never the measure.
 	const m = measureContext(ctx);
@@ -6878,7 +6920,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				releasePiTriggerLine(cc);
 				return undefined;
 			}
-			if (cc.enabled && cc.autoCompact && cc.triggerClockByPi) syncTriggerClock(ctx, cc);
+			// 2026-10-07: no settings.json trigger clock here any more - the watchdog covers the run.
 		} catch {
 			/* never blocks a request */
 		}
