@@ -6132,6 +6132,14 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			restore = { templateMenu: true };
 			continue;
 		}
+		// The digest version (the row on top). Self-check 2026-10-07: adding the -full variant above first
+		// OVERWROTE this branch - the row would have opened nothing. The two prefixes are distinct
+		// ("preview-request:" is not a prefix of "preview-request-full:"), so order does not matter here.
+		if (result.action?.startsWith("preview-request:")) {
+			await previewRequest(ctx, decodeURIComponent(result.action.slice("preview-request:".length)));
+			restore = { templateMenu: true };
+			continue;
+		}
 		if (result.action?.startsWith("preview-template:")) {
 			await previewTemplate(ctx, result.action.slice("preview-template:".length));
 			restore = { templateMenu: true };
