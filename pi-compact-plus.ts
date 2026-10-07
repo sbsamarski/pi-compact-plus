@@ -4146,8 +4146,17 @@ class UserTemplateMenu implements Component, Focusable {
 			this.rebuild();
 			return;
 		}
-		// "" is the pinned extension default; any other text becomes the active template as-is.
-		cfg.templateUserDefaults = name === null ? "" : cfg.userTemplates.find((t) => t.name === name)!.text;
+		// "" is the pinned extension default; any other text becomes the active template as-is. An empty
+		// template therefore pins the built-in text - say so, it must not look like nothing happened.
+		const text = name === null ? "" : cfg.userTemplates.find((t) => t.name === name)!.text;
+		if (!text.trim() && name !== null) {
+			cfg.templateUserDefaults = "";
+			saveConfig(cfg);
+			this.ctx.ui.notify(`${name} is empty, so making it active pins the EXTENSION default (that is what an empty template means). Put text in it, then Ctrl+A again.`, "warning");
+			this.rebuild();
+			return;
+		}
+		cfg.templateUserDefaults = text;
 		saveConfig(cfg);
 		this.ctx.ui.notify(name === null ? "The active template is the extension default again." : `${name} is now the ACTIVE template - this is the text the summarizer gets.`, "info");
 		this.rebuild();
