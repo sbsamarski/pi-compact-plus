@@ -48,6 +48,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SettingItem } from "@earendil-works/pi-tui";
 import { SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
+import { spawnSync } from "node:child_process";
 import type { Component, Focusable, KeybindingsManager, TUI } from "@earendil-works/pi-tui";
 
 /** The context object pi hands to handlers and commands. Typed loosely on purpose: this file is
@@ -279,6 +280,11 @@ type Config = {
 	/** A whole template that an older config kept in the "additional instruction" slot. Kept for
 	 *  reference, never sent: the template is the single text in templateUserDefaults. */
 	templatePreviousCopy: string | null;
+	/** The user's template library (2026-10-07 request): any number of saved templates, names assigned
+	 *  automatically ("User template #15"). The ACTIVE template is a COPY of one of these (or the
+	 *  extension default), assigned from the list with Ctrl+A - which is why the Templates menu offers the
+	 *  active template as a preview only: its text is edited where it lives, in this list. */
+	userTemplates: { name: string; text: string }[];
 };
 
 /** The default no-think tag written into a local model's request when its thinking is off. */
@@ -382,6 +388,7 @@ const DEFAULT_CONFIG: Config = {
 	categorySentences: null,
 	categoryUserDefaults: null,
 	templateUserDefaults: null,
+	userTemplates: [],
 	templatePreviousCopy: null,
 };
 
@@ -973,6 +980,11 @@ export function loadConfig(): Config {
 		categorySentences: sanitizeCategorySentences(raw?.categorySentences),
 		categoryUserDefaults: sanitizeCategorySentences(raw?.categoryUserDefaults),
 		templateUserDefaults: typeof raw?.templateUserDefaults === "string" && raw.templateUserDefaults.trim() ? raw.templateUserDefaults : null,
+		userTemplates: Array.isArray(raw?.userTemplates)
+			? (raw.userTemplates as any[])
+					.filter((t) => t && typeof t.name === "string" && typeof t.text === "string")
+					.map((t) => ({ name: t.name as string, text: t.text as string }))
+			: [],
 	};
 }
 
@@ -3990,19 +4002,266 @@ class CategoryDescList implements Component, Focusable {
 	}
 }
 
+/** The placeholders a template may contain, in the order the request fills them. Listed at the top of
+ *  the template editor so the insertable tags are visible while typing (2026-10-07 request). */
+const TEMPLATE_TAGS = [
+	"{SEGMENT SIZE}",
+	"{LENGTH INSTRUCTIONS}",
+	"{DRAFT INSTRUCTIONS}",
+	"{PREVIOUS SUMMARY SECTION}",
+	"{USER PROMPT SUMMARY}",
+	"{ASSISTANT REPLIES SUMMARY}",
+	"{ASSISTANT THINKING SUMMARY}",
+	"{TOOL CALLS SUMMARY}",
+];
+
+/** The next free template name: one above the highest "#N" in the list. Names are never typed. */
+function nextUserTemplateName(templates: { name: string }[]): string {
+	let max = 0;
+	for (const t of templates) {
+		const m = /#(\d+)\s*$/.exec(t.name);
+		if (m) max = Math.max(max, Number(m[1]));
+	}
+	return `User template #${max + 1}`;
+}
+
+/** Puts text on the system clipboard through the platform's tool and reports what happened. */
+function copyTextToClipboard(ctx: Ctx, text: string, label: string): void {
+	const tool =
+		process.platform === "win32"
+			? { cmd: "clip", args: [] as string[] }
+			: process.platform === "darwin"
+				? { cmd: "pbcopy", args: [] as string[] }
+				: { cmd: "xclip", args: ["-selection", "clipboard"] };
+	try {
+		const res = spawnSync(tool.cmd, tool.args, { input: text, encoding: "utf8" });
+		const ok = res.status === 0;
+		ctx.ui.notify(ok ? `${label}: the template text is on the clipboard.` : `Could not copy it (${tool.cmd} exited ${res.status ?? "with no status"}).`, ok ? "info" : "error");
+	} catch (e) {
+		ctx.ui.notify(`Could not copy it: ${(e as Error)?.message ?? e}`, "error");
+	}
+}
+
+/**
+ * The user's template library (2026-10-07 request): any number of saved templates, named by the
+ * extension. Enter opens one in pi's editor - the normal editing box, where Enter saves, Shift+Enter is
+ * a newline and Esc leaves the text unchanged - with the template's name and the insertable tags shown
+ * above it. The keys on the header line work on the highlighted row. The ACTIVE template is a copy
+ * assigned from here (Ctrl+A); it is not edited in place, which is why the Templates menu shows it as a
+ * preview.
+ */
+class UserTemplateMenu implements Component, Focusable {
+	private list: SettingsList | null = null;
+	private items: SettingItem[] = [];
+	private isFocused = false;
+
+	constructor(
+		private tui: TUI,
+		private ctx: Ctx,
+		private onDone: () => void,
+	) {
+		this.rebuild();
+	}
+
+	/** The text the summarizer gets: the saved user default when there is one, else the built-in text. */
+	private activeText(): string {
+		const t = loadConfig().templateUserDefaults?.trim();
+		return t && t.length ? t : DEFAULT_TEMPLATE_TEXT.trim();
+	}
+
+	private rebuild(): void {
+		const cfg = loadConfig();
+		const active = this.activeText();
+		const extActive = active === DEFAULT_TEMPLATE_TEXT.trim();
+		const items: SettingItem[] = [
+			{
+				id: "keys",
+				label: "Enter opens · Ctrl+N new · Ctrl+K duplicate · Ctrl+D delete · Ctrl+A set active · Ctrl+Y clipboard",
+				currentValue: `${cfg.userTemplates.length} saved`,
+				values: [],
+				description: "Names are automatic: 'User template #N', one above the highest number in the list. The row marked ACTIVE holds the text the summarizer reads. In the editor: Enter saves, Shift+Enter is a newline, Esc leaves the template unchanged.",
+			},
+			{
+				id: "__ext",
+				label: "Extension default (built-in reference)",
+				currentValue: extActive ? "ACTIVE" : "reference",
+				values: ["open"],
+				description: "The template built into the extension - fixed, always available to revert to. Enter shows it in the editor; anything typed there is discarded. Ctrl+K saves its text as a new user template you can edit, Ctrl+A makes it the active template, Ctrl+Y copies it.",
+			},
+		];
+		for (const t of cfg.userTemplates) {
+			items.push({
+				id: `t:${t.name}`,
+				label: t.name,
+				currentValue: !extActive && t.text.trim() === active ? "ACTIVE" : `${t.text.split("\n").length} lines`,
+				values: ["open"],
+				description: "Enter opens it in the editor (Enter saves, Esc discards). Ctrl+A makes this the active template, Ctrl+K copies it under a new name, Ctrl+D deletes it after asking, Ctrl+Y puts its text on the clipboard.",
+			});
+		}
+		this.items = items;
+		this.list = new SettingsList(items, Math.min(items.length + 2, 14), getSettingsListTheme(), (id: string, value: string) => {
+			if (value !== "open") return;
+			if (id === "__ext") void this.openExtensionDefault();
+			else if (id.startsWith("t:")) void this.editTemplate(id.slice(2));
+		}, () => this.onDone());
+	}
+
+	/** The highlighted row: a template's name, null for the built-in default, undefined for the header. */
+	private selectedTarget(): string | null | undefined {
+		const i = (this.list as unknown as { selectedIndex?: number })?.selectedIndex ?? 0;
+		const it = this.items[i];
+		if (!it || it.id === "keys") return undefined;
+		return it.id === "__ext" ? null : it.id.slice(2);
+	}
+
+	private async openExtensionDefault(): Promise<void> {
+		const saved = await editText(this.ctx, `Extension default template - built in, fixed\nTags you can insert: ${TEMPLATE_TAGS.join("   ")}`, DEFAULT_TEMPLATE_TEXT);
+		if (saved === undefined) return;
+		this.ctx.ui.notify("The built-in default cannot be changed, so what you typed was NOT saved. Ctrl+K on that row saves its text as a new user template you can edit.", "info");
+	}
+
+	private async editTemplate(name: string): Promise<void> {
+		const found = loadConfig().userTemplates.find((t) => t.name === name);
+		if (!found) {
+			this.ctx.ui.notify(`"${name}" is no longer in the list.`, "warning");
+			this.rebuild();
+			return;
+		}
+		const saved = await editText(this.ctx, `${name}\nTags you can insert: ${TEMPLATE_TAGS.join("   ")}`, found.text);
+		if (saved === undefined) {
+			this.ctx.ui.notify(`${name}: left exactly as it was (Esc discards, Enter saves).`, "info");
+			return;
+		}
+		const cfg = loadConfig();
+		cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { name, text: saved } : t));
+		saveConfig(cfg);
+		this.ctx.ui.notify(`${name} saved (${saved.split("\n").length} lines). Ctrl+A makes it the active template.`, "info");
+		this.rebuild();
+	}
+
+	private async setActive(name: string | null): Promise<void> {
+		const cfg = loadConfig();
+		if (name !== null && !cfg.userTemplates.some((t) => t.name === name)) {
+			this.ctx.ui.notify(`"${name}" is no longer in the list.`, "warning");
+			this.rebuild();
+			return;
+		}
+		// "" is the pinned extension default; any other text becomes the active template as-is.
+		cfg.templateUserDefaults = name === null ? "" : cfg.userTemplates.find((t) => t.name === name)!.text;
+		saveConfig(cfg);
+		this.ctx.ui.notify(name === null ? "The active template is the extension default again." : `${name} is now the ACTIVE template - this is the text the summarizer gets.`, "info");
+		this.rebuild();
+	}
+
+	private duplicate(name: string | null): void {
+		const cfg = loadConfig();
+		const text = name === null ? DEFAULT_TEMPLATE_TEXT : cfg.userTemplates.find((t) => t.name === name)?.text;
+		if (text === undefined) return;
+		const newName = nextUserTemplateName(cfg.userTemplates);
+		cfg.userTemplates = [...cfg.userTemplates, { name: newName, text }];
+		saveConfig(cfg);
+		this.ctx.ui.notify(`Saved as ${newName}. Enter opens it for editing.`, "info");
+		this.rebuild();
+	}
+
+	private createNew(): void {
+		const cfg = loadConfig();
+		const name = nextUserTemplateName(cfg.userTemplates);
+		cfg.userTemplates = [...cfg.userTemplates, { name, text: "" }];
+		saveConfig(cfg);
+		this.rebuild();
+		void this.editTemplate(name);
+	}
+
+	private async removeTemplate(name: string | null): Promise<void> {
+		if (name === null) {
+			this.ctx.ui.notify("The built-in default is part of the extension - it cannot be deleted.", "info");
+			return;
+		}
+		if (!loadConfig().userTemplates.some((t) => t.name === name)) return;
+		const ok = await this.ctx.ui.confirm(`Delete ${name}?`, "The template leaves the library. What is sent does not change: the active template keeps the text it was given. Press y (or Enter) to delete, Esc to keep it.");
+		if (!ok) {
+			this.ctx.ui.notify(`${name} kept.`, "info");
+			return;
+		}
+		const cfg = loadConfig();
+		cfg.userTemplates = cfg.userTemplates.filter((t) => t.name !== name);
+		saveConfig(cfg);
+		this.ctx.ui.notify(`${name} deleted.`, "info");
+		this.rebuild();
+	}
+
+	handleInput(data: string): void {
+		// The library keys (the terminal bytes for Ctrl+N / Ctrl+K / Ctrl+D / Ctrl+A / Ctrl+Y), all on
+		// the highlighted row. Everything else, Escape included, goes to the list (Esc = back).
+		if (data === "\x0e") {
+			this.createNew();
+			return;
+		}
+		if (data === "\x0b" || data === "\x04" || data === "\x01") {
+			const t = this.selectedTarget();
+			if (t === undefined) return;
+			if (data === "\x0b") this.duplicate(t);
+			else if (data === "\x04") void this.removeTemplate(t);
+			else void this.setActive(t);
+			return;
+		}
+		if (data === "\x19") {
+			const t = this.selectedTarget();
+			if (t === undefined) return;
+			copyTextToClipboard(this.ctx, t === null ? DEFAULT_TEMPLATE_TEXT : loadConfig().userTemplates.find((x) => x.name === t)?.text ?? "", t === null ? "Extension default" : t);
+			return;
+		}
+		this.list?.handleInput(data);
+		this.tui.requestRender();
+	}
+
+	invalidate(): void {
+		this.list?.invalidate();
+	}
+
+	render(width: number): string[] {
+		return this.list ? this.list.render(width) : [];
+	}
+
+	get focused(): boolean {
+		return this.isFocused;
+	}
+
+	set focused(value: boolean) {
+		this.isFocused = value;
+		(this.list as unknown as { focused?: boolean }).focused = value;
+	}
+}
+
 /** The summary template's submenu: edit, read-only previews (active / user / extension), and the
  *  user-default actions. Every row exits through the board loop - editors and pi's select live
  *  over the plain chat, never over a mounted screen. */
 class TemplateMenu implements Component, Focusable {
 	private list: SettingsList | null = null;
 	private isFocused = false;
+	private inUserTemplates = false;
 
 	constructor(
 		private tui: TUI,
 		private ctx: Ctx,
 		private onAction: (action: string) => void,
+		private restoreKey?: string,
 	) {
 		this.rebuild();
+		// The board reopens this menu after an edit; with the key set, it also steps into the template
+		// library, so leaving the library lands back here (not on the main board) - request 2026-10-07.
+		if (this.restoreKey === "userTemplates") this.openUserTemplates();
+	}
+
+	/** The library, shown in place of this menu's list (the pattern the categories screen uses). */
+	private openUserTemplates(): void {
+		this.inUserTemplates = true;
+		this.list = new UserTemplateMenu(this.tui, this.ctx, () => {
+			this.inUserTemplates = false;
+			this.rebuild();
+			this.tui.requestRender();
+		}) as unknown as SettingsList;
 	}
 
 	private stateLabel(): string {
@@ -4021,11 +4280,11 @@ class TemplateMenu implements Component, Focusable {
 		const hasUser = Boolean(cfg.templateUserDefaults?.trim());
 		return [
 			{
-				id: "edit",
-				label: "Edit the template (this is the text that is sent)",
-				currentValue: this.stateLabel(),
+				id: "userTemplates",
+				label: "User templates",
+				currentValue: `${cfg.userTemplates.length} saved`,
 				values: ["open"],
-				description: "Opens the editor with the ACTIVE text. Submit saves it as the active template; empty follows the user default; submit the lone word :extension or :user to restart the editor from that default.",
+				description: "Your own templates, as many as you want, named by the extension ('User template #N'). Enter opens the list: Enter on a template opens it in the editor (Enter saves, Shift+Enter is a newline, Esc discards), Ctrl+N makes a new one and opens it, Ctrl+K duplicates the highlighted one under a new name, Ctrl+D deletes it after asking, Ctrl+A makes it the ACTIVE template, Ctrl+Y copies its text to the clipboard. The active template is a copy assigned from there - the previews below show what is being sent right now.",
 			},
 			// Two previews only (2026-10-07, on request): the template in use, and the built-in one. The
 			// old "preview the request a model gets" row showed the same text as the active preview, and the
@@ -4077,12 +4336,17 @@ class TemplateMenu implements Component, Focusable {
 			Math.min(items.length + 2, 10),
 			getSettingsListTheme(),
 			(id: string, value: string) => {
-				if (value === "open") this.onAction("edit-instruction");
+				if (id === "userTemplates") this.openUserTemplates();
+				else if (value === "open" && id === "edit") this.onAction("edit-instruction");
 				// The two previews. They travel up as __exit actions: the board has to close for the text
 				// screen to take the terminal, and the command loop reopens the board on this row after.
-				if (id === "previewActive") this.onAction("__exit:preview-template:active");
-				else if (id === "previewExt") this.onAction("__exit:preview-template:ext");
-				else if (id === "previewUser") this.onAction("__exit:preview-template:user");
+				// No __exit: prefix here: the row's submenu factory in the board adds it, and the board strips
+				// exactly one. These rows used to add it themselves, so the action arrived as
+				// "__exit:preview-template:active", matched no handler, and the board closed with a warning
+				// (2026-10-07 report: "both previews don't work, it throws me back to the main menu").
+				if (id === "previewActive") this.onAction("preview-template:active");
+				else if (id === "previewExt") this.onAction("preview-template:ext");
+				else if (id === "previewUser") this.onAction("preview-template:user");
 				else if (value === "go") this.onAction(id === "saveUser" ? "save-template-user-default" : id === "resetUser" ? "reset-template-user-default" : "reset-template-extension-default");
 			},
 			() => this.onAction("__close"),
@@ -4108,7 +4372,7 @@ class TemplateMenu implements Component, Focusable {
 
 	render(width: number): string[] {
 		const inner = Math.max(40, width);
-		const lines: string[] = ["", "Summary template - edit, preview the three layers, manage the user default:", ""];
+		const lines: string[] = ["", "Summary template - previews of what is sent, your template library, the resets:", ""];
 		lines.push(...(this.list?.render(inner) ?? []));
 		return lines.map((l) => truncateToWidth(l, inner));
 	}
@@ -4826,6 +5090,11 @@ interface BoardRestore {
 	preserveMenu?: boolean;
 	compactionMenu?: boolean;
 	elisionMenu?: boolean;
+	/** Re-open the Summary template submenu (the previews and the template actions live in it, so the
+	 *  board has to come back there, not on the row that opened it - that was the previous menu). */
+	templateMenu?: boolean;
+	/** With templateMenu: step into that submenu's own screen ("userTemplates" = the template library). */
+	templateKey?: string;
 }
 
 /**
@@ -4909,6 +5178,10 @@ export class CompactionBoard implements Component, Focusable {
 			return;
 		}
 		if (r.compactionMenu && select("compactionMenu")) {
+			(this.list as unknown as { activateItem?: () => void }).activateItem?.();
+			return;
+		}
+		if (r.templateMenu && select("instruction")) {
 			(this.list as unknown as { activateItem?: () => void }).activateItem?.();
 			return;
 		}
@@ -5097,12 +5370,17 @@ export class CompactionBoard implements Component, Focusable {
 			currentValue: "",
 			values: [],
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
-				new TemplateMenu(this.tui, this.ctx, (action: string) => {
-					if (action === "__close") done();
-					else done(`__exit:${action}`);
-				}) as unknown as Component,
+				new TemplateMenu(
+					this.tui,
+					this.ctx,
+					(action: string) => {
+						if (action === "__close") done();
+						else done(`__exit:${action}`);
+					},
+					this.restore?.templateKey,
+				) as unknown as Component,
 			description:
-				"THE SUMMARY TEMPLATE - the exact text the summarizer reads (after the size/draft blocks). It contains {PLACEHOLDER} tokens the extension substitutes per model: {TOOL CALLS SUMMARY}, {USER PROMPT SUMMARY}, {ASSISTANT REPLIES SUMMARY}, {ASSISTANT THINKING SUMMARY}, {STUB EXAMPLE RULE}, {PREVIOUS SUMMARY RULE}, {PREVIOUS SUMMARY SECTION}. DO NOT reword or delete the {TOKENS} - each is replaced by the per-model option sentence (the editable wording of every token lives in the Category templates screen just below); a deleted token is auto-added at the end with a note. Everything else you write is sent word for word. Enter opens the template submenu: edit, read-only previews of the active / user / extension template, save the current as the user default, and both resets (each asks first).",
+				"THE SUMMARY TEMPLATE - the exact text the summarizer reads (after the size/draft blocks). It contains {PLACEHOLDER} tokens the extension substitutes per model: {TOOL CALLS SUMMARY}, {USER PROMPT SUMMARY}, {ASSISTANT REPLIES SUMMARY}, {ASSISTANT THINKING SUMMARY}, {STUB EXAMPLE RULE}, {PREVIOUS SUMMARY RULE}, {PREVIOUS SUMMARY SECTION}. DO NOT reword or delete the {TOKENS} - each is replaced by the per-model option sentence (the editable wording of every token lives in the Category templates screen just below); a deleted token is auto-added at the end with a note. Everything else you write is sent word for word. Enter opens the template submenu: your template library (any number of saved templates, one of them made active), read-only previews of the active / user / extension template, and the resets (each asks first).",
 		});
 		rows.push({
 			id: "catDesc",
@@ -5640,6 +5918,10 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		const result = (await ctx.ui.custom(factory)) as BoardResult | undefined;
 		if (!result?.action) return;
 		// The two compaction switches answer with a capital-letters notice - one compactor at a time.
+	// Safety net for the submenu action protocol (2026-10-07): a submenu marks an action with __exit: and
+	// the board strips it before handing it here. When an action arrives with the marker still on it, the
+	// nesting added it twice - perform it as the plain action instead of falling to the warning below.
+	if (result.action?.startsWith("__exit:")) result.action = result.action.slice("__exit:".length);
 	if (result.action?.startsWith("notice:")) {
 			// 2026-10-07 BUG FIX: these are the two compaction switches, and this used to QUIT the settings
 			// after the notice - the "selecting this item throws me out of the menu completely" complaint.
@@ -5650,7 +5932,7 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		}
 		if (result.action === "edit-instruction") {
 			await editInstruction(ctx);
-			restore = { rowId: "instruction" };
+			restore = { templateMenu: true };
 			continue;
 		}
 		// The request preview: the filled-in template, not the template source. It used to sit inside the
@@ -5658,12 +5940,12 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		// the template menu closed the menu and showed nothing.
 		if (result.action?.startsWith("preview-request:")) {
 			await previewRequest(ctx, result.action.slice("preview-request:".length));
-			restore = { rowId: "instruction" };
+			restore = { templateMenu: true };
 			continue;
 		}
 		if (result.action?.startsWith("preview-template:")) {
 			await previewTemplate(ctx, result.action.slice("preview-template:".length));
-			restore = { rowId: "instruction" };
+			restore = { templateMenu: true };
 			continue;
 		}
 		if (result.action === "elision-now") {
@@ -5690,7 +5972,7 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		}
 		if (result.action === "save-template-user-default" || result.action === "reset-template-user-default" || result.action === "reset-template-extension-default") {
 			await templateDefaultAction(ctx, result.action);
-			restore = { rowId: "instruction" };
+			restore = { templateMenu: true };
 			continue;
 		}
 		if (result.action?.startsWith("preview-category-default:")) {
