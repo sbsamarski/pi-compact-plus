@@ -946,7 +946,12 @@ export function loadConfig(): Config {
 		},
 		autoCompact: typeof raw.autoCompact === "boolean" ? raw.autoCompact : base.autoCompact,
 		autoCompactPaused: typeof raw.autoCompactPaused === "boolean" ? raw.autoCompactPaused : base.autoCompactPaused,
-		triggerClockByPi: typeof raw.triggerClockByPi === "boolean" ? raw.triggerClockByPi : base.triggerClockByPi,
+		// 2026-10-07: the "who pulls the auto-compaction trigger" menu row was REMOVED on request. pi's
+		// own check runs between turns INSIDE a running job (after tools finish, before the next assistant
+		// response - pi's compaction docs), so it is the only trigger that fires during a long run; the
+		// idle watcher stays as a backstop for when the settings line cannot be written. The field is kept
+		// and forced true, so a config holding "false" from the old menu behaves like the new default.
+		triggerClockByPi: true,
 		piLineOwned: raw.piLineOwned === true,
 		piLineOriginal: typeof raw.piLineOriginal === "object" && raw.piLineOriginal
 			? {
@@ -4924,16 +4929,15 @@ class CompactionMenu implements Component, Focusable {
 				currentValue: cfg.enabled ? "on" : "off",
 				values: ["on", "off"],
 				description:
-					"ON = the summary is written by the first model in the Compaction models list that answers. OFF = this extension never compacts. Switching it ON also switches pi's own compaction OFF - one compactor at a time.",
+					"ON = the summary is written by the first model in the Compaction models list that answers. OFF = this extension never compacts. The trigger is pi's own check, which runs between turns INSIDE a long run (after a tool batch, before the next model call), so a working session compacts on its own instead of reaching the end of the window; this extension writes every summary and pi's own summarizer never runs. pi reads its settings file at startup - /reload after a change.",
 			},
-			{
-				id: "piCompaction",
-				label: "Who pulls the auto-compaction trigger:",
-				currentValue: !cfg.autoCompact ? "nothing automatic" : cfg.triggerClockByPi ? "pi checks before every request" : "the extension, only while idle",
-				values: ["pi checks before every request", "the extension, only while idle", "nothing automatic"],
-				description:
-					"THE SUMMARY IS ALWAYS WRITTEN BY THIS EXTENSION, whichever is chosen - pi's own summarizer never runs, because this extension answers every compaction request. The choice is only about WHO NOTICES the line has been crossed: 'before every request' is the only mode that also fires while the agent is working (a long tool-calling run used to overflow instead of compacting); 'while idle' is this extension's own watcher, which stands down during a run; 'nothing automatic' leaves compaction to you. pi reads the file at startup, so a change here does nothing until /reload.",
-			},
+			// 2026-10-07: "Who pulls the auto-compaction trigger" REMOVED. It asked who notices that the
+			// line has been crossed, and the answer is always pi's own check now: pi looks between turns -
+			// after a tool batch, before the next model call - which is the only point inside a long job
+			// where a compaction can start without aborting the run. The extension's idle watcher cannot do
+			// that (it stands down during a run), so offering it as a trigger was offering a mode that
+			// overflows. The watcher stays as a backstop for when the settings line cannot be written, and
+			// "nothing automatic" is exactly what the Compaction on/off switch OFF means - one switch.
 			numberRow("retries", "Retries per model", String(cfg.retries), [], "How many times the next model in the list is tried when one fails."),
 			numberRow("retryWait", "Wait between retries", `${cfg.retryDelaySeconds} s`, [], "Seconds to wait before trying the next model."),
 			{
@@ -5046,39 +5050,21 @@ class CompactionMenu implements Component, Focusable {
 			Math.min(items.length + 2, 10),
 			getSettingsListTheme(),
 			(id: string, value: string) => {
-				if (id === "compactionOn" || id === "piCompaction") {
+				if (id === "compactionOn") {
 					const on = value === "on";
-					if (id === "compactionOn") {
-						const piWasOn = readPiCompactionEnabled();
-						update((c) => void (c.enabled = on));
-						if (on && piWasOn) writePiCompactionEnabled(false);
-						this.onAction(
-							"__exit:notice:" +
-								(on
-									? "COMPACTION IS ON - AND PI'S OWN COMPACTION WAS SWITCHED OFF IN THE SAME ACTION: ONE COMPACTOR AT A TIME. pi reads its settings.json at startup, so /reload TO MAKE THAT STICK."
-									: "THIS EXTENSION'S COMPACTION IS OFF. PI'S OWN STAYS AS IT IS - IF IT WAS OFF TOO, NOTHING COMPACTS ANY MORE UNTIL ONE OF THE TWO IS ON."),
-						);
-						return;
-					}
-					// WHO PULLS THE TRIGGER (2026-10-06). The extension writes the summary in all three
-					// settings; "pi" only lends pi's pre-request check - the one point inside a run where a
-					// compaction can start without aborting the run, which is what a working session needs.
-					const byPi = value === "pi checks before every request";
-					const idleOnly = value === "the extension, only while idle";
-					update((c) => {
-						c.enabled = byPi || idleOnly;
-						c.autoCompact = byPi || idleOnly;
-						c.autoCompactPaused = false;
-						c.triggerClockByPi = byPi;
-					});
+					const piWasOn = readPiCompactionEnabled();
+					update((c) => void (c.enabled = on));
+					if (on && piWasOn) writePiCompactionEnabled(false);
+					// Arm the trigger with the switch (2026-10-07: one switch, the piCompaction row is gone).
+					// ON writes pi's compaction block with THIS extension's line, so pi's between-turn check
+					// pulls the trigger inside a long run and this extension answers with its own summary;
+					// OFF releases the file back to pi (the fully-off rule of 2026-10-06).
 					syncTriggerClock(this.ctx, loadConfig());
 					this.onAction(
 						"__exit:notice:" +
-							(byPi
-								? "THE TRIGGER IS PI'S PRE-REQUEST CHECK - it runs before every request to the model, so a working session compacts on its own instead of overflowing. THE EXTENSION STILL WRITES EVERY SUMMARY: pi's own summarizer is answered by this extension every time. /reload once so pi re-reads settings.json."
-								: idleOnly
-									? "THE TRIGGER IS THIS EXTENSION'S IDLE WATCHER - it never fires while the agent is working, so a long tool-calling run can reach the window before it compacts. /reload so pi's own setting sticks."
-								: "NOTHING COMPACTS BY ITSELF NOW - pi's own check is off too. /reload so pi's setting sticks."),
+							(on
+								? "COMPACTION IS ON. THE TRIGGER IS PI'S OWN CHECK, WHICH RUNS BETWEEN TURNS INSIDE A RUN (after a tool batch, before the next model call) - so a long job compacts instead of overflowing. THIS EXTENSION WRITES EVERY SUMMARY; pi's own summarizer is answered by this extension every time and never runs. pi reads its settings file at startup, so /reload TO MAKE IT STICK."
+								: "THIS EXTENSION'S COMPACTION IS OFF, and its trigger line is given back to pi. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS ANY MORE UNTIL ONE OF THE TWO IS ON."),
 					);
 					return;
 				}
