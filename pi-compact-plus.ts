@@ -4050,6 +4050,83 @@ function copyTextToClipboard(ctx: Ctx, text: string, label: string): void {
  * assigned from here (Ctrl+A); it is not edited in place, which is why the Templates menu shows it as a
  * preview.
  */
+/**
+ * The template library's dialogs, run by the board loop. They CANNOT run inside the library screen: a
+ * modal dialog (editor, confirm) opened while another custom screen is mounted leaves the terminal with
+ * no focused input - the 2026-10-07 report was an editor that took the keystrokes, gave nothing back, and
+ * needed a force close. So the library only asks, and the work happens here, over the plain chat, with the
+ * board closed; the return value reopens the board on the library list. "" = the built-in default.
+ */
+async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templateMenu: boolean; templateKey: string }> {
+	const at = action.indexOf(":");
+	const kind = at < 0 ? action : action.slice(0, at);
+	const name = at < 0 ? "" : decodeURIComponent(action.slice(at + 1));
+	const back = { templateMenu: true, templateKey: "userTemplates" };
+	const header = (n: string) => `User template - ${n}\nTags you can insert: ${TEMPLATE_TAGS.join("   ")}\nEnter saves - Shift+Enter is a newline - Esc leaves the template unchanged`;
+	const cfg = loadConfig();
+	if (kind === "tpl-new") {
+		const n = nextUserTemplateName(cfg.userTemplates);
+		const text = await editText(ctx, header(n), "");
+		cfg.userTemplates = [...cfg.userTemplates, { name: n, text: text ?? "" }];
+		saveConfig(cfg);
+		ctx.ui.notify(text === undefined ? `${n} added to the library EMPTY (Esc in the editor does not delete it).` : `${n} saved to the library. Ctrl+A on its row makes it the active template.`, "info");
+		return back;
+	}
+	if (kind === "tpl-dup") {
+		const src = name ? cfg.userTemplates.find((t) => t.name === name)?.text ?? "" : DEFAULT_TEMPLATE_TEXT;
+		const n = nextUserTemplateName(cfg.userTemplates);
+		const text = await editText(ctx, `${header(n)}\nCopied from ${name || "the extension default"} - editing the copy does not change the original`, src);
+		if (text === undefined) {
+			ctx.ui.notify("Cancelled - no copy was made.", "info");
+			return back;
+		}
+		cfg.userTemplates = [...cfg.userTemplates, { name: n, text }];
+		saveConfig(cfg);
+		ctx.ui.notify(`${n} saved as a copy of ${name || "the extension default"}.`, "info");
+		return back;
+	}
+	if (kind === "tpl-del") {
+		if (!name) {
+			ctx.ui.notify("The built-in default is part of the extension - it cannot be deleted.", "info");
+			return back;
+		}
+		if (!cfg.userTemplates.some((t) => t.name === name)) {
+			ctx.ui.notify(`"${name}" is no longer in the list.`, "warning");
+			return back;
+		}
+		const ok = await ctx.ui.confirm(`Delete ${name}?`, "The template leaves the library. What is sent does not change: the active template keeps the text it was given. Press y (or Enter) to delete, Esc to keep it.");
+		if (!ok) {
+			ctx.ui.notify(`${name} kept.`, "info");
+			return back;
+		}
+		cfg.userTemplates = cfg.userTemplates.filter((t) => t.name !== name);
+		saveConfig(cfg);
+		ctx.ui.notify(`${name} deleted.`, "info");
+		return back;
+	}
+	if (!name) {
+		// The built-in default is fixed: it opens in the same editor so it can be read and copied, and the
+		// result is dropped on purpose, with the notice saying so (the 2026-10-07 request).
+		await editText(ctx, `Extension default template - built in, fixed\nTags you can insert: ${TEMPLATE_TAGS.join("   ")}\nAnything typed here is DISCARDED on submit - Ctrl+K saves it as a new user template`, DEFAULT_TEMPLATE_TEXT);
+		ctx.ui.notify("The built-in default cannot be changed, so what you typed was NOT saved. Ctrl+K on that row saves its text as a new user template you can edit.", "info");
+		return back;
+	}
+	const found = cfg.userTemplates.find((t) => t.name === name);
+	if (!found) {
+		ctx.ui.notify(`"${name}" is no longer in the list.`, "warning");
+		return back;
+	}
+	const text = await editText(ctx, header(name), found.text);
+	if (text === undefined) {
+		ctx.ui.notify(`${name} left unchanged.`, "info");
+		return back;
+	}
+	cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { ...t, text } : t));
+	saveConfig(cfg);
+	ctx.ui.notify(`${name} saved.`, "info");
+	return back;
+}
+
 class UserTemplateMenu implements Component, Focusable {
 	private list: SettingsList | null = null;
 	private items: SettingItem[] = [];
@@ -4058,7 +4135,9 @@ class UserTemplateMenu implements Component, Focusable {
 	constructor(
 		private tui: TUI,
 		private ctx: Ctx,
-		private onDone: () => void,
+		// No argument = the library was left (Esc). With an action = "do this over the plain chat and bring
+		// the library back" - see templateLibraryAction for why the work cannot happen here.
+		private onDone: (action?: string) => void,
 	) {
 		this.rebuild();
 	}
@@ -4101,8 +4180,10 @@ class UserTemplateMenu implements Component, Focusable {
 		this.items = items;
 		this.list = new SettingsList(items, Math.min(items.length + 2, 14), getSettingsListTheme(), (id: string, value: string) => {
 			if (value !== "open") return;
-			if (id === "__ext") void this.openExtensionDefault();
-			else if (id.startsWith("t:")) void this.editTemplate(id.slice(2));
+			// 2026-10-07 CRASH FIX: the editor is a modal dialog. Opening one while this list is mounted
+			// leaves the terminal with no focused input - the "empty prompt, I cannot type anything, force
+			// close" report. Every dialog goes to the board loop now, which runs it over the plain chat.
+			this.onDone(id === "__ext" ? "tpl-edit:" : `tpl-edit:${encodeURIComponent(id.slice(2))}`);
 		}, () => this.onDone());
 	}
 
@@ -4114,6 +4195,8 @@ class UserTemplateMenu implements Component, Focusable {
 		return it.id === "__ext" ? null : it.id.slice(2);
 	}
 
+	// 2026-10-07: DEAD PATH, same reason as duplicate() above - the built-in default's editor runs in the
+	// board loop now (templateLibraryAction, "tpl-edit" with an empty name).
 	private async openExtensionDefault(): Promise<void> {
 		const saved = await editText(this.ctx, `Extension default template - built in, fixed\nTags you can insert: ${TEMPLATE_TAGS.join("   ")}`, DEFAULT_TEMPLATE_TEXT);
 		if (saved === undefined) return;
@@ -4162,6 +4245,8 @@ class UserTemplateMenu implements Component, Focusable {
 		this.rebuild();
 	}
 
+	// 2026-10-07: DEAD PATH, kept only so the modal editor below is never reached from this screen again.
+	// Ctrl+K emits tpl-dup: to the board loop now - an editor opened over a mounted list kills the focus.
 	private duplicate(name: string | null): void {
 		const cfg = loadConfig();
 		const text = name === null ? DEFAULT_TEMPLATE_TEXT : cfg.userTemplates.find((t) => t.name === name)?.text;
@@ -4174,30 +4259,13 @@ class UserTemplateMenu implements Component, Focusable {
 	}
 
 	private createNew(): void {
-		const cfg = loadConfig();
-		const name = nextUserTemplateName(cfg.userTemplates);
-		cfg.userTemplates = [...cfg.userTemplates, { name, text: "" }];
-		saveConfig(cfg);
-		this.rebuild();
-		void this.editTemplate(name);
+		this.onDone("tpl-new"); // created and edited by the board loop - see the note on the row handler
 	}
 
-	private async removeTemplate(name: string | null): Promise<void> {
-		if (name === null) {
-			this.ctx.ui.notify("The built-in default is part of the extension - it cannot be deleted.", "info");
-			return;
-		}
-		if (!loadConfig().userTemplates.some((t) => t.name === name)) return;
-		const ok = await this.ctx.ui.confirm(`Delete ${name}?`, "The template leaves the library. What is sent does not change: the active template keeps the text it was given. Press y (or Enter) to delete, Esc to keep it.");
-		if (!ok) {
-			this.ctx.ui.notify(`${name} kept.`, "info");
-			return;
-		}
-		const cfg = loadConfig();
-		cfg.userTemplates = cfg.userTemplates.filter((t) => t.name !== name);
-		saveConfig(cfg);
-		this.ctx.ui.notify(`${name} deleted.`, "info");
-		this.rebuild();
+	private removeTemplate(name: string | null): void {
+		// The asking and the deleting happen in the board loop: a confirm is a modal dialog, and a dialog
+		// opened over this mounted list leaves the TUI with no focused input (2026-10-07 crash).
+		this.onDone(`tpl-del:${encodeURIComponent(name ?? "")}`);
 	}
 
 	handleInput(data: string): void {
@@ -4210,8 +4278,8 @@ class UserTemplateMenu implements Component, Focusable {
 		if (data === "\x0b" || data === "\x04" || data === "\x01") {
 			const t = this.selectedTarget();
 			if (t === undefined) return;
-			if (data === "\x0b") this.duplicate(t);
-			else if (data === "\x04") void this.removeTemplate(t);
+			if (data === "\x0b") this.onDone(`tpl-dup:${encodeURIComponent(t ?? "")}`); // modal, board loop
+			else if (data === "\x04") this.removeTemplate(t);
 			else void this.setActive(t);
 			return;
 		}
@@ -4266,10 +4334,17 @@ class TemplateMenu implements Component, Focusable {
 	/** The library, shown in place of this menu's list (the pattern the categories screen uses). */
 	private openUserTemplates(): void {
 		this.inUserTemplates = true;
-		this.list = new UserTemplateMenu(this.tui, this.ctx, () => {
-			this.inUserTemplates = false;
-			this.rebuild();
-			this.tui.requestRender();
+		this.list = new UserTemplateMenu(this.tui, this.ctx, (action) => {
+			// No action (Esc) = swap back to this menu's own list, inside the same mounted screen - safe.
+			// With an action = hand it to the board: the board closes, the loop runs the dialog over the
+			// plain chat, and the board reopens on the library. Dialogs never open over a mounted screen.
+			if (!action) {
+				this.inUserTemplates = false;
+				this.rebuild();
+				this.tui.requestRender();
+				return;
+			}
+			this.onAction(action);
 		}) as unknown as SettingsList;
 	}
 
@@ -6060,6 +6135,13 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		if (result.action?.startsWith("__exit:")) {
 			ctx.ui?.notify?.(`Unknown menu request: ${String(result.action).slice(0, 100)}`, "warning");
 			restore = undefined;
+			continue;
+		}
+		// The template library's dialogs (2026-10-07). The library is a mounted screen; an editor, a copy
+		// or a confirmation opened over a mounted screen leaves the TUI with no focused input. The library
+		// asks, the work happens HERE, over the plain chat, and the board comes back on the library list.
+		if (result.action === "tpl-new" || result.action.startsWith("tpl-edit") || result.action.startsWith("tpl-dup:") || result.action.startsWith("tpl-del:")) {
+			restore = await templateLibraryAction(ctx, String(result.action));
 			continue;
 		}
 		ctx.ui?.notify?.(`Unknown menu request: ${String(result.action).slice(0, 100)} - the menu stayed open so nothing is lost.`, "warning");
