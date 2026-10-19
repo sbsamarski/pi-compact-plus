@@ -1547,19 +1547,24 @@ export async function countTextAt(base: string, text: string, estimate: number, 
  */
 type Sizes = { min: number; target: number; max: number; genCap: number; notes: string[] };
 
-/** Slack above `max` on the generation cap only, so a summary landing exactly on max is not cut.
- *  It is also the slack above `max` on what the ENGINE IS TOLD to generate, and the two are held to
- *  the same line: the request asks for at most Summary max + GEN_MARGIN, and a summary of up to that
- *  size is accepted rather than thrown away. 2026-10-19, on the user's hard rule after pi crashed:
- *  this stays 512 and nothing may push the instruction past it, because a local engine asked for more
- *  than its window holds does not fail politely - it takes the session down as a crash.
+/** The tolerance a finished summary is judged against, and its ONLY job (2026-10-20, the operator's
+ *  design, replacing a rule that used this same number for two things at once). A summary of up to
+ *  Summary max + GEN_MARGIN is accepted; anything longer is thrown away and the next model is asked.
+ *  The ask itself is Summary max exactly, so this is not room the model is invited to write into - it
+ *  is slack for the two ways an honest reply lands over the line: an online provider has been seen to
+ *  come back 300-400 tokens over an instructed ceiling, and our token count is never the server's
+ *  token count, because the two tokenizer files disagree. A local llama-family server treats the
+ *  ceiling as a hard stop, so on those this slack almost never gets used, which is the point rather
+ *  than an accident.
  *
- *  On 2026-10-19, in the middle of the emergency, this was raised to 1000 on my reading of a request to
- *  "accept 1000 tokens over the limit". That reading was wrong and the comment above it said so at the
- *  time: the ask and the tolerance are the same number here, so raising it pushed the instruction past
- *  the line this file's own hard rule was drawn to hold. Restored to 512 on 2026-10-20 at the operator's
- *  instruction. If a separate acceptance tolerance is ever wanted, it becomes its own constant beside
- *  this one rather than a second meaning smuggled into this one. */
+ *  It used to also be the slack on what the ENGINE IS TOLD to generate, which is what made the number
+ *  meaningless to the operator: with max at 30,000 the log reported 30,512 back at them as if it were a
+ *  measurement, and before that the scratch and thinking allowances were ADDED on top of both, so a
+ *  model with a 30,000 aim was told to generate 34,608 and ran off the window. Nothing may push the
+ *  instruction past Summary max, because a local engine asked for more than its window holds does not
+ *  fail politely - it takes the session down as a crash. If the ask and the tolerance ever need to
+ *  differ again, that is a second constant with its own name, not a second meaning smuggled into this
+ *  one. Raised to 1000 once, during the emergency of 2026-10-19, and put back to 512 the next day. */
 const GEN_MARGIN = 512;
 
 /** What a scratchpad is worth reserving for when the template asks for one and the model can afford
@@ -1656,7 +1661,10 @@ export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; his
 	if (min > target) min = target;
 	// min 0 = "no minimum": any real output is accepted (the empty-summary check still applies).
 	if (min > 0 && min < 128) min = 128;
-	return { min, target, max, genCap: max + GEN_MARGIN, notes };
+	// The ask IS the allowance. genCap is kept as its own field because the fallback path and the attempt
+	// log both report it, and because what the engine is capped at and what an answer is judged against
+	// are two different numbers - GEN_MARGIN's whole job is now the second one.
+	return { min, target, max, genCap: max, notes };
 }
 
 /**
@@ -2803,13 +2811,19 @@ export async function directCompact(args: {
 		messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
 	};
 	// The engine's instruction ceiling, and a hard one (2026-10-19, the user's rule after a crash):
-	// Summary max plus GEN_MARGIN, never a token more. The scratch and thinking allowances used to be
-	// ADDED on top of this, which is how a model with a 30,000 aim ended up being told to generate
-	// 34,608 - past the point where the engine runs out of window and dies. From here they may only ever
-	// trim the ask, never raise it, however much room a model might theoretically have had.
+	// Summary max, exactly, is what the engine is told to generate, and that figure is the model's TOTAL
+	// allowance for this summary - thinking included, because a thinking level is a model setting rather
+	// than extra room, and it is capped inside the request (see thinkingBudgetFor) so it spends from
+	// inside the allowance instead of quietly enlarging it. The same number reaches the template as
+	// {MAX TOKENS}, so what the model is told and where the server will stop it are the same figure.
+	// The margin above max is not part of this ask at all; it is only the tolerance the finished answer
+	// is judged against, and it is applied at the size checks, not here.
+	// History, kept because these lines are where the design went wrong twice: the allowances used to be
+	// ADDED on top of max (a 30,000 aim became a 34,608 request and ran off the window), and then the
+	// ask was max + margin, which made the ceiling in the log look like a measurement of the reply.
 	const dCeiling = sizes.max + GEN_MARGIN;
 	const dScratch = scratchAllowanceFor(model, sizes.genCap);
-	const dAsk = Math.min(sizes.genCap + dScratch.allowance, dCeiling);
+	const dAsk = sizes.genCap;
 	// Whether the no-think tag went out with this request, logged, because "thinking is off in the
 	// settings" and "the engine was told" are two different claims, and last night needed the second one
 	// written down somewhere a person could read it.
@@ -3178,12 +3192,15 @@ export async function summarizeWithRotation(
 		// initialization" and pi kept re-triggering on a context it could not compact. The allowance is
 		// therefore unconditional now (the template asks for scratch work anyway) and is clamped by what
 		// this model is permitted to emit, which is the only hard ceiling there is.
-		// The same hard ceiling as the direct request (2026-10-19, the user's rule): what we tell the
-		// engine to generate tops out at Summary max + GEN_MARGIN, however much thinking and scratch room
-		// this model could theoretically have been given. Asking past that is how it ran off its window.
+		// The fallback through pi's own compact() carries the same total allowance as a direct request:
+		// Summary max and nothing beyond it. The thinking and scratch allowances are no longer added on
+		// top (2026-10-20, the operator's design) - thinking is capped in the request body, so it spends
+		// from inside the allowance, and a candidate that needs more than the allowance for both is a
+		// candidate to move off rather than one to run past the window. dCeilingFallback is only the
+		// tolerance the answer is judged against, never a licence to ask for more.
 		const dCeilingFallback = realSizes.max + GEN_MARGIN;
 		const scratch = scratchAllowanceFor(c.model, realSizes.genCap);
-		const genCapFinal = Math.min(realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0) + scratch.allowance, dCeilingFallback);
+		const genCapFinal = realSizes.genCap;
 		if (scratch.note) logLine(cfg, { event: "note", ref: c.ref, note: scratch.note });
 		let instructions = buildInstructions({
 			sizes: realSizes,
