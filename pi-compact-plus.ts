@@ -7302,7 +7302,7 @@ function scheduleHandBack(ms: number, api: any = extApi): void {
 	if (autoResumeTurn.timer !== undefined) return;
 	autoResumeTurn.timer = setTimeout(() => {
 		autoResumeTurn.timer = undefined;
-		void tryHandBack(api);
+		runTimerBody("hand-back", () => tryHandBack(api));
 	}, ms);
 	(autoResumeTurn.timer as unknown as { unref?: () => void })?.unref?.();
 }
@@ -7968,9 +7968,49 @@ function stopWatcherTimer(): void {
 	watcherTimer = undefined;
 }
 
+/** pi retires a captured ctx the moment the session behind it is replaced or the extension reloads, and
+ *  it announces the fact by THROWING from every property of that dead ctx: "This extension ctx is stale
+ *  after session replacement or reload...". Every timer in this extension holds a ctx, or the api, or
+ *  both, across that line - and on 2026-10-20 the watchdog tick reached for a session id through a ctx
+ *  the settings menu had already retired. The throw happened inside a setInterval callback with no one
+ *  above it to catch anything, so it surfaced as an uncaughtException and pi exited.
+ *
+ *  A timer that finds its context dead therefore stops itself, drops what it was holding and waits:
+ *  the next agent_start leaves a live ctx behind, and the first live request starts the clock again.
+ *  A timer error of any other kind is still swallowed, because a timer callback has nowhere else for an
+ *  error to go - but now it is swallowed INTO THE LOG, where it can be read, instead of into the exit
+ *  of the program or into silence.
+ */
+export function ctxIsStaleError(e: any): boolean {
+	return /extension ctx is stale/i.test(String(e?.message ?? e ?? ""));
+}
+function noteDeadTimer(where: string, e: any): void {
+	const stale = ctxIsStaleError(e);
+	try {
+		logLine(loadConfig(), { event: stale ? "ctx_stale" : "timer_error", where, error: String(e?.message ?? e).slice(0, 200), note: stale ? "a timer was holding a context pi had already replaced; it stopped itself and waits for the next agent_start to hand it a live one" : "a timer callback threw; pi stayed up, because a timer error has nowhere else to be caught" });
+	} catch {
+		/* a logger that cannot write must never become the second problem */
+	}
+	if (!stale) return;
+	stopWatcherTimer();
+	watcherCtx = null;
+	cancelHandBack("the session behind this timer was replaced or reloaded");
+}
+/** Run the body of a timer, sync or async, and route anything it throws - including a rejection - to
+ *  noteDeadTimer rather than letting it reach pi's process-level handler, where an uncaughtException
+ *  ends the session. */
+export function runTimerBody(where: string, run: () => void | Promise<unknown>): void {
+	try {
+		const r = run();
+		if (r && typeof (r as any).then === "function") void (r as Promise<unknown>).catch((e) => noteDeadTimer(where, e));
+	} catch (e) {
+		noteDeadTimer(where, e);
+	}
+}
+
 function ensureWatcherTimer(): void {
 	if (watcherTimer) return;
-	watcherTimer = setInterval(() => watcherTick("timer"), WATCHER_INTERVAL_MS);
+	watcherTimer = setInterval(() => runTimerBody("watchdog", () => watcherTick("timer")), WATCHER_INTERVAL_MS);
 	(watcherTimer as unknown as { unref?: () => void })?.unref?.();
 }
 
@@ -8013,11 +8053,10 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		if (settleCheckTimer) clearTimeout(settleCheckTimer);
 		settleCheckTimer = setTimeout(() => {
 			settleCheckTimer = undefined;
-			try {
-				watcherTick("settled");
-			} catch {
-				/* the watcher must never break a session */
-			}
+			// Guarded rather than wrapped in a silent catch (2026-10-20): the swallow here used to hide the
+			// one error class that could not be survived elsewhere - a ctx pi had already retired - and a
+			// silent catch on a dead ctx means the watcher stops looking and nobody is told why.
+			runTimerBody("settle-check", () => watcherTick("settled"));
 		}, 1200);
 		(settleCheckTimer as unknown as { unref?: () => void })?.unref?.();
 		return undefined;
