@@ -2394,13 +2394,46 @@ export function chatTemplateKwargsFor(thinking: Level): Record<string, unknown> 
 	return undefined;
 }
 
+/**
+		 * Put a ceiling on the model's own thinking, in tokens, for THIS request - the one lever that works
+		 * on a server whose chat template we do not control (2026-10-20, taken from the servers themselves).
+		 * Thinking gets decided twice, and the prompt only reaches the second decision: the server picks the
+		 * size of the thinking channel from the REQUEST PARAMETERS before generating anything, while the
+		 * no-think tag is text the model reads later, by which time the budget is already spent. So say it in
+		 * the request. Every recognised spelling goes, because a server ignores the keys it does not
+		 * implement and this one request has to serve three engines: reasoning_budget_tokens is Strata's cap
+		 * (its run-config applies the server-wide value only when the request sends none of its own, so
+		 * naming ours wins), and thinking plus chat_template_kwargs is what ik_llama.cpp's server reads.
+		 * Never send 0 to Strata: its documentation says 0 means no cap rather than no thinking, which would
+		 * hand the whole request back to the thinking channel - the exact shape of last night's failure. A
+		 * small non-zero budget still lets a model close its own think block cleanly. The total asked for does
+		 * not change with this: the summary is what gains the room thinking gives up.
+	 */
+	export function thinkingBudgetFor(thinking: Level): { budget: number; fields: Record<string, unknown> } {
+		const budgets: Record<string, number> = { off: 256, minimal: 1024, low: 1024, medium: 4096, high: 8192, xhigh: 8192 };
+		const budget = budgets[thinking] ?? 4096;
+		const fields: Record<string, unknown> = {
+			reasoning_budget_tokens: budget,
+			thinking: thinking === "off" ? { type: "disabled" } : { type: "enabled", budget_tokens: budget },
+		};
+		if (thinking === "off") fields.chat_template_kwargs = { enable_thinking: false, thinking_enable: false, thinking_budget: 0 };
+		else fields.chat_template_kwargs = { enable_thinking: true, thinking_budget: budget };
+		return { budget, fields };
+	}
+
 /** The streamFn handed to pi's compact() so a FALLBACK request carries the same sampling flags and
  *  effort kwargs as the direct request. undefined = nothing to inject - call compact() as before. */
 function samplingStreamFn(ref: string, sampling: SamplingFlags | undefined, thinking: Level): ((model: any, context: any, opts: any) => any) | undefined {
 	const params = samplingParamsFor(ref, sampling);
 	const kwargs = refLooksLocal(ref) ? chatTemplateKwargsFor(thinking) : undefined;
-	if (!params && !kwargs) return undefined;
-	return (model, context, opts) => piStreamSimple(model, context, { ...opts, samplingParams: { ...(params ?? {}), ...(kwargs ?? {}) } });
+	// The same ceiling the direct request sends, so a fallback through pi's own compact() is not the
+	// one path where the model may spend the whole ask on its own reasoning.
+	const kBud = refLooksLocal(ref) ? thinkingBudgetFor(thinking) : undefined;
+	if (!params && !kwargs && !kBud) return undefined;
+	return (model, context, opts) => piStreamSimple(model, context, {
+		...opts,
+		samplingParams: { ...(params ?? {}), ...(kwargs ?? {}), ...((kBud?.fields as Record<string, unknown>) ?? {}) },
+	});
 }
 
 /** Board label for the state of a model's flags. */
@@ -2780,7 +2813,21 @@ export async function directCompact(args: {
 	// itself, ride into the request body here; the adapter merges samplingParams over the named fields.
 	const dParams = samplingParamsFor(args.ref, options.sampling);
 	const dKwargs = refLooksLocal(args.ref) ? chatTemplateKwargsFor(args.thinking) : undefined;
-	if (dParams || dKwargs) requestOptions.samplingParams = { ...(dParams ?? {}), ...(dKwargs ?? {}) };
+	// The ceiling on thinking is computed beside the template kwargs because both answer the same
+	// question - how much of this request may go on thinking - and only one of them is a request
+	// parameter rather than a line of prose.
+	const dBudget = refLooksLocal(args.ref) ? thinkingBudgetFor(args.thinking) : undefined;
+	// The thinking ceiling rides in the same body object as the sampling flags: the adapters merge
+	// samplingParams over the named request fields, and a server that has never heard of
+	// reasoning_budget_tokens simply does not see it. That silence is what makes sending all three
+	// spellings safe rather than a gamble on which engine is on the other end.
+	if (dParams || dKwargs || dBudget) {
+		const merged: Record<string, unknown> = { ...(dParams ?? {}), ...(dKwargs ?? {}), ...((dBudget?.fields as Record<string, unknown>) ?? {}) };
+		// A sampling flag of the same name is the user's own setting, so theirs wins on a collision; the
+		// two chat_template_kwargs objects merge instead of one replacing the other.
+		if (dKwargs && dBudget) merged.chat_template_kwargs = { ...(((dBudget.fields as any)?.chat_template_kwargs as Record<string, unknown>) ?? {}), ...(((dKwargs as any)?.chat_template_kwargs as Record<string, unknown>) ?? {}) };
+		requestOptions.samplingParams = merged;
+	}
 	const response: any = await registry.streamSimple(model, context, requestOptions).result();
 	// A generation that ran out of room is not automatically worthless, and treating it that way is
 	// what stopped every compaction tonight (2026-10-19, live): the local model's hidden reasoning
@@ -3145,6 +3192,10 @@ export async function summarizeWithRotation(
 		const started = Date.now();
 		logLine(cfg, {
 			event: "attempt",
+			// Which ceiling on the model's own thinking actually went out with this request (2026-10-20). The
+			// settings value and the number the engine honoured are different claims, and only one of them is
+			// in this line; that difference is what last night's forensics had to reconstruct by arithmetic.
+			thinkingBudgetTok: refLooksLocal(c.ref) ? thinkingBudgetFor(th.level).budget : undefined,
 			ref: c.ref,
 			kind: c.kind,
 			inputTokens: realInput,
