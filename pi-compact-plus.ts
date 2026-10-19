@@ -1553,7 +1553,7 @@ type Sizes = { min: number; target: number; max: number; genCap: number; notes: 
  *  size is accepted rather than thrown away. 2026-10-19, on the user's hard rule after pi crashed:
  *  this stays 512 and nothing may push the instruction past it, because a local engine asked for more
  *  than its window holds does not fail politely - it takes the session down as a crash. */
-const GEN_MARGIN = 512;
+const GEN_MARGIN = 1000;
 
 /** What a scratchpad is worth reserving for when the template asks for one and the model can afford
  *  it (2026-10-18). Since the draft setting was deleted the only way to want a scratchpad is to write
@@ -2834,26 +2834,18 @@ export async function directCompact(args: {
 			throw dead;
 		}
 	}
+	// Running out of room is a FAILURE, and it has to stay one (2026-10-20, on the user's evidence
+	// rather than my inference). On 2026-10-19 I turned this exact case into carry on with whatever
+	// arrived, and the result was the summary of last night: the room went on a draft block and on
+	// hidden reasoning, so what arrived was a short write-up OF THE MODEL'S OWN DRAFT instead of the
+	// conversation. Accepting that writes a lobotomized ledger into the session and the user loses
+	// the whole transcript from the model's view; throwing this attempt moves the ask on to the next
+	// model, which costs minutes. Minutes are the cheaper loss, and a truncated run is exactly what
+	// produces a stub, so there is no judgement of the text that makes this safe to keep.
 	if (cutShort) {
-		// Measured the blunt way - characters over four - because this is a gate, not a receipt: it only
-		// has to tell 'an actual summary arrived' from 'the model had barely started'. The exact count is
-		// the ordinary checks further down, which this text now runs through as if the generation had
-		// stopped cleanly. It sits here, after the reasoning channel had its say, so a run that carried
-		// its summary in that channel is judged on that text rather than on an empty answer channel.
-		const visTokens = Math.round(text.length / 4);
-		const shaped = /(^|\n)\s*(#{1,6}\s*)?TURN LEDGER\b/i.test(text) || /(^|\n)\s*Turn \d+\b/.test(text) || /(^|\n)\s*user: /m.test(text);
-		if (visTokens < sizes.min || !shaped) {
-			throw new Error(
-				`generation stopped at the request cap (${fmt(requestCap)} tok) before a usable summary had arrived: ~${fmt(visTokens)} tok of readable summary out of ${fmt(wroteAll)} tok written` +
-					(reasonedAll > 0 ? `, of which ~${fmt(reasonedAll)} tok went to the model's own hidden reasoning` : "") +
-					(shaped ? "" : ", and what did arrive has no ledger shape in it") +
-					` - that reasoning is what strata's "of budget ... (max ...)" line was telling you about. The instruction tops out at Summary max + ${GEN_MARGIN} and will not go higher, because past that the engine leaves its own window and crashes: so lower Thinking for this candidate, raise Summary max (now ${fmt(sizes.max)} tok), or move the trigger earlier so the segments get smaller.` +
-					(noteWritten ? ` The no-think tag WAS in this request and ${fmt(reasonedAll)} tok still came back as reasoning, so the fault is in the template strata is actually running, not in these settings.` : " No no-think tag was in this request (thinking is off but this model has no marker set), so the model was never told not to reason."),
-			)
-		}
-		// A kept truncation is a fact worth telling the user about, not a detail: the summary is short
-		// because the budget ran out, and the reader of the next summary deserves to know that.
-		logLine(loadConfig(), { event: "note", ref: args.ref, cutAtCap: requestCap, tagWritten: noteWritten, writtenTokens: wroteAll, reasoningTokens: reasonedAll, visibleTokens: visTokens, note: "the generation stopped at the request cap, but what arrived is a summary of at least the acceptance floor with its ledger shape intact - kept instead of moving to the next model" + (fromReasoning ? " (the text came from the reasoning channel)" : "") });
+		throw new Error(
+				`generation was cut short at the request cap of ${fmt(requestCap)} tok: the model wrote ${fmt(wroteAll)} tok against it, of which ${fmt(reasonedAll)} tok was hidden reasoning, so the summary that arrived is whatever room was left over. Two things eat that room and neither is excluded by the size numbers written into the template: hidden reasoning - a thinking-by-default chat template keeps reasoning while our request sends it nothing about thinking, and the server then takes a share of the request budget for it - and a draft or scratchpad block, which the template used to ask for and which costs a second full pass of output tokens. Switch Thinking off for this model, keep draft wording out of the summary template, and move the trigger earlier so the segments get smaller`,
+		)
 	}
 	// The exact conversation text the request carried - the stub-coverage gate counts the stub
 	// markers in it against the copies in the summary.
