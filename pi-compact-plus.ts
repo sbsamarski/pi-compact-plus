@@ -1552,8 +1552,15 @@ type Sizes = { min: number; target: number; max: number; genCap: number; notes: 
  *  the same line: the request asks for at most Summary max + GEN_MARGIN, and a summary of up to that
  *  size is accepted rather than thrown away. 2026-10-19, on the user's hard rule after pi crashed:
  *  this stays 512 and nothing may push the instruction past it, because a local engine asked for more
- *  than its window holds does not fail politely - it takes the session down as a crash. */
-const GEN_MARGIN = 1000;
+ *  than its window holds does not fail politely - it takes the session down as a crash.
+ *
+ *  On 2026-10-19, in the middle of the emergency, this was raised to 1000 on my reading of a request to
+ *  "accept 1000 tokens over the limit". That reading was wrong and the comment above it said so at the
+ *  time: the ask and the tolerance are the same number here, so raising it pushed the instruction past
+ *  the line this file's own hard rule was drawn to hold. Restored to 512 on 2026-10-20 at the operator's
+ *  instruction. If a separate acceptance tolerance is ever wanted, it becomes its own constant beside
+ *  this one rather than a second meaning smuggled into this one. */
+const GEN_MARGIN = 512;
 
 /** What a scratchpad is worth reserving for when the template asks for one and the model can afford
  *  it (2026-10-18). Since the draft setting was deleted the only way to want a scratchpad is to write
