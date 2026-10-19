@@ -22,11 +22,11 @@
  *          override sentences — nothing to blend with).
  *      The call goes through the model registry (streamSimple — request-time auth), maxTokens set
  *      directly, no prompt-cache writes.
- *      After the call: draft stripping, size gate, SHAPE gate (sections + turn-label sanity),
+ *      After the call: rough-work stripping, size gate, SHAPE gate (sections + turn-label sanity),
  *      pointer line; the turn counter stored in details.
  *      FALLBACKS: direct request fails → pi's compact() with the extension instructions (the old
  *      path) → fails → next model in the rotation → all failed → pi's own compaction.
- *   3. PER-MODEL OPTIONS: thinking, timeout, aim/min/max shares of pi's reserveTokens, draft block
+ *   3. PER-MODEL OPTIONS: thinking, timeout, aim/min/max shares of pi's reserveTokens
  *      (off/mini/full), summarizer input (stubs/raw), arg cap, and four preservation options
  *      (stubs/user/replies/thinking: verbatim | detailed | summary | brief) that generate the
  *      template's RULES wording. Every description states its default.
@@ -75,7 +75,6 @@ const SESSION_REF = "session";
 
 type Level = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type Kind = "local" | "online";
-type Draft = "off" | "mini" | "full";
 /** How much of a given content type the summary must keep. Each value maps to its own instruction
  *  sentence (RULE sentences in buildTemplate), so the template wording always matches the option. */
 type Preserve = "verbatim" | "detailed" | "summary" | "brief";
@@ -176,7 +175,6 @@ type ModelOptions = {
 	legacyMaxPct?: number;
 	/** Hidden analysis written before the summary in the same call, stripped before storing:
 	 *  "full" = a chronological per-turn analysis; "mini" = at most ten lines; "off" = none. */
-	draft: Draft;
 	/** The summarizer's input has every tool result replaced by an informative stub (smaller,
 	 *  faster, and the exit/tail message survives pi's 2,000-char clip). false = pi's raw input. */
 	inputStubs: boolean;
@@ -211,6 +209,12 @@ type Config = {
 	/** Append a "full raw transcript" line (the session file path) to extension-written summaries,
 	 *  so the next model can recover anything the summary dropped by reading the file. */
 	transcriptPointer: boolean;
+	/** Append one receipt line to extension-written summaries saying when the compaction ran, what the
+	 *  context held, how much material the summariser actually read (and how much of it was elided
+	 *  first), and how big the summary came out. pi's own on-screen line can only ever show the whole
+	 *  pre-compaction context, which is why "compacted from 163,000 tokens" looks nothing like the
+	 *  49,000 tokens the summariser was given. */
+	summaryReceipt: boolean;
 	/** ON = the extension builds the whole summarization request itself (turn-numbered input,
 	 *  labelled previous summary, ONE instruction source) and calls the model through the registry;
 	 *  a direct failure moves to the NEXT candidate, and pi's compact() runs only after every
@@ -235,7 +239,11 @@ type Config = {
 	/** Set when an auto-compaction was cancelled by the user or failed twice: the proactive trigger
 	 *  stays armed off until a MANUAL compaction runs (2026-10-05 - a failing auto-compaction used to
 	 *  re-fire every minute, ~100 attempts in one session, each one uploading the whole context). */
-	autoCompactPaused: boolean;
+	/** Parked means PARKED FOR THIS SESSION (2026-10-17): the id of the session that stopped the trigger,
+	 *  or false when armed. A legacy boolean true parks everywhere, so an old config file still means what
+	 *  it meant; a new stop stores the id, so starting or resuming another session finds the trigger armed
+	 *  and going back to the stopped one finds it parked where you left it. */
+	autoCompactPaused: boolean | string;
 	/**
 	 * WHO PULLS THE TRIGGER (2026-10-06). true (the default) = pi's own check that runs before every
 	 * request to the model compares the context with the line and starts the compaction there; that is
@@ -244,19 +252,18 @@ type Config = {
 	 * false = this extension's idle watcher is the only trigger, which cannot fire mid-run and is why
 	 * a long working session used to overflow instead of compacting.
 	 */
-	triggerClockByPi: boolean;
 	/**
-	 * TRUE while the compaction block in pi's settings.json is the one THIS extension wrote (2026-10-06).
-	 * It exists so that switching this extension off gives pi back exactly the settings it had before we
-	 * touched them, and so that we never write that file while the extension is off: another compaction
-	 * extension may own it by then, or the user may have set it by hand.
+	 * The elision block: stubbing the oldest tool results out of the LIVE request before the context gets
+	 * anywhere near the trigger line, so a long working session keeps its conclusions instead of losing them
+	 * to a compaction. On or off, the share of the window at which it starts, and how many of the most recent
+	 * calls are protected - see ElisionConfig, applyElision, and the elision rows on the settings board.
+	 *
+	 * This field sat inside the comment below it from 2026-10-18 until 2026-10-19. The paragraph describing
+	 * the removed piLineWritten flag lost its closing marker to the patch that deleted the flag itself, so the
+	 * comment ran on and swallowed this declaration. Types are stripped rather than checked, so nothing
+	 * complained: the cost was that the Config interface stopped telling the truth about a field every
+	 * elision path uses, and no bracket scanner can see that, because it throws comments away first.
 	 */
-	piLineOwned: boolean;
-	/** pi's own compaction block as it was before this extension first wrote it; null = never touched. */
-	piLineOriginal: { enabled: boolean; reserveTokens: number; keepRecentTokens: number } | null;
-	/** The last compaction block this extension wrote - used to tell "nobody touched it" from "leave it". */
-	piLineWritten: { enabled: boolean; reserveTokens: number; keepRecentTokens: number } | null;
-	/** The elision stage (extension-wide: fires in the live session for every model alike). */
 	elision: ElisionConfig;
 	/** The default no-think tag for local models (each model's own value wins when set). */
 	noThinkMarker: string;
@@ -295,7 +302,6 @@ const DEFAULT_NO_THINK_TAG = "<|think_off|>";
 const TIMEOUT_STEPS = [120_000, 180_000, 300_000, 420_000, 600_000, 900_000, 1_200_000, 1_800_000, 2_700_000, 3_600_000, 0];
 
 const THINKING_CYCLE: Level[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const DRAFT_CYCLE: Draft[] = ["off", "mini", "full"];
 const PRESERVE_CYCLE: Preserve[] = ["verbatim", "detailed", "summary", "brief"];
 /** How the PREVIOUS compaction's summary rides into the next one:
  *  "fold"   - the model integrates it and continues its turn numbering (compact, lossy),
@@ -372,16 +378,13 @@ const DEFAULT_CONFIG: Config = {
 	retryDelaySeconds: 5,
 	log: true,
 	transcriptPointer: true,
+	summaryReceipt: true,
 	directRequest: true,
 	shapeGate: true,
 	chatMaxTokensCap: 65_536,
 	scaling: { ...SCALING_DEFAULTS },
 	autoCompact: true,
 	autoCompactPaused: false,
-	triggerClockByPi: true,
-	piLineOwned: false,
-	piLineOriginal: null,
-	piLineWritten: null,
 	elision: ELISION_DEFAULTS,
 	noThinkMarker: DEFAULT_NO_THINK_TAG,
 	additionalInstruction: null,
@@ -397,9 +400,12 @@ const DEFAULT_CONFIG: Config = {
  *  preparation.settings at compaction time. */
 export const DEFAULT_RESERVE_TOKENS = 16384;
 
-/** pi's OWN settings.json compaction.reserveTokens - read for display, written by the board's
- *  stock-fallback row. This extension never USES the value; it only matters to pi's built-in
- *  compaction (the fallback that runs when the extension is disabled or every candidate failed). */
+/** pi's OWN settings.json compaction.reserveTokens, READ for display and nothing else (2026-10-19).
+ *  It used to say "written by the board's stock-fallback row"; that row is gone, this extension has never
+ *  written pi's settings.json since the coupling came out on 2026-10-18, and the claim stayed in the comment
+ *  long enough to send tonight's diagnosis looking for a writer that did not exist. The number belongs to
+ *  pi's built-in compaction - the fallback that runs when this extension is disabled or every candidate has
+ *  failed - and we never apply it to our own work. */
 function readPiReserveTokens(): number {
 	try {
 		const raw = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
@@ -410,10 +416,17 @@ function readPiReserveTokens(): number {
 	}
 }
 
-/** pi's OWN built-in compaction switch (settings.json "compaction": {"enabled": ...}). Hard rule of
- *  this extension: at most ONE compactor is ever on - turning this on switches the extension's
- *  compaction off, turning the extension's compaction on switches this off. Writing it only writes
- *  the file: pi reads settings.json at startup, so the change does nothing until the user /reload-s. */
+/** pi's OWN built-in compaction switch (settings.json "compaction": {"enabled": ...}).
+ *
+ *  READ ONLY, in every sense: this extension reads the flag to warn you when two compactors would both be
+ *  live, and it never writes that file. The writer that used to run here on a per-second clock was deleted
+ *  on 2026-10-18, and the log's last trigger_clock record - one second after a manual restore of the very
+ *  same block, and from the build that was still loaded - is the reason it had to go.
+ *
+ *  The hard rule still stands, and at most ONE compactor may be on. What has changed is who enforces it:
+ *  not us, never again us. You hold that line in pi's own settings, and a change made in the file needs a
+ *  restart, because pi reads settings.json at startup and then holds what it read - which is how a flag
+ *  switched off at 23:29:55 was still reported as on by the pi that started at 23:29:36. */
 export function readPiCompactionEnabled(): boolean {
 	try {
 		const raw = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
@@ -423,32 +436,6 @@ export function readPiCompactionEnabled(): boolean {
 	}
 }
 
-/** Write pi's own compaction.enabled, leaving the rest of pi's settings untouched. True = pi's own
- *  compactor runs; the extension's compaction is switched off in the same action. */
-export function writePiCompactionEnabled(on: boolean): boolean {
-	try {
-		const file = join(AGENT_DIR, "settings.json");
-		const raw = JSON.parse(readFileSync(file, "utf8"));
-		raw.compaction = { ...(raw.compaction ?? {}), enabled: on === true };
-		// Written back exactly the way pi writes it itself: two-space JSON, no trailing newline, so the only
-	// difference in the file is the value that changed.
-	writeFileSync(file, JSON.stringify(raw, null, 2), "utf8");
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function writePiReserveTokens(v: number): void {
-	try {
-		const file = join(AGENT_DIR, "settings.json");
-		const raw = JSON.parse(readFileSync(file, "utf8"));
-		raw.compaction = { ...(raw.compaction ?? {}), reserveTokens: Math.max(0, Math.round(v)) };
-		writeFileSync(file, JSON.stringify(raw, null, 2) + "\n", "utf8");
-	} catch {
-		/* leave pi's settings untouched on any error */
-	}
-}
 /** pi's default keepRecentTokens, used when the preparation carries no settings of its own. */
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 
@@ -482,6 +469,38 @@ function lengthFragment(sizes: Sizes, inputTokens: number): string {
 		return `The segment below is about ${fmt(region)} tokens. Aim for about ${fmt(target)} tokens (around ${fmt(wordsFor(target))} words). A summary under ${fmt(min)} tokens (around ${fmt(wordsFor(min))} words) or over ${fmt(max)} tokens (around ${fmt(wordsFor(max))} words) is rejected outright. If you approach the ${fmt(max)}-tok ceiling, tighten the least important details and land on a finished item, never mid-item.`;
 	}
 	return `The segment below is about ${fmt(region)} tokens. Aim for about ${fmt(target)} tokens (roughly ${fmt(wordsFor(target))} words); there is no hard minimum, but a very thin summary leaves the next request blind, so write freely and do not stop early. Your text is cut off at ${fmt(max)} tok.`;}
+
+/** The six numbers a template may ask for by name, as text, ready to drop in wherever the name sits.
+ *  These tokens were listed in the editor's tag row and described as "substituted wherever they appear"
+ *  (see INLINE_LENGTH_TOKENS and the note above applyTemplate), and no code ever substituted one of
+ *  them. So a template that writes its own length sentence - the built-in default does, and User
+ *  templates #1 and #3 are copies of it - sent the summarizer a pair of curly braces in place of its
+ *  target, and the block carrying the real numbers was withheld as well, because the code read those
+ *  same unfilled tokens as proof that the sentence had been written out on purpose. GLM wrote 9,487
+ *  tokens against an aim of 22,100 on 2026-10-18 for exactly that reason, which is the complaint
+ *  logged on 2026-10-17 as well ("why does the online GLM model write such a short compaction of
+ *  around 10000 tokens even though it is told to write 24000 tokens?") - it was never told.
+ *  A number that cannot be computed comes out as a plain sentence saying so rather than NaN or
+ *  braces, because a sentence at least tells the model what to do instead; min 0 means "no floor"
+ *  by design (see computeSizes) and is worded as that rather than as a failure. */
+
+function lengthValues(sizes: Sizes | undefined): Array<[string, string]> {
+	const cant = "could not be computed for this compaction - write a complete ledger and do not stop early";
+	if (!sizes) return INLINE_LENGTH_TOKENS.map((t): [string, string] => [t, cant]);
+	const min = tok(sizes.min, -1);
+	const max = tok(sizes.max, -1);
+	const target = tok(sizes.target, -1);
+	const num = (v: number): string => (v > 0 ? fmt(v) : v === 0 ? "no floor (any complete summary passes the acceptance check)" : cant);
+	const words = (v: number): string => (v > 0 ? fmt(wordsFor(v)) : v === 0 ? "no floor" : cant);
+	return [
+		["{AIM TOKENS}", num(target)],
+		["{AIM WORDS}", words(target)],
+		["{MIN TOKENS}", num(min)],
+		["{MIN WORDS}", words(min)],
+		["{MAX TOKENS}", num(max)],
+		["{MAX WORDS}", words(max)],
+	];
+}
 /**
  * Instruction sentences per preservation level, per content type. The template's RULES section is
  * generated from these, so the wording a model reads always matches the options in the menu.
@@ -526,21 +545,13 @@ function ladderText(kind: "stubs" | "user" | "replies" | "thinking", current: Pr
 
 /**
  * The draft-block instruction: a hidden analysis written before the summary, inside the SAME call,
- * stripped before storing (stripDraft). Anthropic's Claude Code compaction prompt runs the same
+ * stripped before storing (stripRoughWork). Anthropic's Claude Code compaction prompt runs the same
  * trick in one call (an analysis scratchpad before the summary, removed afterwards); it organizes
  * the summary and costs no extra request. It costs OUTPUT tokens, so it is a per-model switch:
  * online models default to full, local ones to off (a full draft roughly doubles a 10-20
  * tokens/second summary).
  */
-const DRAFT_FULL = `First write a scratchpad between <draft> and </draft>: go through the conversation chronologically, turn by turn - for each user turn note what was asked, what you concluded and did, every tool call with its key arguments and what the result showed, every error and how it was fixed, and every point where the user corrected, narrowed or reversed an instruction. Then check that every section of the OUTPUT FORMAT below is fully coverable from what you noted, and note anything that is not. After the closing draft tag, write the summary itself. The scratchpad is working space: it is discarded before the summary is stored and it does not count as part of the summary.`;
 
-const DRAFT_MINI = `First write a scratchpad between <draft> and </draft>: at most ten lines, one line per user turn in order - what was asked, what changed, what it led to. Then check that every section of the OUTPUT FORMAT below is fully coverable. After the closing draft tag, write the summary itself; the scratchpad is discarded and does not count as part of the summary.`;
-
-function draftBlock(mode: Draft): string {
-	if (mode === "full") return DRAFT_FULL;
-	if (mode === "mini") return DRAFT_MINI;
-	return "";
-}
 
 /**
  * THE SUMMARY TEMPLATE (the user's 2026-10-01 design): one editable source text with {PLACEHOLDER}
@@ -560,7 +571,7 @@ export const DEFAULT_TEMPLATE_TEXT = [
 	`{LENGTH INSTRUCTIONS}`,
 	`Do not stop early and do not save tokens: covering the whole segment is the one thing that matters.`,
 	`Override: the line "Keep each section concise" in the instructions above does not apply to this job. It is written for a summary that sits beside the full transcript; here the transcript is deleted and your text is the only memory the next request has. Completeness beats brevity. Long bullet lists are good. Repeating an exact value in multiple turns is fine. Splitting one vague sentence into five specific ones is the point. Vagueness and omission are the only failures.`,
-	`{DRAFT INSTRUCTIONS}`,
+	``,
 	``,
 	`OUTPUT FORMAT - the format block above is replaced by this one. Use only the sections below, in this order, no preamble, no closing remarks.`,
 	``,
@@ -621,7 +632,10 @@ const PREVIOUS_SECTION_TEXT = [
 export function sentenceFor(kind: "stubs" | "user" | "replies" | "thinking", level: Preserve): string {
 	const custom = loadConfig().categorySentences?.[kind]?.[level];
 	const t = typeof custom === "string" ? custom.trim() : "";
-	return t || PRESERVE_SENTENCES[level][kind];
+	// No leading bullet (2026-10-17): these sentences sit inside a template as a clause of a paragraph, and
+	// the store may carry one typed by hand in the editor. The list that re-adds lost rules writes its own
+	// bullet when it has to, so a bullet kept here arrives twice.
+	return (t || PRESERVE_SENTENCES[level][kind]).replace(/^[-*]\s+/, "");
 }
 
 /** Which layer a sentence IS - extension default first (it wins ties), then user default, then
@@ -647,15 +661,41 @@ export function layerTag(kind: "stubs" | "user" | "replies" | "thinking", level:
 	return l === "ext" ? "extension default" : l === "user" ? "user default" : "custom";
 }
 
+/** The marker a template uses to declare that it carries every rule in its own prose, in its own place:
+ *  see applyTemplate. It expands to nothing; its whole job is to be present or absent. */
+export const RULES_WRITTEN_OUT = "{RULES WRITTEN OUT}";
+/** Rule tokens the LAST rendered template declared written out but left no trace of - the record that takes
+ *  the place of silently re-adding them, so a self-sufficient template can be checked instead of trusted. */
+export const templateAbsentRules: string[] = [];
+
 /** Substitute the {TOKENS} in a template source for one model's options. Tokens that the source
  *  lost are auto-added at the end under a visible note - a user edit can never silently drop a
- *  preserve rule, and a hand-written source still yields a complete instruction. */
-export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean, extra?: { sizes?: Sizes; inputTokens?: number; draft?: Draft }): string {
-	let out = String(src ?? "");
+ *  preserve rule, and a hand-written source still yields a complete instruction. Notes between
+ *  <!-- and --> are cut first, so they can carry wording that is not live yet. */
+export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean, extra?: { sizes?: Sizes; inputTokens?: number; segmentTokens?: number }): string {
+	let out = stripTemplateNotes(src);
 	const missing: string[] = [];
+	// A TEMPLATE THAT DECLARES ITSELF COMPLETE (2026-10-17). The safety net above is right for a template that
+	// uses the rule tokens and wants their wording kept: delete a token and its rule comes back at the bottom,
+	// which is what makes those rules feel uneditable - the text is put back no matter what the author writes.
+	// A template that would rather carry every rule in its own prose says so with this one marker, and then
+	// nothing is stapled on afterwards. What it says is verifiable, so it is verified: `templateAbsentRules`
+	// lists the rule tokens the declaration left no trace of, and the summary request logs that list. So the
+	// declaration trades a safety net for a visible record - dropping a rule from a declaring template stops
+	// being corrected and becomes something the log admits out loud. Applies to the rule tokens only: the
+	// numbers are still filled wherever they sit, because those are values rather than instructions.
+	const writtenOut = out.includes(RULES_WRITTEN_OUT);
+	const absent = templateAbsentRules;
+	absent.length = 0;
+	// The marker itself never reaches the model: it is a declaration, not an instruction.
+	out = out.split(RULES_WRITTEN_OUT).join("").trim();
 	const sub = (token: string, value: string): void => {
 		if (out.includes(token)) out = out.split(token).join(value);
-		else if (value.trim()) missing.push(value);
+		else if (!value.trim()) return;
+		// Declared complete: a rule counts as written out when its text is there, token or no token. Absent
+		// altogether is a different thing, and that is what gets recorded rather than silently re-added.
+		else if (writtenOut) { if (!out.includes(value)) absent.push(token); }
+		else missing.push(value);
 	};
 	sub("{TOOL CALLS SUMMARY}", `- ${sentenceFor("stubs", o.preserveStubs)}`);
 	sub("{USER PROMPT SUMMARY}", `- ${sentenceFor("user", o.preserveUser)}`);
@@ -676,17 +716,58 @@ export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean,
 				: "",
 	);
 	sub("{PREVIOUS SUMMARY SECTION}", o.chainMode === "attach" ? PREVIOUS_SECTION_TEXT : "");
-	// The computed fragments: the segment size, the length numbers, and the draft instruction (empty
-	// when a model's draft is off - the line then just disappears from the request).
-	sub("{SEGMENT SIZE}", extra?.inputTokens ? fmt(extra.inputTokens) : "");
-	sub("{LENGTH INSTRUCTIONS}", extra?.sizes ? lengthFragment(extra.sizes, extra.inputTokens ?? 0) : "");
-	sub("{DRAFT INSTRUCTIONS}", extra?.draft && extra.draft !== "off" ? draftBlock(extra.draft) : "");
+	// The computed fragments: the segment size, the length numbers, and nothing else
+	// (there is no draft block any more: it was removed 2026-10-17).
+	// {SEGMENT SIZE} describes THE SEGMENT BELOW, so it has to be the segment (2026-10-17). The whole-session
+	// fill is larger - it carries pi's kept-recent slice, the fixed request overhead and these notes - and a
+	// model told the segment is bigger than it is will pad toward a figure that does not exist. Falls back to
+	// the fill only where a caller has no segment of its own to name.
+	sub("{SEGMENT SIZE}", fmt(extra?.segmentTokens ?? extra?.inputTokens ?? 0));
+		// THE NUMBERS, WHEREVER THEY SIT (see lengthValues - advertised, never filled, and two compactions
+		// lost their target to it). The hand-written tell further down is measured HERE, on the text before
+		// the fill, because after the fill the tokens are gone by definition, and a template that wrote its
+		// own length sentence would then also receive the generated block and be told the same thing twice.
+		const handWroteLength = INLINE_LENGTH_TOKENS.some((t) => out.includes(t));
+		for (const [token, value] of lengthValues(extra?.sizes)) out = out.split(token).join(value);
+	// THE TWO BLOCKS WHOSE WORDS THE USER MAY WANT TO WRITE HIMSELF (2026-10-15: "I don't have access to the
+	// wording of those sections"). Both can still be asked for as a whole block, exactly as before, OR written
+	// out in the template in the user's own words. Writing them out has to be detectable, or the safety net
+	// below would staple the block on again at the end and the model would be told twice: the length block's
+	// inline tell is any one of its number tokens appearing in the text
+	// the scratchpad is opened with (measured on the text that is actually going to be sent - note-stripping
+	// runs first, so a commented-out copy of that wording cannot count as the live version of a rule).
+	{
+		const v = extra?.sizes ? lengthFragment(extra.sizes, extra.inputTokens ?? 0) : "";
+		if (out.includes("{LENGTH INSTRUCTIONS}")) out = out.split("{LENGTH INSTRUCTIONS}").join(v);
+		else if (v.trim() && handWroteLength) { /* the numbers sit in the template's own sentence and were filled above */ }
+		else if (v.trim() && writtenOut) absent.push("{LENGTH INSTRUCTIONS}");
+		else if (v.trim()) missing.push(v);
+	}
 	// 2026-10-06: a summary that collapses the ledger sub-lines into one prose line per turn is the
 	// failure mode users report as "everything was heavily summarized and the tool calls are gone". The
 	// template shows the shape; this says out loud that the shape is mandatory, whatever it looks like.
-	out += `\n\nSHAPE OF THE LEDGER (mandatory): copy the shape the OUTPUT FORMAT shows. Every turn entry gets its own sub-lines, one line each, with the labels exactly as the OUTPUT FORMAT writes them - the user prompt, the assistant thinking, the assistant replies, the tool calls, the errors and fixes, what was decided. Never merge two sub-lines into one sentence and never drop a sub-line the input has content for; "nothing to say" is only true when the input really has none. A turn entry written as one long line is a failed summary.`;
-	if (missing.length) out += `\n\nRules the template lost (auto-added here; restore their {PLACEHOLDER} tokens to place them properly):\n${missing.join("\n")}`;
+	if (!writtenOut) out += `\n\nSHAPE OF THE LEDGER (mandatory): copy the shape the OUTPUT FORMAT shows. Every turn entry gets its own sub-lines, one line each, with the labels exactly as the OUTPUT FORMAT writes them - the user prompt, the assistant thinking, the assistant replies, the tool calls, the errors and fixes, what was decided. Never merge two sub-lines into one sentence and never drop a sub-line the input has content for; "nothing to say" is only true when the input really has none. A turn entry written as one long line is a failed summary.`;
+	if (!writtenOut && missing.length) out += `\n\nRules the template lost (auto-added here; restore their {PLACEHOLDER} tokens to place them properly):\n${missing.join("\n")}`;
 	return out;
+}
+
+/** The number tokens an inline copy of the length block is built from - see applyTemplate. Exported so the
+ *  template editor can list them and a test can assert they all resolve. */
+export const INLINE_LENGTH_TOKENS = ["{AIM TOKENS}", "{AIM WORDS}", "{MIN TOKENS}", "{MIN WORDS}", "{MAX TOKENS}", "{MAX WORDS}"];
+
+/**
+ * NOTES THE SUMMARIZER NEVER READS (2026-10-15). The template is the user's working document as well as the
+ * request that goes out, so anything between <!-- and --> is cut out at the front of substitution - before
+ * the tokens are filled and before the inline-block tells are measured, so a commented-out instruction is
+ * inert in every sense. That is where the wording being edited back into place can wait unread, and where a
+ * note to the next reader about why a line exists can live beside it instead of in a separate file. Runs on
+ * every template, the extension's own included, which uses none of these markers.
+ */
+export function stripTemplateNotes(src: string): string {
+	return String(src ?? "")
+		.replace(/<!--[\s\S]*?-->/g, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
 }
 
 /** The template for one model - compatibility wrapper: the default source, substituted. */
@@ -714,18 +795,22 @@ export function buildInstructions(args: {
 	kind: Kind;
 	options: ModelOptions;
 	additionalInstruction: string | null;
+	/** The segment's own size, without the framing allowance: what {SEGMENT SIZE} reports. Falls back to
+	 *  inputTokens, which is the whole request figure, when a caller has nothing better to say. */
+	segmentTokens?: number;
 	/** The main template's USER default: used when the active is null (empty = follow it). */
 	userDefault?: string | null;
 	customInstructions?: string;
 }): string {
 	const { sizes, inputTokens, kind, options } = args;
+	const segmentTokens = args.segmentTokens ?? inputTokens;
 	const parts: string[] = [];
 	// THE SUMMARY TEMPLATE (2026-10-06): ONE text, the one the Summary template menu shows and edits.
 	// It used to be two stored texts with an order of precedence between them, and the one the menu
 	// did NOT show won - the request carried a different template from the one on screen. Now the
 	// menu's text is the template, the extension default rides when none is saved, and the Additional
 	// instruction is what its name says: an extra paragraph after the template, never a replacement.
-	parts.push(applyTemplate(args.userDefault?.trim() || DEFAULT_TEMPLATE_TEXT, options, options.inputStubs, { sizes, inputTokens, draft: options.draft }));
+	parts.push(applyTemplate(args.userDefault?.trim() || DEFAULT_TEMPLATE_TEXT, options, options.inputStubs, { sizes, inputTokens, segmentTokens }));
 	// The extra instruction, when it is an instruction. A stored one that is itself a whole template
 	// (it carries the placeholders) is a leftover of the old two-text design and is NOT appended twice.
 	const extraInstruction = args.additionalInstruction?.trim();
@@ -770,15 +855,8 @@ function refLooksLocal(ref: string): boolean {
 	return /llama|ollama|127\.0\.0\.1|localhost|192\.168\.|(^|\.)10\./i.test(ref);
 }
 
-/** Guard for a stored draft value of unknown shape. */
-function isDraft(v: unknown): v is Draft {
-	return typeof v === "string" && (DRAFT_CYCLE as string[]).includes(v);
-}
 /** Migrate one stored per-model profile (config v2 "overrides"/"defaults") to the new options. */
-/** Migrate one stored per-model profile (config v2 "overrides"/"defaults") to the new options.
- *  fallbackDraft covers configs from before the draft switch: local models defaulted to off,
- *  online ones to full - the same kind defaults optionsFor applies today. */
-function modelOptionsFrom(src: any, fallbackMarker: string, fallbackDraft: Draft): ModelOptions {
+function modelOptionsFrom(src: any, fallbackMarker: string): ModelOptions {
 	const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 	const o: ModelOptions = {
 		thinking: (levels.includes(src?.thinking) ? src.thinking : "off") as Level,
@@ -788,7 +866,6 @@ function modelOptionsFrom(src: any, fallbackMarker: string, fallbackDraft: Draft
 		summaryMaxTokens: nonNegField(src?.summaryMaxTokens, DEFAULT_OPTIONS.summaryMaxTokens),
 		legacyMinPct: typeof src?.summaryMinPercent === "number" && Number.isFinite(src.summaryMinPercent) ? src.summaryMinPercent : undefined,
 		legacyMaxPct: typeof src?.summaryMaxPercent === "number" && Number.isFinite(src.summaryMaxPercent) ? src.summaryMaxPercent : undefined,
-		draft: isDraft(src?.draft) ? src.draft : fallbackDraft,
 		inputStubs: typeof src?.inputStubs === "boolean" ? src.inputStubs : true,
 		argCap: isCharCap(src?.argCap) ? src.argCap : 500,
 		preserveStubs: isPreserve(src?.preserveStubs) ? src.preserveStubs : "verbatim",
@@ -866,16 +943,15 @@ function migrateV1andV2(raw: any): { models: Record<string, ModelOptions>; retri
 		const kindDefault = looksLocal ? defaultsLocal : defaultsOnline;
 		// The pi-wide no-think tag only ever applied to local models in v2.
 		const kindMarker = looksLocal ? noThinkMarker : "";
-		const kindDraft: Draft = looksLocal ? "off" : "full";
 		const o2 = overridesV2[ref];
 		if (o2 && typeof o2 === "object" && (o2.thinking !== undefined || o2.timeoutMs !== undefined || o2.targetFrac !== undefined || o2.summaryBudgetTokens !== undefined)) {
 			// An override rides ON TOP of the kind defaults, so an entry that only set the timeout
 			// still inherits the kind's thinking and sizes.
-			models[ref] = modelOptionsFrom({ ...kindDefault, ...o2 }, kindMarker, kindDraft);
+			models[ref] = modelOptionsFrom({ ...kindDefault, ...o2 }, kindMarker);
 			continue;
 		}
 		if (kindDefault && (kindDefault.thinking !== undefined || kindDefault.timeoutMs !== undefined || kindDefault.targetFrac !== undefined || kindDefault.summaryBudgetTokens !== undefined)) {
-			models[ref] = modelOptionsFrom(kindDefault, kindMarker, kindDraft);
+			models[ref] = modelOptionsFrom(kindDefault, kindMarker);
 		}
 	}
 	return { models, retries, retryDelaySeconds, noThinkMarker, additionalInstruction };
@@ -945,28 +1021,7 @@ export function loadConfig(): Config {
 			reserveMax: nonNegField(raw?.scaling?.reserveMax, base.scaling.reserveMax),
 		},
 		autoCompact: typeof raw.autoCompact === "boolean" ? raw.autoCompact : base.autoCompact,
-		autoCompactPaused: typeof raw.autoCompactPaused === "boolean" ? raw.autoCompactPaused : base.autoCompactPaused,
-		// 2026-10-07: the "who pulls the auto-compaction trigger" menu row was REMOVED on request. pi's
-		// own check runs between turns INSIDE a running job (after tools finish, before the next assistant
-		// response - pi's compaction docs), so it is the only trigger that fires during a long run; the
-		// idle watcher stays as a backstop for when the settings line cannot be written. The field is kept
-		// and forced true, so a config holding "false" from the old menu behaves like the new default.
-		triggerClockByPi: true,
-		piLineOwned: raw.piLineOwned === true,
-		piLineOriginal: typeof raw.piLineOriginal === "object" && raw.piLineOriginal
-			? {
-					enabled: raw.piLineOriginal.enabled === true,
-					reserveTokens: Number(raw.piLineOriginal.reserveTokens) || 0,
-					keepRecentTokens: Number(raw.piLineOriginal.keepRecentTokens) || 0,
-				}
-			: null,
-		piLineWritten: typeof raw.piLineWritten === "object" && raw.piLineWritten
-			? {
-					enabled: raw.piLineWritten.enabled === true,
-					reserveTokens: Number(raw.piLineWritten.reserveTokens) || 0,
-					keepRecentTokens: Number(raw.piLineWritten.keepRecentTokens) || 0,
-				}
-			: null,
+		autoCompactPaused: typeof raw.autoCompactPaused === "boolean" || typeof raw.autoCompactPaused === "string" ? raw.autoCompactPaused : base.autoCompactPaused,
 		elision: sanitizeElision(raw?.elision),
 		noThinkMarker: m.noThinkMarker,
 		// 2026-10-06: the template is ONE text now - the one the Summary template menu edits. An old
@@ -1042,7 +1097,11 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
 		} catch {
 			/* no log file yet */
 		}
-		appendFileSync(LOG_PATH, JSON.stringify({ ts: localStamp(), ...record }) + "\n", "utf8");
+		// The pid travels with every line. Two processes can write this one file - the pi that is running the
+		// session and a test harness driving the same code - and on 2026-10-18 that distinction was the whole
+		// question twice: once when an old build's writes were mistaken for the new one's, and once when a
+		// harness's own events had to be told apart from a real compaction's.
+		appendFileSync(LOG_PATH, JSON.stringify({ ts: localStamp(), pid: process.pid, ...record }) + "\n", "utf8");
 	} catch {
 		/* logging must never break compaction */
 	}
@@ -1338,6 +1397,15 @@ export function summariserInputTokens(preparation: any, extraInstructionChars = 
 	return Math.ceil(((summariserText(preparation).length + extraInstructionChars) * TOKEN_HEAVINESS) / 4) + SUMMARISER_FRAMING_TOKENS;
 }
 
+/** The size of the SEGMENT ALONE, with no framing in it (2026-10-17). {SEGMENT SIZE} used to be filled
+ *  from summariserInputTokens, which adds SUMMARISER_FRAMING_TOKENS - so the model was told the material
+ *  below was worth 1,500 tokens more than it is. It plans its length against the figure it is given, so
+ *  the figure it is given has to be the material. Both are heuristic (chars x TOKEN_HEAVINESS / 4); the
+ *  server's own count is the truth, and switching this to that count is the open follow-up. */
+export function summariserSegmentTokens(preparation: any): number {
+	return Math.ceil((summariserText(preparation).length * TOKEN_HEAVINESS) / 4);
+}
+
 /** Allowance for the fixed part of a request when the live projection cannot be read. */
 const FIXED_REQUEST_TOKENS = 4096;
 
@@ -1366,6 +1434,101 @@ function wordsFor(tokens: number): number {
 	return Math.round(tokens / TOKENS_PER_WORD);
 }
 
+/** The base URL of a local summariser ref (`llama-server=http://127.0.0.1:9931/<model>`), or the
+ *  model's own baseUrl when the ref carries none. Undefined for an online ref. */
+export function localSummariserBaseUrl(model: any, ref: string): string | undefined {
+	if (!refLooksLocal(ref)) return undefined;
+	const eq = ref.indexOf("=");
+	const tail = eq >= 0 ? ref.slice(eq + 1) : "";
+	if (tail.startsWith("http://") || tail.startsWith("https://")) {
+		// The origin, scheme included. An earlier version of this helper returned "127.0.0.1:9931" with
+		// the scheme stripped off, which made every fetch an invalid URL that threw immediately - so
+		// server-side counting silently never ran, and every figure in the log came from the heuristic.
+		try {
+			return new URL(tail).origin;
+		} catch {
+			return undefined;
+		}
+	}
+	const base = String(model?.baseUrl ?? "").replace(/\/+$/, "");
+	return base.startsWith("http") ? base : undefined;
+}
+
+/** What this base URL answers, remembered so a server without the route is not probed every time. A
+ *  missing route is remembered for an hour (it is not a transient fault, and retrying it every
+ *  compaction would put a timeout in front of every request); a 5xx or a timeout for a minute. */
+const countCapability = new Map<string, { how: "messages" | "tokenize" | "no"; at: number }>();
+function countRoute(base: string): "messages" | "tokenize" | "no" {
+	const hit = countCapability.get(base.replace(/\/+$/, ""));
+	if (!hit) return "messages";
+	const ttl = hit.how === "no" ? 3_600_000 : 60_000;
+	return Date.now() - hit.at > ttl ? "messages" : hit.how;
+}
+
+/** The exact number of tokens this server would read for this text, or null when it cannot be trusted.
+ *
+ *  - First POST /v1/messages/count_tokens (Anthropic-shaped): llama.cpp has it, Strata has it, and it
+ *    renders the chat template before counting, so it answers "what will the model read". Measured here:
+ *    65 ms for 170,000 characters and 56,495 tokens where the heuristic said 55,250.
+ *  - Then POST /tokenize, which every llama.cpp-derived server has had always and which ik_llama.cpp
+ *    implements without the route above. It counts the raw text with no template, which is precisely
+ *    what {SEGMENT SIZE} means: the material, nothing else.
+ *  An answer is accepted only when it is finite, positive and within a factor of two of the character
+ *  estimate. A server that returns 0, or counts something else entirely, must not be allowed to drive
+ *  what the model is told to aim at: a wrong count is worse than an honest guess, so anything odd means
+ *  the estimate is used and the record says which ruler was in force. */
+export async function countTextAt(base: string, text: string, estimate: number, ms = 6_000): Promise<{ n: number; how: "messages" | "tokenize" } | null> {
+	// A server that already failed both routes is not asked again for an hour: an engine with neither
+	// route would otherwise pay two timeouts on every single compaction, which is slower than the guess.
+	if (countRoute(base) === "no") return null;
+	const sane = (n: any): boolean => {
+		const v = Number(n);
+		return Number.isFinite(v) && v > 0 && v >= estimate * 0.5 && v <= Math.max(estimate * 2, 4096);
+	};
+	const url = base.replace(/\/+$/, "");
+	const route = countRoute(base);
+	const post = async (path: string, body: any, extra: Record<string, string>) => {
+		const r = await fetch(url + path, { method: "POST", headers: { "content-type": "application/json", ...extra }, body: JSON.stringify(body), signal: AbortSignal.timeout(ms) });
+		if (r.status === 404 || r.status === 405 || r.status === 501) return "missing" as const;
+		if (!r.ok) return "bad" as const;
+		return ((await r.json().catch(() => null)) ?? null) as any;
+	};
+	if (route !== "tokenize") {
+		try {
+			const out = await post("/v1/messages/count_tokens", { model: "count", max_tokens: 1, messages: [{ role: "user", content: text }] }, { "anthropic-version": "2023-06-01" });
+			if (out === "missing") countCapability.set(url, { how: "tokenize", at: Date.now() });
+			else if (out === "bad") countCapability.set(url, { how: route === "messages" ? "messages" : route, at: Date.now() });
+			else if (sane(out?.input_tokens)) {
+				countCapability.set(url, { how: "messages", at: Date.now() });
+				return { n: Number(out.input_tokens), how: "messages" };
+			} else countCapability.set(url, { how: "tokenize", at: Date.now() });
+		} catch {
+			countCapability.set(url, { how: "tokenize", at: Date.now() });
+		}
+	}
+	try {
+		const out = await post("/tokenize", { text, content: text, add_special: false, parse_special: true }, {});
+		if (out === "missing" || out === "bad") {
+			countCapability.set(url, { how: "no", at: Date.now() });
+			return null;
+		}
+		// llama.cpp-family servers answer with a "tokens" array; ik_llama.cpp's documents the request field
+		// as "content" (we send both names, so either answers) and some forks answer only with the variant
+		// array that includes special tokens, which counts one or two more and is near enough for a ruler.
+		const arr = Array.isArray(out?.tokens) ? out.tokens : Array.isArray(out?.tokens_with_spc) ? out.tokens_with_spc : Array.isArray(out?.tokens_spc) ? out.tokens_spc : Array.isArray(out?.tokens_with_bos) ? out.tokens_with_bos : undefined;
+		const raw = arr !== undefined ? arr.length : out?.tokens !== undefined ? out.tokens : out?.count ?? out?.size;
+		if (sane(raw)) {
+			countCapability.set(url, { how: "tokenize", at: Date.now() });
+			return { n: Number(raw), how: "tokenize" };
+		}
+		countCapability.set(url, { how: "no", at: Date.now() });
+	} catch {
+		countCapability.set(url, { how: "no", at: Date.now() });
+	}
+	return null;
+}
+
+
 /**
  * The size window one summarisation attempt is governed by, all in tokens.
  *
@@ -1385,7 +1548,35 @@ function wordsFor(tokens: number): number {
 type Sizes = { min: number; target: number; max: number; genCap: number; notes: string[] };
 
 /** Slack above `max` on the generation cap only, so a summary landing exactly on max is not cut. */
-const GEN_MARGIN = 512;
+const GEN_MARGIN = 1000;
+
+/** What a scratchpad is worth reserving for when the template asks for one and the model can afford
+ *  it (2026-10-18). Since the draft setting was deleted the only way to want a scratchpad is to write
+ *  it into the template, so that is where the wish is looked for: the text the model will be shown.
+ *  Reserve nothing and the scratchpad eats into the summary itself, so a run that means to fill the
+ *  ceiling is cut off in the middle of the summary and the whole attempt is thrown away. Where the
+ *  model's own output permission is known the allowance is capped by it, because asking a model to
+ *  emit more than it can is not a longer scratchpad, it is a truncation with extra steps. */
+const SCRATCH_ALLOWANCE = 4_096;
+const SCRATCH_MIN_USEFUL = 1_024;
+function asksForScratch(instructions: string): boolean {
+	return /<draft[\s>]/i.test(instructions) || /<analysis[\s>]/i.test(instructions) || /\bscratchpad\b/i.test(instructions);
+}
+/** The scratchpad share of the output budget: the allowance below, shrunk to whatever a model can
+ *  actually still emit above the summary ceiling and the thinking allowance, and written down in the log
+ *  when that leaves too little to matter (2026-10-18). It deliberately reads nothing but the model and
+ *  the numbers already computed, because the request text does not exist where this is needed - reading
+ *  it there sat in a temporal dead zone and threw "Cannot access 'instructions' before initialization"
+ *  on every compaction, which re-triggered on a context that could not be compacted. */
+function scratchAllowanceFor(model: any, baseCap: number): { allowance: number; note: string } {
+	const limit = Number(model?.maxTokens);
+	if (!Number.isFinite(limit) || limit <= 0) return { allowance: SCRATCH_ALLOWANCE, note: `scratchpad allowed ${fmt(SCRATCH_ALLOWANCE)} tok; this model states no output limit` };
+	const room = Math.max(0, Math.floor(limit) - baseCap - 256);
+	if (room >= SCRATCH_ALLOWANCE) return { allowance: SCRATCH_ALLOWANCE, note: "" };
+	if (room >= SCRATCH_MIN_USEFUL) return { allowance: room, note: `the scratchpad gets ${fmt(room)} of the ${fmt(SCRATCH_ALLOWANCE)} tok: this model emits at most ${fmt(limit)} tok and the ceiling, the margin and the thinking allowance already want ${fmt(baseCap)}` };
+	return { allowance: room, note: `THE SCRATCHPAD HAS ALMOST NO ROOM: this model emits at most ${fmt(limit)} tok, everything before it already takes ${fmt(baseCap)}, leaving ${fmt(room)} for scratch work plus the summary. Raise the model output limit (pi owns it now), lower Summary max, or the run is cut off and the attempt discarded.` };
+}
+
 
 /** When a model THINKS before writing the summary, the reasoning tokens ride inside the same
  * generation cap. Without extra room the thinking eats the summary's budget and the answer is cut
@@ -1402,16 +1593,11 @@ const GEN_MARGIN = 512;
  *  attempts with thinking on died at the cap with the summary half written.) */
 const THINKING_ALLOWANCE: Record<string, number> = { minimal: 4_096, low: 8_192, medium: 12_288, high: 16_384, xhigh: 20_480, max: 20_480 };
 
-/** Output-token headroom a draft block needs on top of the summary ceiling, so a long draft cannot
- *  push the summary itself into pi's length-stop. The draft is stripped before measuring, but it
- *  rides inside the model's output and the generation cap governs draft + summary together. */
-function draftAllowance(draft: Draft | undefined): number {
-	if (draft === "full") return 4096;
-	if (draft === "mini") return 1024;
-	return 0;
-}
+/** Output-token headroom a scratchpad needs on top of the summary ceiling, so that a long one cannot
+ *  push the summary itself into a length-stop. The scratchpad is stripped before measuring, but it
+ *  rides inside the model's output, so the generation cap governs scratchpad and summary together. */
 
-export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; historyTokens: number; headroom: number; overflow: boolean; draft?: Draft; windowTokens?: number }, prevTokens = 0): Sizes {
+export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; historyTokens: number; headroom: number; overflow: boolean; windowTokens?: number }, prevTokens = 0): Sizes {
 	const notes: string[] = [];
 	// The REGION: the material being folded (the session ctx minus the preserved tail, measured
 	// after the stubbing pass) - kept only for the sanity cap and the unknown-window fallback.
@@ -1458,7 +1644,7 @@ export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; his
 	if (min > target) min = target;
 	// min 0 = "no minimum": any real output is accepted (the empty-summary check still applies).
 	if (min > 0 && min < 128) min = 128;
-	return { min, target, max, genCap: max + GEN_MARGIN + draftAllowance(opts.draft), notes };
+	return { min, target, max, genCap: max + GEN_MARGIN, notes };
 }
 
 /**
@@ -1492,7 +1678,7 @@ export function measuredTokens(summary: string, usage: any): { tokens: number; b
  * characters the scratchpad occupied, so a usage-based token count can be corrected: the draft
  * rode inside the provider's output figure, but it must not count against the acceptance window.
  */
-export function stripDraft(text: string): { summary: string; strippedChars: number } {
+export function stripRoughWork(text: string): { summary: string; strippedChars: number } {
 	let s = String(text ?? "");
 	let stripped = 0;
 	const open = s.indexOf("<draft>");
@@ -1534,6 +1720,36 @@ export function appendTranscriptPointer(cfg: Config, ctx: Ctx, summary: string):
 	return summary;
 }
 
+/** One honest line at the end of every extension-written summary, readable by the next model and by a
+ *  person expanding the compaction block (2026-10-18, because the figure pi can show there is only ever
+ *  the size of the whole conversation before it was compacted - which looks nothing like the amount the
+ *  summariser was really handed once elision and the kept tail are taken out). Deliberately short: it
+ *  rides inside the summary, so every token of it is a token of context that stays. */
+export function appendCompactionReceipt(cfg: Config, ctx: Ctx, r: any, summary: string): string {
+	if (!cfg.summaryReceipt) return summary;
+	try {
+		const d = new Date();
+		const p = (n: number) => String(n).padStart(2, "0");
+		const off = -d.getTimezoneOffset();
+		const zone = off === 0 ? " UTC" : ` UTC${off > 0 ? "+" : "-"}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`;
+		const when = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}${zone}`;
+		const who = String(r?.ref ?? "").split(/[/\\]/).filter(Boolean).pop()?.replace(/-\d{5}-of-\d{5}\.gguf$/i, "").replace(/\.gguf$/i, "").slice(-48) || "the summariser";
+		const before = Number(r?.compaction?.tokensBefore);
+		const material = Number(r?.material);
+		const elided = Number(r?.elided);
+		const wrote = Number(r?.measured);
+		const bits: string[] = [];
+		if (Number.isFinite(before) && before > 0) bits.push(`the context held ${fmt(before)} tok`);
+		if (Number.isFinite(material) && material > 0) bits.push(`the summariser was handed ${fmt(material)} tok of material${Number.isFinite(elided) && elided > 0 ? ` (${fmt(elided)} tok elided out of the older part before it was sent)` : ""}`);
+		if (Number.isFinite(wrote) && wrote > 0) bits.push(`wrote ${fmt(wrote)} tok`);
+		if (!bits.length) return summary;
+		const secs = Number(r?.seconds);
+		return `${summary}\n\nCompacted ${when} by ${who}${Number.isFinite(secs) && secs > 0 ? ` in ${fmt(secs)} s` : ""}: ${bits.join(", ")}.`;
+	} catch {
+		/* best effort */
+	}
+	return summary;
+}
 function countWords(text: string): number {
 	return String(text).trim().split(/\s+/).filter(Boolean).length;
 }
@@ -1670,13 +1886,20 @@ export function capToolCallArgs(messages: any[], cap: CharCap): { messages: any[
  * design and carries the exit/tail message the head-only clip used to destroy), and tool-call
  * argument values get capped. Returns a NEW preparation; the caller's object is untouched.
  */
-export function preprocessForSummariser(prep: any, options: { inputStubs: boolean; argCap: CharCap; stubTailChars?: CharCap }): { prep: any; stubbed: number; argsCapped: number } {
+export function preprocessForSummariser(prep: any, options: { inputStubs: boolean; argCap: CharCap; stubTailChars?: CharCap }): { prep: any; stubbed: number; argsCapped: number; rawChars: number; keptChars: number; savedChars: number } {
 	const tail = options.stubTailChars ?? ELISION_DEFAULTS.stubTailChars;
 	let stubbed = 0;
 	let argsCapped = 0;
+	// How much material the elision actually removed, so the log can say where the tokens went. Before
+	// this, a compaction could read 49,151 tokens out of a 164,239-token context and the log had no way
+	// to account for the difference beyond a count of how many results were touched.
+	let rawChars = 0;
+	let keptChars = 0;
+	const charsOf = (list: any[]) => list.reduce((n: number, m: any) => n + contentTextOf(m?.content).length, 0);
 	const out: any = { ...prep };
 	for (const key of ["messagesToSummarize", "turnPrefixMessages"]) {
 		const list: any[] = prep?.[key] ?? [];
+		rawChars += charsOf(list);
 		let working = list;
 		if (options.inputStubs) {
 			working = working.map((m, i) => {
@@ -1695,8 +1918,19 @@ export function preprocessForSummariser(prep: any, options: { inputStubs: boolea
 			stubbed += working.filter((m: any, i: number) => isToolResult(m) && m !== list[i]).length;
 		}
 		out[key] = working;
+		keptChars += charsOf(working);
 	}
-	return { prep: out, stubbed, argsCapped };
+	return { prep: out, stubbed, argsCapped, rawChars, keptChars, savedChars: Math.max(0, rawChars - keptChars) };
+}
+
+/** What the elision removed from the material, in the same tokens the material is measured in. The
+ *  elision counts characters and the ruler in force counted the material AFTER the cut, so the saving
+ *  is scaled through that ratio instead of being guessed from a constant tokens-per-character. */
+function elidedTokens(pre: { savedChars?: number; keptChars?: number }, material: number): number {
+	const saved = Number(pre?.savedChars);
+	const kept = Number(pre?.keptChars);
+	if (!Number.isFinite(saved) || !Number.isFinite(kept) || kept <= 0 || material <= 0) return 0;
+	return Math.max(0, Math.round((material * saved) / kept));
 }
 
 // ---------------------------------------------------------------- the elision stage
@@ -1819,14 +2053,34 @@ export function resetElisionBreaker(): void {
  *   wire   - the prompt tokens the server reported for the newest request after the last compaction.
  *            Elisions are in that figure, so it is the real fill of the model's context.
  *   pi     - pi's own estimate from the same usage figure.
- *   sum    - a sum of the messages, for a model that answers without usage figures or for the very
- *            first request of a session.
- * `how` is reported with the number so a zero can never be mistaken for an empty context.
+ *   sum    - what the NEXT request would carry, for a model that answers without usage figures, right
+ *            after a compaction, or straight after a restart. Taken from pi itself: the entries pi would
+ *            assemble (newest summary + the kept tail + everything added since), NOT the whole archive.
+ * `all` is the whole branch next to it - what is on disk rather than what is on the wire, which on an
+ * elided session is about twice as big - and `justCompacted` says the newest of those entries is the
+ * summary itself: the one state where no measure exists yet. `how` says which was used, so a zero can
+ * never be mistaken for an empty context.
  */
-function measureContext(ctx: any): { wire: number; pi: number; sum: number; tokens: number; how: string } {
+/** Tokens one session entry adds to the context. A summary rides on the entry's own text (pi keeps it in
+ *  `summary`, not in a message); pass countSummary=false to leave summaries out of a total. */
+function tokensOfEntry(e: any, countSummary = true): number {
+	try {
+		if ((e as any)?.type === "compaction") return countSummary ? Math.round((((e as any).summary ?? "").length * 1.15) / 4) : 0;
+		const m: any = (e as any)?.message ?? e;
+		if (!m || m.role === "system") return 0;
+		return Math.round(estimateTokens(m as never));
+	} catch {
+		return 0;   // an entry this cannot read adds nothing rather than breaking the measure
+	}
+}
+
+function measureContext(ctx: any): { wire: number; pi: number; sum: number; all: number; tokens: number; how: string; justCompacted: boolean } {
 	let wire = 0;
 	let piEst = 0;
 	let sum = 0;
+	let all = 0;
+	let keptSlice = false;
+	let nothingSinceCompaction = false;
 	try {
 		wire = wireTokensOf(ctx);
 		const u = (ctx as any)?.getContextUsage?.();
@@ -1836,23 +2090,46 @@ function measureContext(ctx: any): { wire: number; pi: number; sum: number; toke
 	}
 	if (!(wire > 0) && !(piEst > 0)) {
 		try {
-			const branch: any[] = (ctx as any)?.sessionManager?.getBranch?.() ?? [];
-			for (const e of branch) {
-				const m: any = (e as any)?.message ?? e;
-				if (!m || m.role === 'system') continue;
-				try {
-					sum += Math.round(estimateTokens(m as never));
-				} catch {
-					/* that message is skipped */
+			const sm: any = (ctx as any)?.sessionManager;
+			// WHAT WOULD BE SENT, TAKEN FROM PI RATHER THAN GUESSED: buildContextEntries() is how pi
+			// assembles a context - the newest summary first, then the entries from its firstKeptEntryId,
+			// then everything added since. The kept tail sits PHYSICALLY BEFORE the summary in the file, so
+			// "from the newest compaction onward" is not it, and summing the whole branch is the archive:
+			// roughly twice what the model is actually shown, which is what set this trigger off a second
+			// after a compaction had landed and left the user with "Nothing to compact (session too small)".
+			let slice: any[] = [];
+			try {
+				slice = sm?.buildContextEntries?.() ?? [];
+			} catch {
+				slice = [];
+			}
+			const branch: any[] = sm?.getBranch?.() ?? [];
+			for (const e of branch) all += tokensOfEntry(e, false);
+			if (slice.length) {
+				// pi's own warning applies here: the kept range can swallow an OLDER summary, and only the
+				// newest one is actually sent - count that one and no other, or the figure double-counts.
+				let newestId: any = null;
+				for (let i = branch.length - 1; i >= 0; i--) if ((branch[i] as any)?.type === "compaction") { newestId = (branch[i] as any).id; break; }
+				keptSlice = newestId !== null;
+				for (const e of slice) {
+					if ((e as any)?.type === "compaction" && (e as any).id !== newestId) continue;
+					sum += tokensOfEntry(e);
 				}
+				// THE STATE WITH NOTHING TO MEASURE: a summary is in what would be sent and not one answer has
+				// come after it - the server has not been asked anything since it landed. Only a real number can
+				// justify starting another compaction here (see the watcher's stand-down).
+			nothingSinceCompaction = keptSlice && wire === 0;
+			} else {
+				// No pi to ask (older build, or the call refused): the archive is the only figure left.
+				sum = all;
 			}
 		} catch {
 			/* nothing to sum */
 		}
 	}
-	const how = wire > 0 ? 'wire' : piEst > 0 ? 'pi-estimate' : sum > 0 ? 'message-sum' : 'unmeasurable';
+	const how = wire > 0 ? 'wire' : piEst > 0 ? 'pi-estimate' : sum > 0 ? (keptSlice ? 'kept-slice' : 'message-sum') : 'unmeasurable';
 	const tokens = wire > 0 ? wire : piEst > 0 ? piEst : sum;
-	return { wire, pi: piEst, sum, tokens, how };
+	return { wire, pi: piEst, sum, all, tokens, how, justCompacted: nothingSinceCompaction };
 }
 
 function wireTokensOf(ctx: any): number {
@@ -1863,6 +2140,16 @@ function wireTokensOf(ctx: any): number {
 		let best = 0;
 		for (let i = branch.length - 1; i > latestCompaction; i--) {
 			const m: any = branch[i]?.role === undefined ? branch[i]?.message : branch[i];
+			// PI'S OWN RULE, COPIED ON PURPOSE (2026-10-15). A response that was aborted or errored carries the
+			// usage of the request that was cut short, which describes the context as it was BEFORE the summary
+			// that is now in front of it. pi excludes those messages from its accounting for exactly this reason
+			// ("kept pre-compaction messages have stale usage reflecting the old, larger context and would falsely
+			// trigger compaction right after one just finished"), and since 2026-10-15 a compaction can be started
+			// mid-run - where the abort it issues leaves precisely such a message behind. Reading it as the live
+			// fill would have made every mid-run compaction immediately re-arm the trigger with the old, bigger
+			// number: the re-trigger loop this file exists to have killed.
+			const sr = String(m?.stopReason ?? '');
+			if (sr === 'aborted' || sr === 'error') continue;
 			const u: any = m?.usage;
 			if (!u) continue;
 			const total = Number(u.totalTokens) > 0 ? Number(u.totalTokens) : [u.input, u.output, u.cacheRead, u.cacheWrite].reduce((acc: number, v: any) => acc + (Number(v) || 0), 0);
@@ -2084,11 +2371,23 @@ export function samplingParamsFor(ref: string, s: SamplingFlags | undefined): Re
 /** Per-request chat-template kwargs that make the THINKING EFFORT real for a local llama server:
  *  pi-ai sends nothing thinking-related for a plain openai-format model (its reasoning branches do
  *  not cover it), so low/medium/xhigh would otherwise be silently dropped. ik_llama.cpp merges
- *  chat_template_kwargs over the server's --chat-template-kwargs defaults. "off" keeps using the
- *  no-think tag instead - deliberately not this. */
+ *  chat_template_kwargs over the server's --chat-template-kwargs defaults. "off" used to send
+ *  nothing on the theory that the no-think tag in the prompt was enough - see below for what that
+ *  cost on 2026-10-19. */
 export function chatTemplateKwargsFor(thinking: Level): Record<string, unknown> | undefined {
 	const level = thinking === "minimal" ? "low" : thinking === "high" ? "xhigh" : thinking;
 	if (level === "low" || level === "medium" || level === "xhigh") return { reasoning_effort: level };
+	// "off" has to be an instruction, not a silence (2026-10-19, live failure): a thinking-by-default
+	// chat template keeps reasoning when we send nothing, and the server then spends most of the
+	// request budget on that hidden reasoning - 25,956 of 34,608 tokens, leaving 8,652 for the
+	// summary, which then hit the cap and looked like a broken extension. The spellings vary by
+	// template and server build, so the known ones all go, and a template that does not know a key
+	// ignores it: ik_llama.cpp merges chat_template_kwargs over its --chat-template-kwargs defaults, and
+	// that server's own README documents the key with {"enable_thinking": false} as its example.
+	// They ride INSIDE chat_template_kwargs, never beside it - pi-ai copies samplingParams straight
+	// into the request body, so an unknown top-level key is a coin flip with the server.
+	if (thinking === "off") return { chat_template_kwargs: { enable_thinking: false, thinking_enable: false, reasoning_budget: 0, thinking_budget: 0 } };
+	// "max" and anything else: send nothing thinking-related, exactly as before 2026-10-19.
 	return undefined;
 }
 
@@ -2312,6 +2611,81 @@ export function shapeCheck(summary: string): { ok: boolean; reason?: string } {
 	}
 	return { ok: true };
 }
+/** How much of the TURN LEDGER really carries a user prompt (2026-10-18), and how many prompts appear
+ *  anywhere in the summary (2026-10-19 - see userPromptsGiven for why that second figure exists).
+ *
+ *  `turns` and `withPrompt` look at the ledger: the Turn entries and, for each, whether its sub-lines hold a
+ *  line labelled with the word user with real text after the colon. The label is whatever the template chose
+ *  ("user:", "user asked:", "USER PROMPT:") so the tell is the word rather than the wording, and a label with
+ *  nothing after it does not count, because an empty user line is how a model satisfies the shape without
+ *  carrying the prompt it was told to quote.
+ *
+ *  `linesAnywhere` counts the same labelled lines across the whole summary, ledger or no ledger. It exists
+ *  because the 00:50 summary on 2026-10-18 carried no Turn labels whatsoever - the shape gate said so out loud
+ *  in its warning - and a check written only on turn labels reads "zero turns, nothing to complain about" in
+ *  exactly the case where the model threw the structure away along with the prompts.
+ *
+ *  Counts, not a verdict, so the caller can tell a thin ledger from an empty one. Falls back to the whole
+ *  summary when there is no ledger section, so a differently shaped template still gets measured instead of a
+ *  silent zero. */
+
+export function userPromptCoverage(summary: string): { turns: number; withPrompt: number; linesAnywhere: number } {
+	const all = String(summary ?? "").split("\n");
+	// "four letters" rather than "not empty": a user line that says nothing, shows a dash, or quotes the word
+	// "ok" is the model acknowledging the shape without carrying the prompt. The same rule on the given side,
+	// in userPromptsGiven, keeps that honest rather than punishing a faithful summary of a terse session.
+	const real = (s: string) => s.replace(/[^A-Za-z0-9]/g, "").length >= 4;
+	let inLedger = false;
+	const ledger: string[] = [];
+	for (const l of all) {
+		if (/^##\s*TURN LEDGER\b/i.test(l)) {
+			inLedger = true;
+			continue;
+		}
+		if (inLedger && /^##\s/.test(l)) break;
+		if (inLedger) ledger.push(l);
+	}
+	const body = ledger.length >= 4 ? ledger : all;
+	let turns = 0;
+	let withPrompt = 0;
+	for (let i = 0; i < body.length; i++) {
+		if (!/^\s*Turn \d+\b/.test(body[i])) continue;
+		turns += 1;
+		for (let j = i + 1; j < body.length; j++) {
+			if (/^\s*Turn \d+\b/.test(body[j]) || /^#{1,3}\s/.test(body[j])) break;
+			const m = body[j].match(/^\s*user[^:\n]{0,30}\s*:\s*(\S.*)$/i);
+			if (m && real(m[1])) {
+				withPrompt += 1;
+				break;
+			}
+		}
+	}
+	let linesAnywhere = 0;
+	for (const l of all) {
+		const m = l.match(/^\s*[-*]?\s*user[^:\n]{0,30}\s*:\s*(\S.*)$/i);
+		if (m && real(m[1])) linesAnywhere += 1;
+	}
+	return { turns, withPrompt, linesAnywhere };
+}
+
+/** How many prompts the summarizer was HANDED (2026-10-19). serializeRegion marks each one - "[User - Turn
+ *  12]: ...", and for a /bash entry or a custom note "[User bash - Turn 12]" / "[Note - Turn 12]". Those are
+ *  all things the user gave the session, so they all belong in the denominator. "[Earlier summary - Turn N]"
+ *  is deliberately not counted: that is the previous summary rather than a prompt, and counting it would make
+ *  a chained summary look better supplied than the model was.
+ *
+ *  Only prompts with at least four letters count, mirroring the summary-side rule above. A prompt whose text
+ *  was trimmed by preprocessing still counts as long as any of its text survives the trim - the four-letter
+ *  rule is what decides, not whether the material was shortened, and a prompt emptied to nothing was never
+ *  there to quote. */
+export function userPromptsGiven(material: string): number {
+	let n = 0;
+	const real = (s: string) => s.replace(/[^A-Za-z0-9]/g, "").length >= 4;
+	for (const m of String(material ?? "").matchAll(/^\[(?:User(?: bash)?|Note) - Turn \d+[^\]]*\]:\s*(\S.*)$/gm)) {
+		if (real(m[1])) n += 1;
+	}
+	return n;
+}
 
 /** pi's machine-readable file appendix (<read-files>/<modified-files>), from the preparation's
  *  fileOps (a Set or an array - both accepted). */
@@ -2354,7 +2728,7 @@ export async function directCompact(args: {
 	 */
 	additionalInstruction?: string | null;
 	userDefault?: string | null;
-}): Promise<{ text: string; usage: any; lastTurn: number; inputText: string }> {
+}): Promise<{ text: string; usage: any; lastTurn: number; inputText: string; segmentBy: "count" | "estimate"; fromReasoning: boolean }> {
 	const { preparation, model, registry, sizes, options } = args;
 	const startTurn = args.prevTurn > 0 ? args.prevTurn : 0;
 	const main = serializeRegion(preparation?.messagesToSummarize ?? [], { startTurn, inputStubs: options.inputStubs, argCap: options.argCap });
@@ -2363,8 +2737,16 @@ export async function directCompact(args: {
 	const prevBlock = labeledPreviousSummary(preparation?.previousSummary, args.prevTurn, nextTurn);
 	const regionText = [main.text, prefix.text].filter(Boolean).join("\n\n");
 	const coverLine = `The conversation segment below covers Turns ${startTurn + 1}-${Math.max(main.lastTurn, prefix.lastTurn)} (already numbered - use those numbers).`;
-	const inputTokens = Math.ceil((regionText.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
-	const instructions = buildInstructions({ sizes, inputTokens, kind: args.kind, options, additionalInstruction: args.additionalInstruction ?? null, userDefault: args.userDefault, customInstructions: args.customInstructions });
+	// The real count when the server can state one (2026-10-18): the character heuristic is within about
+	// 2 % on this pack's transcript and within about 11 % on summary prose, but it is a guess, and a guess
+	// the model is asked to hold itself to is a poor ruler. An online candidate cannot be counted before
+	// the fact, so it keeps the estimate and the record says which ruler was used.
+	const countBase = localSummariserBaseUrl(model, args.ref);
+	const guessed = Math.ceil((regionText.length * TOKEN_HEAVINESS) / 4);
+	const counted = countBase ? await countTextAt(countBase, [prevBlock, regionText].filter(Boolean).join("\n\n"), guessed) : null;
+	const segmentBy = counted ? counted.how : countBase ? "estimate (this server gave no usable count)" : "estimate (not a local model)";
+	const inputTokens = (counted?.n ?? guessed) + SUMMARISER_FRAMING_TOKENS;
+	const instructions = buildInstructions({ sizes, inputTokens, segmentTokens: counted?.n ?? inputTokens - SUMMARISER_FRAMING_TOKENS, kind: args.kind, options, additionalInstruction: args.additionalInstruction ?? null, userDefault: args.userDefault, customInstructions: args.customInstructions });
 	const promptText = [
 		prevBlock,
 		prevBlock ? coverLine : coverLine,
@@ -2377,7 +2759,8 @@ export async function directCompact(args: {
 		systemPrompt: COMPACTOR_SYSTEM_PROMPT,
 		messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
 	};
-	const requestOptions: Record<string, unknown> = { maxTokens: sizes.genCap, signal: args.signal, cacheRetention: "none" };
+	const dScratch = scratchAllowanceFor(model, sizes.genCap);
+	const requestOptions: Record<string, unknown> = { maxTokens: sizes.genCap + dScratch.allowance, signal: args.signal, cacheRetention: "none" };
 	if (model?.reasoning && args.thinking !== "off") requestOptions.reasoning = args.thinking;
 	// The per-model sampling flags + (local) effort kwargs ride into the request body here; the
 	// adapter merges samplingParams over the named fields, and llama-server reads them per request.
@@ -2385,19 +2768,81 @@ export async function directCompact(args: {
 	const dKwargs = refLooksLocal(args.ref) ? chatTemplateKwargsFor(args.thinking) : undefined;
 	if (dParams || dKwargs) requestOptions.samplingParams = { ...(dParams ?? {}), ...(dKwargs ?? {}) };
 	const response: any = await registry.streamSimple(model, context, requestOptions).result();
-	if (response?.stopReason === "length") throw new Error(`generation hit the token cap (${sizes.genCap} tok: acceptance max ${sizes.max} tok + margins) and the summary is incomplete - the model wrote ~${fmt(response?.usage?.output ?? 0)} tok. Raise Summary max, or set the draft to off/mini.`);
+	// A generation that ran out of room is not automatically worthless, and treating it that way is
+	// what stopped every compaction tonight (2026-10-19, live): the local model's hidden reasoning
+	// ate most of the request budget, the visible summary stopped at the cap, and the attempt was
+	// thrown away the instant stopReason arrived - before a single character of it was looked at. The
+	// user's reading was right that the number made no sense: 30,512 is not a measurement of what
+	// the model wrote, it is our own acceptance ceiling (Summary max + GEN_MARGIN) reported back at
+	// them, while the request had actually been capped higher and the model had filled it. Judge what
+	// arrived instead, after it has arrived: a half-finished sentence at the end is a loss, a session
+	// that cannot compact is a bigger one. So this run keeps its honest numbers, and the gate below
+	// (which is the ordinary size and shape checks, run on the text as it would be after a clean stop)
+	// decides.
+	const cutShort = response?.stopReason === "length";
+	// What the SERVER was told to generate, and everything the model wrote against it. A message about
+	// being cut short must quote these, not our own acceptance ceiling, or the reader chases a number
+	// that was never a measurement of anything.
+	const requestCap = Number(requestOptions.maxTokens) || sizes.genCap;
+	// pi reports `output` as everything the server completed, its own reasoning included, and `reasoning`
+	// as the part of that which was hidden - so the two are never added together, only named separately.
+	const wroteAll = Math.round(response?.usage?.output ?? 0);
+	const reasonedAll = Math.round(response?.usage?.reasoning ?? 0);
 	if (response?.stopReason === "error") throw new Error(response?.errorMessage || "provider error");
 	if (response?.stopReason === "aborted") throw new Error("aborted");
 	if ((response?.content ?? []).some((b: any) => b?.type === "toolCall")) throw new Error("the model tried to call a tool");
-	const text = (response?.content ?? [])
+	let text = (response?.content ?? [])
 		.filter((b: any) => b?.type === "text")
 		.map((b: any) => String(b.text ?? ""))
 		.join("")
 		.trim();
-	if (!text) throw new Error("empty response");
+	// AN EMPTY ANSWER IS NOT AN EMPTY REQUEST (2026-10-18). On 03:24 the local Qwen ran 594 s and the
+	// record said "empty response", which threw the run away as though nothing had happened: about 440 s
+	// of that was decoding at this pack's rate, i.e. several thousand tokens of reasoning the answer
+	// channel never carried. So the reasoning channel is now offered to the gates instead of the bin - a
+	// summary the model wrote in its head is worth the rough-work stripper it has to go through - and a
+	// run with NOTHING in either channel fails carrying the usage counts and the stop reason, so the next
+	// one of those says what actually happened instead of repeating itself.
+	let fromReasoning = false;
+	if (!text) {
+		const scratch = (response?.content ?? [])
+			.filter((b: any) => b?.type === "thinking" || b?.type === "reasoning")
+			.map((b: any) => String(b?.text ?? b?.thinking ?? b?.reasoning ?? ""))
+			.join("\n\n")
+			.trim();
+		if (scratch.length > 200) {
+			text = scratch;
+			fromReasoning = true;
+		} else {
+			const dead: any = new Error(scratch ? "empty response (the reasoning channel held only " + scratch.length + " characters, no summary)" : "empty response");
+			dead.usage = response?.usage;
+			dead.stopReason = response?.stopReason;
+			throw dead;
+		}
+	}
+	if (cutShort) {
+		// Measured the blunt way - characters over four - because this is a gate, not a receipt: it only
+		// has to tell 'an actual summary arrived' from 'the model had barely started'. The exact count is
+		// the ordinary checks further down, which this text now runs through as if the generation had
+		// stopped cleanly. It sits here, after the reasoning channel had its say, so a run that carried
+		// its summary in that channel is judged on that text rather than on an empty answer channel.
+		const visTokens = Math.round(text.length / 4);
+		const shaped = /(^|\n)\s*(#{1,6}\s*)?TURN LEDGER\b/i.test(text) || /(^|\n)\s*Turn \d+\b/.test(text) || /(^|\n)\s*user: /m.test(text);
+		if (visTokens < sizes.min || !shaped) {
+			throw new Error(
+				`generation stopped at the request cap (${fmt(requestCap)} tok) before a usable summary had arrived: ~${fmt(visTokens)} tok of readable summary out of ${fmt(wroteAll)} tok written` +
+					(reasonedAll > 0 ? `, of which ~${fmt(reasonedAll)} tok went to the model's own hidden reasoning` : "") +
+					(shaped ? "" : ", and what did arrive has no ledger shape in it") +
+					` - that reasoning is what strata's "of budget ... (max ...)" line was telling you about. Lower Thinking for this candidate, raise Summary max (now ${fmt(sizes.max)} tok), or move the trigger earlier so the segments get smaller.`,
+			)
+		}
+		// A kept truncation is a fact worth telling the user about, not a detail: the summary is short
+		// because the budget ran out, and the reader of the next summary deserves to know that.
+		logLine(loadConfig(), { event: "note", ref: args.ref, cutAtCap: requestCap, writtenTokens: wroteAll, reasoningTokens: reasonedAll, visibleTokens: visTokens, note: "the generation stopped at the request cap, but what arrived is a summary of at least the acceptance floor with its ledger shape intact - kept instead of moving to the next model" + (fromReasoning ? " (the text came from the reasoning channel)" : "") });
+	}
 	// The exact conversation text the request carried - the stub-coverage gate counts the stub
 	// markers in it against the copies in the summary.
-	return { text, usage: response.usage, lastTurn: Math.max(main.lastTurn, prefix.lastTurn), inputText: `${main.text}\n${prefix.text}` };
+	return { text, usage: response.usage, lastTurn: Math.max(main.lastTurn, prefix.lastTurn), inputText: `${main.text}\n${prefix.text}`, segmentBy, fromReasoning };
 }
 
 /**
@@ -2618,14 +3063,13 @@ export async function summarizeWithRotation(
 		// and capped tool-call argument values. The raw preparation is never mutated.
 		const pre = preprocessForSummariser(prep, { ...profile, stubTailChars: cfg.elision.stubTailChars });
 		prep = pre.prep;
-		if (pre.stubbed || pre.argsCapped) logLine(cfg, { event: "preprocess", ref: c.ref, stubbed: pre.stubbed, argsCapped: pre.argsCapped });
+		if (pre.stubbed || pre.argsCapped) logLine(cfg, { event: "preprocess", ref: c.ref, stubbed: pre.stubbed, argsCapped: pre.argsCapped, rawChars: pre.rawChars, keptChars: pre.keptChars, savedChars: pre.savedChars });
 		const inputTokens = summariserInputTokens(prep);
 		const sizes = sizesFor(profile, {
 			inputTokens,
 			historyTokens: historyTokensOnly(preparation),
 			headroom: overflow ? 0 : postCompactionHeadroom(ctx, preparation),
 			overflow,
-			draft: profile.draft,
 			windowTokens: ctx?.model?.contextWindow ?? 0,
 		}, prevSummaryTokens(preparation));
 		for (const note of sizes.notes) logLine(cfg, { event: "note", ref: c.ref, note });
@@ -2657,12 +3101,30 @@ export async function summarizeWithRotation(
 		const th = effectiveThinking(profile.thinking, c.model);
 		// A local chat template can hold thinking on whatever the request asks for. When we asked for
 		// thinking off, also say it inside the message, because that is where such a template looks.
-		const realInput = summariserInputTokens(prep);
-		const realSizes = prep === preparation ? sizes : sizesFor(profile, { inputTokens: realInput, historyTokens: historyTokensOnly(prep), headroom: overflow ? 0 : postCompactionHeadroom(ctx, prep), overflow, draft: profile.draft, windowTokens: ctx?.model?.contextWindow ?? 0 }, prevSummaryTokens(prep));
-		const genCapFinal = realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0);
+		// Counted on the material that is actually going out, after any overflow trim, so the figure the
+		// model is shown describes its real reading matter rather than a guess about a tokenizer's habits.
+		// A server that answers nothing plausible falls back to the heuristic and the record says so.
+		const regionForCount = summariserText(prep);
+		const guessedRegion = Math.ceil((regionForCount.length * TOKEN_HEAVINESS) / 4);
+		const countBase2 = localSummariserBaseUrl(c.model, c.ref);
+		const countedRegion = countBase2 ? await countTextAt(countBase2, regionForCount, guessedRegion) : null;
+		const realInput = (countedRegion?.n ?? guessedRegion) + SUMMARISER_FRAMING_TOKENS;
+		const segmentBy2 = countedRegion ? countedRegion.how : countBase2 ? "estimate (this server gave no usable count)" : "estimate (not a local model)";
+		const realSizes = prep === preparation ? sizes : sizesFor(profile, { inputTokens: realInput, historyTokens: historyTokensOnly(prep), headroom: overflow ? 0 : postCompactionHeadroom(ctx, prep), overflow, windowTokens: ctx?.model?.contextWindow ?? 0 }, prevSummaryTokens(prep));
+		// The scratchpad share of the output budget rides on the cap here. It must NOT look at the built
+		// instructions: those are assembled below this line, and reading them here sat in their temporal
+		// dead zone - every compaction in this session threw "Cannot access 'instructions' before
+		// initialization" and pi kept re-triggering on a context it could not compact. The allowance is
+		// therefore unconditional now (the template asks for scratch work anyway) and is clamped by what
+		// this model is permitted to emit, which is the only hard ceiling there is.
+		const scratch = scratchAllowanceFor(c.model, realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0));
+		const genCapFinal = realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0) + scratch.allowance;
+		if (scratch.note) logLine(cfg, { event: "note", ref: c.ref, note: scratch.note });
 		let instructions = buildInstructions({
 			sizes: realSizes,
 			inputTokens: realInput,
+			segmentTokens: countedRegion?.n ?? summariserSegmentTokens(prep),
+			segmentBy: segmentBy2,
 			kind: c.kind,
 			options: profile,
 			additionalInstruction: cfg.additionalInstruction,
@@ -2680,9 +3142,11 @@ export async function summarizeWithRotation(
 			max: realSizes.max,
 			minTok: realSizes.min,
 			maxTok: realSizes.max,
+			// Non-empty only for a template that declared its rules written out by hand: which of them the
+			// rendered text then left no trace of. An ordinary run logs nothing here.
+			absentRules: templateAbsentRules.length ? templateAbsentRules.join(" ") : undefined,
 			window: ctx?.model?.contextWindow ?? 0,
 			genCap: genCapFinal,
-			draft: profile.draft,
 			thinking: th.level,
 			timeoutMs: profile.timeoutMs,
 			extraTries: cfg.retries,
@@ -2710,7 +3174,7 @@ export async function summarizeWithRotation(
 					kind: c.kind,
 				});
 				const dSeconds = Math.round(((Date.now() - started) / 1000) * 10) / 10;
-				const cleaned = stripDraft(raw.text);
+				const cleaned = stripRoughWork(raw.text);
 				const summary: string = cleaned.summary;
 				const words = countWords(summary);
 				const u: any = raw.usage ?? {};
@@ -2727,7 +3191,11 @@ export async function summarizeWithRotation(
 				if (timedOut) throw dFail(`timed out with a half written summary`);
 				if (!summary || summary.trim().length < 80) throw dFail("empty summary");
 				if (measured.tokens < realSizes.min) throw dFail(`too thin - the summary is ~${fmt(measured.tokens)} tok vs the acceptance floor is ${fmt(realSizes.min)} tok absolute (aim ${fmt(realSizes.target)} tok, ceiling ${fmt(realSizes.max)} tok). Raise this model's Summary min, or lower the aim %.`);
-				if (measured.tokens > realSizes.max) throw dFail(`too long - the summary is ~${fmt(measured.tokens)} tok vs the acceptance ceiling is ${fmt(realSizes.max)} tok absolute (aim ${fmt(realSizes.target)} tok). Raise this model's Summary max, or lower the aim %.`);
+				// The ceiling for REJECTION is the ceiling the request was actually capped at - max plus GEN_MARGIN
+				// (2026-10-17). Throwing away twenty minutes of writing because a summary came in a hair over the
+				// number we told the model to stay under was its own kind of waste: anything between max and the cap
+				// it was given is a summary that fits the allowance, and it is still reported as such in the log.
+				if (measured.tokens > realSizes.max + GEN_MARGIN) throw dFail(`too long - the summary is ~${fmt(measured.tokens)} tok vs the acceptance ceiling is ${fmt(realSizes.max)} tok absolute (aim ${fmt(realSizes.target)} tok). Raise this model's Summary max, or lower the aim %.`);
 				// 2026-10-06: the accuracy checks no longer REJECT. A summary that breaks the shape rules,
 				// paraphrases the tool calls or loses the previous-summary section is kept anyway - what is
 				// written down here is what it did not do, and the next model is not asked. Only the length
@@ -2747,6 +3215,44 @@ export async function summarizeWithRotation(
 				if (profile.preserveStubs === "verbatim" && inStubs >= 4 && gotStubs < Math.ceil(inStubs * 0.8)) {
 					warnings.push(`stub coverage ${gotStubs}/${inStubs} below 80% with preserveStubs=verbatim (the model paraphrased the tool calls)`);
 				}
+				// THE USER-PROMPT CHECK, measured against the material rather than the summary (2026-10-19).
+				// Every model on this user's list is set to preserveUser = verbatim, so a ledger without the
+				// user's own words is not a style - it is the loss of everything they asked for, and it was
+				// passing: the summary that landed at 23:02 on 2026-10-18 carried one user line where the run
+				// six hours earlier carried twelve, and the one at 00:50 quoted three out of some forty, said
+				// "no Turn labels in the ledger" in its own shape warning, and was accepted anyway. Counting
+				// turns inside the summary cannot see that case - with no labels there are no turns to be sad
+				// about - so the denominator is the segment we sent: every prompt in it is marked
+				// "[User - Turn N]" by serializeRegion, and every prompt quoted in the summary is a line whose
+				// label says user. Both sides count only text of at least four letters, so a session run on
+				// "ok" and "go on" cannot convict an honest summary.
+				//
+				// Nothing quoted is a rejection. Quoting under a quarter of what was handed over, in a segment
+				// large enough for a quarter to be more than a rounding artefact, is a rejection too: the next
+				// model in the rotation costs one more upload, and a session that has lost its instructions
+				// costs the session. Anything short of that but still short is a warning, because a thin ledger
+				// is usually a model that ran out of room rather than one that ignored the instruction.
+				const upc = userPromptCoverage(summary);
+				const given = userPromptsGiven(raw.inputText ?? "");
+				const wantsPrompts = profile.preserveUser === "verbatim" || profile.preserveUser === "detailed";
+				if (wantsPrompts && given >= 2 && upc.linesAnywhere === 0) {
+					throw dFail(`no user prompts at all - the segment offered ${given} and the summary quotes none, while this model is asked to copy them verbatim`);
+				}
+				if (wantsPrompts && given >= 6 && upc.linesAnywhere * 4 < given) {
+					throw dFail(`barely any user prompts - the segment offered ${given} and the summary quotes ${upc.linesAnywhere}, under a quarter of what it was handed`);
+				}
+				if (given >= 2 && upc.linesAnywhere < given) {
+					warnings.push(`user prompts quoted in ${upc.linesAnywhere} of ${given} (${given - upc.linesAnywhere} not carried through)`);
+				}
+				if (upc.turns >= 2 && upc.withPrompt === 0 && upc.linesAnywhere > 0) {
+					warnings.push(`the ledger's Turn entries carry no user line, though prompts are quoted elsewhere in the summary (${upc.linesAnywhere} of ${given})`);
+				}
+				// The UNDERSHOOT, visible now instead of buried in the log: a summary at a third of its aim left
+				// most of the segment out, and the reader deserves to see that written down rather than to find
+				// it a dozen requests later.
+				if (realSizes.target > 0 && measured.tokens < realSizes.target * 0.6) {
+					warnings.push(`undershot the aim: ${fmt(measured.tokens)} of ${fmt(realSizes.target)} tokens (${Math.round((100 * measured.tokens) / realSizes.target)}%)`);
+				}
 				// The CHAIN-ATTACH check: with chainMode=attach the previous summary should appear,
 				// verbatim, in its own section. Warned about since 2026-10-06, never a rejection.
 				if (profile.chainMode === "attach" && preparation.previousSummary?.trim() && !/^##\s*PREVIOUS SUMMARY\b/im.test(summary)) {
@@ -2755,7 +3261,8 @@ export async function summarizeWithRotation(
 				if (warnings.length) {
 					logLine(cfg, { event: "accepted_with_warnings", ref: c.ref, via: "direct", measured: measured.tokens, min: realSizes.min, max: realSizes.max, warnings });
 				}
-				logLine(cfg, { event: "ok", ref: c.ref, via: "direct", kind: c.kind, seconds: dSeconds, measured: measured.tokens, measuredBy: measured.by, draft: profile.draft, draftStripped: cleaned.strippedChars || undefined, min: realSizes.min, target: realSizes.target, max: realSizes.max, words, stubsIn: inStubs || undefined, stubsCopied: gotStubs || undefined, input: u.input, output: u.output, reasoning: u.reasoning });
+				logLine(cfg, { event: "ok", ref: c.ref, via: "direct", kind: c.kind, seconds: dSeconds, measured: measured.tokens, measuredBy: measured.by, segmentBy: raw.segmentBy, fromReasoning: raw.fromReasoning || undefined, roughWorkStripped: cleaned.strippedChars || undefined, min: realSizes.min, target: realSizes.target, max: realSizes.max, words, stubsIn: inStubs || undefined, stubsCopied: gotStubs || undefined, input: u.input, output: u.output, reasoning: u.reasoning });
+				logLine(cfg, { event: "user_prompts", ref: c.ref, quoted: upc.linesAnywhere, given, ledgerTurns: upc.turns, ledgerQuoted: upc.withPrompt });
 				const compaction = {
 					summary: summary + fileOpsAppendix(preparation.fileOps),
 					firstKeptEntryId: prep.firstKeptEntryId,
@@ -2764,13 +3271,13 @@ export async function summarizeWithRotation(
 					details: { lastTurnNumber: Math.max(raw.lastTurn, maxTurnInSummary(summary)) },
 				};
 				combined.dispose();
-				return { ok: true, result: { ok: true, compaction, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds: dSeconds } };
+				return { ok: true, result: { ok: true, compaction, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds: dSeconds, material: realInput - SUMMARISER_FRAMING_TOKENS, elided: elidedTokens(pre, realInput - SUMMARISER_FRAMING_TOKENS) } };
 			} catch (dErr: any) {
 				if (signal?.aborted) {
 					logLine(cfg, { event: "note", note: "cancelled", ref: c.ref });
 					return { ok: false, error: "cancelled" };
 				}
-				logLine(cfg, { event: "direct_fail", ref: c.ref, error: String(dErr?.message ?? dErr).slice(0, 220), note: "moving to the next candidate; pi's compact() runs only after every candidate failed" });
+				logLine(cfg, { event: "direct_fail", ref: c.ref, error: String(dErr?.message ?? dErr).slice(0, 220), stop: dErr?.stopReason, inTok: dErr?.usage?.input, outTok: dErr?.usage?.output, reasonTok: dErr?.usage?.reasoning, note: "moving to the next candidate; pi's compact() runs only after every candidate failed" });
 				failures.push(`${c.ref}: direct: ${String(dErr?.message ?? dErr).split("\n")[0].slice(0, 100)}`);
 				combined.dispose();
 				continue;
@@ -2795,15 +3302,15 @@ export async function summarizeWithRotation(
 				undefined,
 			);
 			const seconds = Math.round(((Date.now() - started) / 1000) * 10) / 10;
-			// The draft scratchpad (when the model has one) is discarded here, before measuring or
+			// Rough work a model writes for itself (a scratchpad in <draft> tags) is discarded here, before measuring or
 			// storing: the acceptance window judges the summary the next request will actually see.
-			const cleaned = stripDraft(compaction?.summary ?? "");
+			const cleaned = stripRoughWork(compaction?.summary ?? "");
 			const summary: string = cleaned.summary;
 			const words = countWords(summary);
 			const u: any = compaction?.usage ?? {};
 			let measured = measuredTokens(summary, u);
 			if (th.level !== "off") measured = { tokens: Math.ceil((summary.length * 1.15) / 4), by: "estimate" };
-			// The draft rode inside the provider's output count; take its estimate back out so the
+			// That rough work rode inside the provider's output count; take its estimate back out so the
 			// acceptance window measures only the summary that will be stored.
 			if (cleaned.strippedChars > 0 && measured.by === "usage") {
 				measured = { tokens: Math.max(0, measured.tokens - Math.ceil((cleaned.strippedChars * 1.15) / 4)), by: "usage" };
@@ -2829,7 +3336,7 @@ export async function summarizeWithRotation(
 				failures.push(`${c.ref}: ~${fmt(measured.tokens)} tok, needed at least ${fmt(realSizes.min)}`);
 				continue;
 			}
-			if (measured.tokens > realSizes.max) {
+			if (measured.tokens > realSizes.max + GEN_MARGIN) {
 				logLine(cfg, { event: "fail", ref: c.ref, seconds, measured: measured.tokens, min: realSizes.min, max: realSizes.max, words, reason: "too long - over the accepted ceiling", ...split });
 				failures.push(`${c.ref}: ~${fmt(measured.tokens)} tok, ceiling is ${fmt(realSizes.max)}`);
 				continue;
@@ -2841,8 +3348,7 @@ export async function summarizeWithRotation(
 				seconds,
 				measured: measured.tokens,
 				measuredBy: measured.by,
-				draft: profile.draft,
-				draftStripped: cleaned.strippedChars || undefined,
+				roughWorkStripped: cleaned.strippedChars || undefined,
 				min: realSizes.min,
 				target: realSizes.target,
 				max: realSizes.max,
@@ -2853,7 +3359,7 @@ export async function summarizeWithRotation(
 			});
 			return {
 				ok: true,
-				result: { ok: true, compaction: { ...compaction, summary }, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds },
+				result: { ok: true, compaction: { ...compaction, summary }, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds, material: realInput - SUMMARISER_FRAMING_TOKENS, elided: elidedTokens(pre, realInput - SUMMARISER_FRAMING_TOKENS) },
 			};
 		} catch (err: any) {
 			const seconds = Math.round(((Date.now() - started) / 1000) * 10) / 10;
@@ -2931,7 +3437,6 @@ function slotLabel(ref: string | null, model: any): string {
 // ---------------------------------------------------------------- option cycles
 
 /** Timeout periods in the exact order they toggle. 0 = unlimited. */
-
 function nextValue(values: string[], current: string): string {
 	const i = values.indexOf(current);
 	return values[(i + 1) % values.length];
@@ -2958,7 +3463,6 @@ export const DEFAULT_OPTIONS: ModelOptions = {
 	summaryPercent: 10,
 	summaryMinTokens: 4096,
 	summaryMaxTokens: 30_000,
-	draft: "off",
 	inputStubs: true,
 	argCap: 500,
 	preserveStubs: "verbatim",
@@ -2994,7 +3498,7 @@ export function optionsFor(cfg: Config, ref: string, model: any): ModelOptions {
 /** Selected models get their stored options; the rest display (and would use) the defaults. */
 function optionsOfAnyModel(cfg: Config, ref: string, model: any): ModelOptions {
 	if (cfg.models[ref]) return optionsFor(cfg, ref, model);
-	return { ...DEFAULT_OPTIONS, draft: isLocalModel(model ?? {}) ? "off" : "full" };
+	return { ...DEFAULT_OPTIONS };
 }
 
 /**
@@ -3004,7 +3508,7 @@ function optionsOfAnyModel(cfg: Config, ref: string, model: any): ModelOptions {
  * What stays per-model: the thinking level, the no-think tag, the timeout and the sampling flags.
  */
 export const GLOBAL_MODEL_KEYS = [
-	"draft", "summaryPercent", "summaryMinTokens", "summaryMaxTokens", "inputStubs", "argCap",
+	"summaryPercent", "summaryMinTokens", "summaryMaxTokens", "inputStubs", "argCap",
 	"preserveStubs", "preserveUser", "preserveReplies", "preserveThinking", "chainMode",
 ] as const;
 
@@ -3180,7 +3684,7 @@ function modelRowValue(cfg: Config, ref: string, model: any, reserveTokens: numb
 	const place = orderPosition(cfg, ref);
 	const pos = place >= 0 ? `#${place + 1}` : "—";
 	// 2026-10-07: the right-hand text is the four options this model's screen really holds - thinking,
-	// no-think tag, timeout, sampling flags. It used to repeat aim/min/max/draft, which are no longer
+	// no-think tag, timeout, sampling flags. It used to repeat aim/min/max, which are no longer
 	// per-model settings and made the column read as garbage.
 	const tag = o.noThinkMarker && o.noThinkMarker.trim() ? "on" : "off";
 	return `${pos} · thinking ${thinkingWord(o.thinking)} · no-think tag ${tag} · timeout ${timeoutLabel(o.timeoutMs)} · sampling ${samplingLabel(o.sampling)}`;
@@ -3554,7 +4058,7 @@ export class OrderList implements Component, Focusable {
 			label: modelRowLabel(place, ref, model),
 			currentValue: selected ? modelRowValue(cfg, ref, model, reserveTokens) : modelRowValue(cfg, ref, model, reserveTokens),
 			description: selected
-				? "Enter opens its options (thinking, draft block, timeout, summary sizes, no-think tag). Space removes it from the order. Digits move it to that place."
+				? "Enter opens its options (thinking, timeout, summary sizes, no-think tag). Space removes it from the order. Digits move it to that place."
 				: "Not in the Compaction models order - it shows the default options. Press a digit (or 0) to add it at that place; Space on a selected model removes it. Enter opens options only for models in the order.",
 		};
 	}
@@ -3566,7 +4070,7 @@ export class OrderList implements Component, Focusable {
 // model keeps its reasoning and sampling controls here and its compaction settings sit with the rest
 // of the compaction settings.
 export const MODEL_KEEP_ROWS = ["thinking", "nothink", "timeout", "sampling"] as const;
-export const MODEL_MOVED_ROWS = ["draft", "summaryPct", "summaryMin", "summaryMax", "inputstubs", "argcap", "preservestubs", "preserveuser", "preservereply", "preservethinking", "chain", "previewDesc"] as const;
+export const MODEL_MOVED_ROWS = ["summaryPct", "summaryMin", "summaryMax", "inputstubs", "argcap", "preservestubs", "preserveuser", "preservereply", "preservethinking", "chain", "previewDesc"] as const;
 
 /**
  * One selected model's options. Every row toggles through its values on Enter/Space:
@@ -3601,14 +4105,6 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 			// low, medium, high, xhigh, max); the handler maps "none" back to the stored "off".
 			values: withCurrent(levels.map((l) => thinkingWord(l)), thinkingWord(o.thinking)),
 			description: `Enter/Space cycles: ${levels.join(" → ")}. Private reasoning before it writes - it costs time, it does not make the summary longer. "off" also writes the no-think tag (row below) into the request for local models. A level the model does not have falls back to the nearest it has.`,
-		});
-		rows.push({
-			id: "draft",
-			label: "Draft block:",
-			currentValue: o.draft,
-			values: withCurrent(DRAFT_CYCLE, o.draft),
-			description:
-				'A hidden analysis written before the summary in the SAME call, then stripped off before storing. "full" = go through every user turn (what was asked, what you did, tools, errors, user corrections) and check the sections are coverable; "mini" = at most ten lines; "off" = start the summary directly. Its tokens do not count against the acceptance window, but they do cost time - online models default to full (Anthropic\'s own compaction does this), local models to off, because at 10-20 tokens/s a full draft roughly doubles the summary time.',
 		});
 		rows.push({
 			id: "timeout",
@@ -3704,7 +4200,7 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 			currentValue: "Press enter to preview",
 			values: ["show"],
 			description:
-				"The COMPLETE description THIS model would receive on the next compaction: the size block, the draft instruction, and the summary template with this model's {TOKENS} substituted (its thinking level, its preserve levels, its chain mode, the category sentences as customized on the board). Read-only preview - nothing is sent; edits in the editor are discarded.",
+				"The COMPLETE description THIS model would receive on the next compaction: the size block and the summary template with this model's {TOKENS} substituted (its thinking level, its preserve levels, its chain mode, the category sentences as customized on the board). Read-only preview - nothing is sent; edits in the editor are discarded.",
 		});
 		rows.push({
 			id: "nothink",
@@ -3748,8 +4244,6 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 			};
 			if (id === "thinking") {
 				setModelOptions(ref, { thinking: (value === "none" ? "off" : value) as Level });
-			} else if (id === "draft") {
-				setModelOptions(ref, { draft: (DRAFT_CYCLE as string[]).includes(value) ? (value as Draft) : "off" });
 			} else if (id === "timeout") {
 				if (value === EDIT_NUMBER) { if (onExit) { onExit(id); return; } rebuildList(); }
 				else setModelOptions(ref, { timeoutMs: parseDuration(value) });
@@ -4090,8 +4584,13 @@ class CategoryDescList implements Component, Focusable {
  *  the template editor so the insertable tags are visible while typing (2026-10-07 request). */
 const TEMPLATE_TAGS = [
 	"{SEGMENT SIZE}",
+	// A template carrying every rule as its own prose puts this marker in its text: nothing is then appended
+	// afterwards, neither the rules it omits nor the ledger-shape paragraph. See applyTemplate.
+	RULES_WRITTEN_OUT,
 	"{LENGTH INSTRUCTIONS}",
-	"{DRAFT INSTRUCTIONS}",
+	// The numbers the length block is made of, for a template that writes the block out in its own words.
+	// Substituted wherever they appear; see INLINE_LENGTH_TOKENS and applyTemplate.
+	...INLINE_LENGTH_TOKENS,
 	"{PREVIOUS SUMMARY SECTION}",
 	"{USER PROMPT SUMMARY}",
 	"{ASSISTANT REPLIES SUMMARY}",
@@ -4254,7 +4753,7 @@ class UserTemplateMenu implements Component, Focusable {
 				label: "View the summary request (template, prompt, session digest)",
 				currentValue: firstRef ? firstRef.split("/").pop() ?? "?" : "no model",
 				values: ["open"],
-				description: "ENTER OPENS IT: the WHOLE text the summarizer gets, exactly as it is sent - the active template with every tag filled in for this session (the size block, the preserve rules, the draft block), the previous-summary line, the cover line, the conversation region between the tags, and the system prompt that rides above it all. Read-only, nothing is sent. The name on the right is the first model in the compaction try order: it is the one that would be asked, and its settings are what fill the tags.",
+				description: "ENTER OPENS IT: the WHOLE text the summarizer gets, exactly as it is sent - the active template with every tag filled in for this session (the size block, the preserve rules), the previous-summary line, the cover line, the conversation region between the tags, and the system prompt that rides above it all. Read-only, nothing is sent. The name on the right is the first model in the compaction try order: it is the one that would be asked, and its settings are what fill the tags.",
 			},
 			{
 				id: "__reqfull",
@@ -4681,6 +5180,7 @@ async function previewDescription(ctx: Ctx, ref: string): Promise<void> {
 	const text = buildInstructions({
 		sizes,
 		inputTokens,
+		segmentTokens: inputTokens - SUMMARISER_FRAMING_TOKENS,
 		kind: isLocalModel(model) ? "local" : "online",
 		options: profile,
 		additionalInstruction: cfg.additionalInstruction,
@@ -5041,10 +5541,9 @@ class CompactionMenu implements Component, Focusable {
 				description:
 					"The plugin measures the context before every request to the model - including the requests inside a long tool-calling run - and compacts when the line is passed, so a working session compacts on its own instead of reaching the end of the window. Nothing to switch here: the switch above starts and stops it, and the start point in Auto-compaction settings is the line. The same check runs on a timer while the agent is idle, which covers a model switch: a bigger window moves the line at once.",
 			},
-			// 2026-10-07: the settings.json trigger line (syncTriggerClock) is NO LONGER CALLED - see the
-			// trigger row above. Its helpers stay: releasePiTriggerLine() is called on shutdown and on
-			// startup, so a session that starts with this extension off hands back any line an earlier
-			// version wrote, and pi's own block is restored if nobody changed it.
+		// pi's own compaction settings are read for information only. This extension never writes
+		// that file: it compacts on its own trigger with its own models, which works whether pi's
+		// flag is on or off, and leaves pi's own summary path out of the picture while it is off.
 			numberRow("retries", "Retries per model", String(cfg.retries), [], "How many times the next model in the list is tried when one fails."),
 			numberRow("retryWait", "Wait between retries", `${cfg.retryDelaySeconds} s`, [], "Seconds to wait before trying the next model."),
 			{
@@ -5083,14 +5582,6 @@ class CompactionMenu implements Component, Focusable {
 				values: [EDIT_NUMBER],
 				description:
 					"A summary longer than this is thrown away too. One setting for every model.",
-			},
-			{
-				id: "draft",
-				label: "Draft block (all models):",
-				currentValue: `${o.draft}`,
-				values: withCurrent(DRAFT_CYCLE as string[], o.draft),
-				description:
-					"A hidden analysis the model writes first, in the same call, stripped before the summary is stored. One setting for every model.",
 			},
 			{
 				id: "inputstubs",
@@ -5152,11 +5643,11 @@ class CompactionMenu implements Component, Focusable {
 			// belong next to the compaction switches, not on the top level.
 			{
 				id: "piReserve",
-				label: "pi's reserveTokens (stock fallback):",
-				currentValue: `${fmt(readPiReserveTokens())} tok`,
-				values: [EDIT_NUMBER],
+				label: `pi's own compaction numbers (read-only):`,
+				currentValue: `${fmt(readPiReserveTokens())} tok reserve`,
+				values: [],
 				description:
-					"Writes pi's OWN settings.json (compaction.reserveTokens) - the number the row above aims with. Applies ONLY to pi's built-in compaction (the row above, or the fallback when this extension is disabled or EVERY model failed). This extension itself never reads it (its own trigger lives in the Auto-compaction submenu above). pi caches its settings, so /reload is needed for the change to take effect.",
+					"pi's settings.json, read for information only - this extension never writes it. Those numbers apply only to pi's own compaction; this extension uses its own reserve and keep-recent numbers, which are the rows above.",
 			},
 			numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."),
 		];
@@ -5177,13 +5668,10 @@ class CompactionMenu implements Component, Focusable {
 						(this as unknown as { rebuild?: () => void }).rebuild?.();
 						return;
 					}
-					const piWasOn = readPiCompactionEnabled();
 					update((c) => void (c.enabled = on));
-					// 2026-10-07: switching us ON stops pi's own compaction (one compactor at a time - pi's
-					// summarizer must never be the one writing the summary). Switching us OFF hands pi's file
-					// back untouched, so any other manager keeps what it set (the fully-off rule of 2026-10-06).
-					if (on && piWasOn) writePiCompactionEnabled(false);
-					if (!on) releasePiTriggerLine(loadConfig());
+					// pi's own compaction is a separate thing in pi's own settings file, and this switch never
+					// touches it. The automatic trigger here is this extension's own check, which works with
+					// pi's flag either way - so switching pi's compaction off means off, and it stays off.
 					this.onAction(
 						"__exit:notice:" +
 							(on
@@ -5214,7 +5702,6 @@ class CompactionMenu implements Component, Focusable {
 					this.onAction(`__exit:edit-allmodels-number:${id}`);
 					return;
 				}
-				if (id === "draft") setModelOptions(first, { draft: value as never });
 				else if (id === "inputstubs") setModelOptions(first, { inputStubs: value === "stubs" });
 				else if (id === "preservestubs") setModelOptions(first, { preserveStubs: value as never });
 				else if (id === "preserveuser") setModelOptions(first, { preserveUser: value as never });
@@ -5556,7 +6043,7 @@ export class CompactionBoard implements Component, Focusable {
 					this.restore?.templateKey,
 				) as unknown as Component,
 			description:
-				"THE SUMMARY TEMPLATE - the exact text the summarizer reads (after the size/draft blocks). It contains {PLACEHOLDER} tokens the extension substitutes per model: {TOOL CALLS SUMMARY}, {USER PROMPT SUMMARY}, {ASSISTANT REPLIES SUMMARY}, {ASSISTANT THINKING SUMMARY}, {STUB EXAMPLE RULE}, {PREVIOUS SUMMARY RULE}, {PREVIOUS SUMMARY SECTION}. DO NOT reword or delete the {TOKENS} - each is replaced by the per-model option sentence (the editable wording of every token lives in the Category templates screen just below); a deleted token is auto-added at the end with a note. Everything else you write is sent word for word. Enter opens the template submenu: your template library (any number of saved templates, one of them made active), read-only previews of the active / user / extension template, and the resets (each asks first).",
+				"THE SUMMARY TEMPLATE - the exact text the summarizer reads (after the size block). It contains {PLACEHOLDER} tokens the extension substitutes per model: {TOOL CALLS SUMMARY}, {USER PROMPT SUMMARY}, {ASSISTANT REPLIES SUMMARY}, {ASSISTANT THINKING SUMMARY}, {STUB EXAMPLE RULE}, {PREVIOUS SUMMARY RULE}, {PREVIOUS SUMMARY SECTION}. DO NOT reword or delete the {TOKENS} - each is replaced by the per-model option sentence (the editable wording of every token lives in the Category templates screen just below); a deleted token is auto-added at the end with a note. Everything else you write is sent word for word. Enter opens the template submenu: your template library (any number of saved templates, one of them made active), read-only previews of the active / user / extension template, and the resets (each asks first).",
 		});
 		rows.push({
 			id: "catDesc",
@@ -5952,8 +6439,8 @@ async function previewRequest(ctx: Ctx, ref: string, full = false): Promise<void
 	const main = serializeRegion(region, { startTurn: prevTurn.lastTurn, inputStubs: profile.inputStubs, argCap: profile.argCap });
 	const keptText = kept.map((m: any) => `[${String(m.role)} - kept]: ${contentTextOf(m.content).slice(0, 400)}`).join("\n\n");
 	const inputTokens = Math.ceil((main.text.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
-	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, draft: profile.draft, windowTokens: (ctx as any)?.model?.contextWindow ?? 0 }, 0);
-	const instructions = buildInstructions({ sizes, inputTokens, kind: isLocalModel(model) ? "local" : "online", options: profile, additionalInstruction: cfg.additionalInstruction ?? null, userDefault: cfg.templateUserDefaults, customInstructions: undefined });
+	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: (ctx as any)?.model?.contextWindow ?? 0 }, 0);
+	const instructions = buildInstructions({ sizes, inputTokens, segmentTokens: inputTokens - SUMMARISER_FRAMING_TOKENS, kind: isLocalModel(model) ? "local" : "online", options: profile, additionalInstruction: cfg.additionalInstruction ?? null, userDefault: cfg.templateUserDefaults, customInstructions: undefined });
 	// 2026-10-07 ORDER FIX ("it shows random code, not the request"): the conversation region used to come
 	// FIRST, and in a session full of scripts and JSON that is a wall of code, with the filled template
 	// pushed off the bottom. The request is presented in the order a reader wants it: the INSTRUCTIONS (the
@@ -5971,7 +6458,7 @@ async function previewRequest(ctx: Ctx, ref: string, full = false): Promise<void
 		];
 	const text = [
 		`REQUEST PREVIEW - everything ${ref} would receive for a compaction of this session (nothing is sent).`,
-		`PART 1 OF 3 - THE INSTRUCTIONS: the ACTIVE template with every tag filled in for this session - the size block, the preserve rules, the draft block, the previous-summary rule, your extra instruction.`,
+		`PART 1 OF 3 - THE INSTRUCTIONS: the ACTIVE template with every tag filled in for this session - the size block, the preserve rules, the previous-summary rule, your extra instruction.`,
 		instructions,
 		`PART 2 OF 3 - THE SYSTEM PROMPT that rides above everything:`,
 		COMPACTOR_SYSTEM_PROMPT,
@@ -6106,10 +6593,10 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			new CompactionBoard(tui, theme, ctx, done, restore);
 		const result = (await ctx.ui.custom(factory)) as BoardResult | undefined;
 		if (!result?.action) return;
-		// The two compaction switches answer with a capital-letters notice - one compactor at a time.
-	// Safety net for the submenu action protocol (2026-10-07): a submenu marks an action with __exit: and
-	// the board strips it before handing it here. When an action arrives with the marker still on it, the
-	// nesting added it twice - perform it as the plain action instead of falling to the warning below.
+		// pi's compaction flag is read for information only and never written by this extension.
+		// The automatic trigger here is this extension's own: it measures the live context and starts
+		// the compaction itself, so with pi's flag off automatic compaction still works - and pi never
+		// writes a summary of its own. The coupling that armed pi's flag is deleted for good.
 	if (result.action?.startsWith("__exit:")) result.action = result.action.slice("__exit:".length);
 	if (result.action?.startsWith("notice:")) {
 			// 2026-10-07 BUG FIX: these are the two compaction switches, and this used to QUIT the settings
@@ -6436,7 +6923,6 @@ const NUMBER_EDITORS: Record<string, { title: string; lo: number; hi: number; un
 	elisionCap: { title: "Max tool results per batch", lo: 1, hi: 500, unit: "results", def: 40, apply: (v) => { update((c) => void (c.elision = { ...c.elision, maxResultsPerBatch: v })); return undefined; } },
 	chatCap: { title: "Chat max_tokens cap", lo: 0, hi: 2_000_000, unit: "tokens (0 = no cap)", def: 65_536, apply: (v) => { update((c) => void (c.chatMaxTokensCap = v)); return undefined; } },
 	retries: { title: "Retries per model", lo: 0, hi: 99, unit: "tries (0 = no retries)", def: 2, apply: (v) => { update((c) => void (c.retries = v)); return undefined; } },
-	piReserve: { title: "pi's reserveTokens (stock compaction fallback)", lo: 0, hi: 10_000_000, unit: "tokens", def: 16_384, apply: (v) => { writePiReserveTokens(v); return undefined; } },
 };
 
 async function editNumber(ctx: Ctx, id: string): Promise<void> {
@@ -6560,12 +7046,6 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 				},
 			},
 			{
-				label: `Draft block - now ${o.draft}`,
-				hint: "A hidden analysis before the summary in the same call, stripped before storing. off / mini / full. Online defaults full, local off (a full draft doubles a slow summary).",
-				run: async () => {
-					const chosen = await ctx.ui.select("Draft block", withCurrent(DRAFT_CYCLE, o.draft));
-					if (chosen !== undefined) setModelOptions(ref, { draft: (DRAFT_CYCLE as string[]).includes(chosen) ? (chosen as Draft) : "off" });
-				},
 			},
 			{
 				label: `Summary timeout period - now ${timeoutLabel(o.timeoutMs)}`,
@@ -6677,24 +7157,30 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 		const rows: Row[] = [
 			{
 				label: `Compaction (this extension) - ${cfg.enabled ? "ON" : "OFF"}`,
-				hint: `Tried in this order until one writes a usable summary: ${rotationText(cfg, ctx)}. ONE compactor is ever on: turning this ON turns pi's own compaction OFF.`,
+				hint: `Tried in this order until one writes a usable summary: ${rotationText(cfg, ctx)}. The automatic trigger is this extension's own check of the live context, and /compact works while this is off. pi running its own compaction is a separate setting in pi's own settings.json, which this menu never writes; see the row below it.`,
 				run: () => {
-					const piWasOn = readPiCompactionEnabled();
 					const on = !loadConfig().enabled;
-					if (on && enableBlockedByOtherCompactor()) return; // ONE COMPACTOR (2026-10-07)
+					if (on && enableBlockedByOtherCompactor()) return; // another manager present: one at a time
 					update((c) => void (c.enabled = on));
-					if (on && piWasOn) writePiCompactionEnabled(false);
-					ctx.ui?.notify?.(on ? "COMPACTION IS ON" + (piWasOn ? " - AND PI'S OWN COMPACTION WAS SWITCHED OFF IN THE SAME ACTION: ONE COMPACTOR AT A TIME." : ".") + " pi reads its own settings.json at startup, so /reload to make pi's side stick." : "THIS EXTENSION'S COMPACTION IS OFF. pi's own compaction stays as it is - if it was off too, NOTHING COMPACTS ANY MORE until one of the two is on.", "info");
+					ctx.ui?.notify?.(
+						on
+							? "COMPACTION IS ON. This extension compacts on its own trigger, with its own models, and /compact is answered by this extension. pi's own compaction is untouched by this switch - it lives in " + join(AGENT_DIR, "settings.json") + ", and while it stays on pi can compact by itself with pi's own summariser."
+							: "COMPACTION IS OFF. Nothing of this extension compacts or elides any more; pi is left exactly as its own settings have it.",
+					"info",
+					);
 				},
 			},
 			{
-				label: `pi's built-in compaction - ${readPiCompactionEnabled() ? "ON (needs /reload)" : "off"}`,
-				hint: "pi writes the summary with the session model, on pi's own trigger, from pi's settings.json. ONE compactor is ever on: turning this ON switches this extension's compaction OFF. A change here does nothing until /reload.",
+				label: `pi's own compaction (read-only) - ${readPiCompactionEnabled() ? "ENABLED in pi's settings" : "disabled in pi's settings"}`,
+				hint: "This menu never writes pi's settings. That flag only decides whether pi runs its own compaction with its own summariser on pi's own threshold check; it does not gate /compact, and it does not gate this extension's automatic compaction, which runs on this extension's own trigger with its own models. To change it, edit compaction.enabled in " + join(AGENT_DIR, "settings.json") + " by hand and /reload.",
 				run: () => {
-					const on = !readPiCompactionEnabled();
-					const wrote = writePiCompactionEnabled(on);
-					update((c) => void (on ? (c.enabled = false) : c));
-					ctx.ui?.notify?.(!wrote ? "COULD NOT WRITE PI'S settings.json - EDIT IT BY HAND (compaction.enabled)." : on ? "PI'S OWN COMPACTION IS NOW ON AND THIS EXTENSION'S COMPACTION IS NOW OFF - ONE COMPACTOR AT A TIME. pi reads settings.json at startup, so NOTHING CHANGES UNTIL YOU /RELOAD." : "PI'S OWN COMPACTION IS NOW OFF. THIS EXTENSION'S COMPACTION WAS ALREADY OFF TOO, SO NOTHING COMPACTS UNTIL YOU TURN ONE OF THEM ON. /reload to make pi's setting stick.", "info");
+					const f = join(AGENT_DIR, "settings.json");
+					ctx.ui?.notify?.(
+						readPiCompactionEnabled()
+							? `pi's OWN compaction is ENABLED in ${f} (compaction.enabled). This extension never writes that file. While it stays on, pi can compact by itself with pi's own summariser, and it will if this extension is ever stopped by an error. Set the flag to false there and /reload to keep pi's own checks off for good.`
+							: `pi's own compaction is disabled in ${f}: pi will not compact by itself, on the threshold check or after an overflow. This extension still compacts on its own trigger, automatically and on /compact.`,
+					"info",
+					);
 				},
 			},
 			{ label: "Compaction models", hint: "Pick, place (digits), remove (space) and tune models. Number 1 is asked first.", run: () => orderMenuFallback(ctx) },
@@ -6741,7 +7227,7 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 	const reserve = extReserve(ctx as Ctx);
 	const lines: string[] = [
 		`Compaction models, in try order (if all fail, pi's own compaction runs):`,
-		`  trigger: estimate crosses window - ${fmt(reserve)} tok · auto-compact while idle: ${cfg.autoCompact ? (cfg.autoCompactPaused ? "ON BUT PAUSED (a manual compaction resumes it)" : "ON") : "off"} · chat max_tokens cap: ${cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "off"}`,
+		`  trigger: estimate crosses window - ${fmt(reserve)} tok · auto-compact while idle: ${cfg.autoCompact ? (parkedThisSession(cfg, ctx) ? "PARKED FOR THIS SESSION (a manual compaction arms it again)" : "ON") : "off"} · chat max_tokens cap: ${cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "off"}`,
 	];
 	const refs = Object.keys(cfg.models);
 	refs.forEach((ref, i) => {
@@ -6749,7 +7235,7 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 		const o = optionsFor(cfg, ref, model);
 		const th = model ? effectiveThinking(o.thinking, model) : { level: o.thinking, note: "" };
 		lines.push(
-			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${o.summaryPercent}% of the ctx window, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, thinking ${th.level}, draft ${o.draft}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
+			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${o.summaryPercent}% of the ctx window, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, thinking ${th.level}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
 		);
 	});
 	lines.push(`retries: ${cfg.retries} per model, ${cfg.retryDelaySeconds}s apart · no-think tag: ${cfg.noThinkMarker || "(empty)"} · additional instruction: ${cfg.additionalInstruction ? "custom" : "default (turn ledger)"} · transcript pointer: ${cfg.transcriptPointer ? "on" : "off"}`);
@@ -6769,6 +7255,177 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
  *  -> this fork's rotation) the moment the estimate crosses window - extReserve. The line is
  *  recomputed every tick, so a mid-session model switch moves it with zero /reload. */
 let watcherCtx: Ctx | null = null;
+/**
+ * Set when this extension's own watcher fires while the loop is mid-turn. pi's compact() begins by
+ * aborting what is running and pi never resumes an interrupted turn on its own, so a mid-turn trigger
+ * would otherwise end the session's work until the user types something (2026-10-18: that is exactly
+ * what it did, on a 55-minute turn, with nothing left to defer to). Armed here, spent by the
+ * session_compact handler below once the summary is really in the journal, and expired by age so a
+ * cancelled compaction cannot resume a turn much later.
+ */
+const autoResumeTurn = { armed: false, warnedLongWait: false, atMs: 0, tries: 0, timer: undefined as any };
+/** pi's own API object, remembered at install. Everything else in this file reaches pi through a handler's
+ *  parameter; these hand-back helpers run from a timer, with no handler on the stack, so the object has to be
+ *  kept. It is the same object pi passes to every handler - this is a reference, not a second path into pi.
+ */
+let extApi: any;
+/** The sentence the interrupted turn is picked up with. Short on purpose: it is a nudge, not a brief - the
+ *  summary above it already says what the work was and what comes next.
+ */
+const HAND_BACK_TEXT =
+	"The automatic compaction landed and interrupted the turn that was running. Continue that work from the summary above: do not greet me, do not re-read what you had already read, and do not redo a step the summary marks as finished. Pick up at the current point.";
+
+/** Queue one attempt at the hand-back. One flight at a time: while a timer is pending, further nudges from
+ *  other events are no-ops, so agent_settled and session_compact cannot stack up attempts that each send a
+ *  message of their own.
+ */
+function scheduleHandBack(ms: number, api: any = extApi): void {
+	if (autoResumeTurn.timer !== undefined) return;
+	autoResumeTurn.timer = setTimeout(() => {
+		autoResumeTurn.timer = undefined;
+		void tryHandBack(api);
+	}, ms);
+	(autoResumeTurn.timer as unknown as { unref?: () => void })?.unref?.();
+}
+
+/** Arm the hand-back: a mid-run crossing is about to interrupt a turn, and that turn must not wait for a
+ *  keystroke. Spent by tryHandBack when pi accepts the message, dropped when pi refuses for good, and expired
+ *  by age so a compaction that was cancelled cannot resume a turn much later.
+ */
+function armHandBack(): void {
+	autoResumeTurn.armed = true;
+	autoResumeTurn.atMs = Date.now();
+	autoResumeTurn.tries = 0;
+	autoResumeTurn.warnedLongWait = false;
+}
+
+/** Stop expecting a hand-back: a settled crossing interrupts nothing, and a compaction rotation that failed
+ *  twice lands no summary to continue from. Only says so in the log if something had already been attempted,
+ *  because "nothing was ever armed" and "we gave up trying" are different facts worth different records.
+ */
+function cancelHandBack(why: string): void {
+	const wasArmed = autoResumeTurn.armed;
+	const attempted = autoResumeTurn.tries > 0;
+	if (autoResumeTurn.timer !== undefined) {
+		clearTimeout(autoResumeTurn.timer);
+		autoResumeTurn.timer = undefined;
+	}
+	autoResumeTurn.armed = false;
+	autoResumeTurn.tries = 0;
+	autoResumeTurn.warnedLongWait = false;
+	if (wasArmed && attempted) logLine(loadConfig(), { event: "auto_resume_cancelled", note: why });
+}
+
+/** Whether the user took the session back on their own before the hand-back could go out. Their own message
+ *  IS the resumption; sending ours as well would only talk over them. Newest-first, so the scan stops at the
+ *  first user entry it finds, whatever that entry's date turns out to be.
+ */
+function userSpokeSince(atMs: number, ctx: any): boolean {
+	try {
+		const branch: any[] = (ctx as any)?.sessionManager?.getBranch?.() ?? [];
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const e = branch[i];
+			if (!e || e.type !== "message" || e.message?.role !== "user") continue;
+			const t = Date.parse(String(e.timestamp ?? ""));
+			return Number.isFinite(t) ? t >= atMs - 2_000 : true;
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
+/** THE HAND-BACK ITSELF - and why it runs on a timer instead of inline.
+
+ *  The first version sent the continuation from inside the session_compact handler and wrote a log line
+ *  saying the turn had been handed back. Nothing reached the transcript. pi's compact() emits session_compact
+ *  while its own _compactionAbortController is still set, and clears that state a few lines later, with a
+ *  comment that says the quiet part out loud: "compaction_end listeners may submit queued prompts, so expose
+ *  idle state before notifying them". A prompt submitted from the handler dies on pi's guard, "Cannot submit
+ *  a prompt while compaction is in progress" - and because sendUserMessage returns a promise nobody was
+ *  waiting for, that refusal was thrown into the wind: no log, no notice on screen, summary in place, turn
+ *  unresumed. The user's words for it: "it did NOT resume after it".
+ *
+ *  compaction_end never reaches an extension (it is not in the extension event union), so the fix is to
+ *  submit the message at a moment pi will take it: wait for the session to be idle, retry while pi still
+ *  refuses, keep the whole thing inside the 20-minute age limit, and record what actually happened - took it,
+ *  still waiting, refused for good, or not needed because the user got there first.
+ */
+async function tryHandBack(api: any = extApi): Promise<void> {
+	if (!autoResumeTurn.armed) return;
+	const cfg = loadConfig();
+	const waited = Date.now() - autoResumeTurn.atMs;
+	if (waited > 1_200_000) {
+		cancelHandBack("the armed continuation went stale");
+		logLine(cfg, {
+			event: "auto_resume_dropped",
+			seconds: Math.round(waited / 1000),
+			note: "the armed continuation was older than 20 minutes, so nothing was sent",
+		});
+		(watcherCtx as any)?.ui?.notify?.("The summary landed, but the automatic continuation went stale. Send any message and the work carries on from the summary.", "warning");
+		return;
+	}
+	if (userSpokeSince(autoResumeTurn.armed ? autoResumeTurn.atMs : 0, watcherCtx)) {
+		cancelHandBack("a message from the user resumed the session first");
+		logLine(cfg, {
+			event: "auto_resume_not_needed",
+			seconds: Math.round(waited / 1000),
+			note: "a user message landed after the interrupt, so the session was already moving again",
+		});
+		return;
+	}
+	// pi's own idle check covers "no active agent run, compaction, branch summary, retry, or queued
+	// continuation", which is exactly the state in which a prompt is accepted. If the context says busy, wait:
+	// the price of waiting is two seconds, the price of guessing wrong is a lost turn.
+	if ((watcherCtx as any)?.isIdle?.() === false) {
+		// Deliberately silent (2026-10-19, on request). This line went out every two seconds for the
+		// whole length of a compaction - 423 identical entries in one episode - which buried the one
+		// thing worth reading, namely which model was writing the summary. A wait is the expected
+		// state while pi holds the session busy, so it earns no log line at all. The one case that
+		// does is a wait that has gone on past a minute with no compaction running: that is no longer
+		// a wait, it is being stuck, and it says so once.
+		if (Date.now() - autoResumeTurn.atMs > 60_000 && !autoResumeTurn.warnedLongWait) {
+			autoResumeTurn.warnedLongWait = true;
+			logLine(cfg, {
+				event: "auto_resume_waiting",
+				seconds: Math.round((Date.now() - autoResumeTurn.atMs) / 1000),
+				note: "no continuation has gone out for over a minute and no compaction is running - something is holding the session",
+			});
+			watcherCtx?.ui?.notify?.("The automatic continuation has been waiting over a minute; send any short message and the work picks up from the summary.", "warning");
+		}
+		scheduleHandBack(2_000, api);
+		return;
+	}
+	autoResumeTurn.tries += 1;
+	try {
+		// No deliverAs: the session is idle, so pi appends the message and starts the turn now. Passing
+		// "followUp" was the other half of the old bug - it queued the message into a queue that a run which
+		// had just been aborted never comes back to drain.
+		await api?.sendUserMessage?.(HAND_BACK_TEXT);
+		autoResumeTurn.armed = false;
+		logLine(cfg, {
+			event: "auto_resume_turn",
+			seconds: Math.round(waited / 1000),
+			tries: autoResumeTurn.tries,
+			note: "pi took the continuation, so the interrupted turn is running again",
+		});
+	} catch (err: any) {
+		const msg = String(err?.message ?? err);
+		// pi's own wording for the two cases that ask to be tried again: compaction still in progress, and the
+		// agent already processing something. Anything else is a refusal nobody asked us to work around.
+		const later = /compaction is in progress|already processing|wait for/i.test(msg);
+		if (later && autoResumeTurn.tries < 150) {
+			if (autoResumeTurn.tries === 1 || autoResumeTurn.tries % 15 === 0) {
+				logLine(cfg, { event: "auto_resume_retrying", tries: autoResumeTurn.tries, seconds: Math.round(waited / 1000), note: msg.slice(0, 160) });
+			}
+			scheduleHandBack(2_000, api);
+			return;
+		}
+		cancelHandBack(later ? "pi kept refusing the prompt for five minutes of retries" : "pi refused the prompt and did not ask for a retry");
+		logLine(cfg, { event: "auto_resume_failed", tries: autoResumeTurn.tries, error: msg.slice(0, 200) });
+		(watcherCtx as any)?.ui?.notify?.("The summary landed, but the automatic continuation failed. Send any message and the work carries on from the summary.", "warning");
+	}
+}
 let lastAutoTriggerMs = 0;
 /** The watcher writes its "nothing to do" decision at most once every five minutes. */
 let lastWatchLogMs = 0;
@@ -6780,6 +7437,235 @@ let compactionInFlight = false;
  *  left to pi itself. */
 let skipNextStockCompaction = false;
 const WATCHER_INTERVAL_MS = 5_000;
+
+/**
+ * WHAT THE AGENT LOOP IS DOING RIGHT NOW, kept current from pi's own events.
+ *
+ * WHY THIS EXISTS (2026-10-14, twice in one session). The watcher used to start a compaction whenever the
+ * size crossed the line, at any moment, because 2026-10-07 had removed the idle gate on the theory that a
+ * long working turn must not be allowed to overflow. What that actually bought was this: ctx.compact() took
+ * pi's abort signal with it, so the request in flight died with "This operation was aborted" - a bash tool
+ * cut off 0.5 s into running, a turn whose only output was an abort - and the turn never restarted, so the
+ * session sat there while the summary ran and after it. Then the summary, asked to compress an already
+ * compacted conversation, answered "Nothing to compact (session too small)" and read as a second error.
+ * The trigger also mistook the on-disk history for the live context and believed it was 234,591 tokens in
+ * a 20,300-token conversation (see measureContext), which is what made it knock at all.
+ *
+ *
+ * WHAT THAT BOUGHT, AND WHY IT IS NOW HALF-REVERSED (2026-10-15, written down because the pendulum has swung
+ * twice). Started only at a settled point, the trigger fired 10,000 tokens LATE in a session that had already
+ * crossed its line, and the summary it finally ran at 178,039 tokens was too late to cover the newest material:
+ * the ledger it wrote got as far as the seventeenth turn and stopped mid-sentence, so the eighteenth prompt was
+ * neither summarised nor kept, which is what the user read as "all the newer prompts are missing". Meanwhile
+ * pi's own between-rounds check - the one non-aborting mid-run trigger there is - was silent the whole time.
+ * Why is still open: the guess written into this file the same evening, that pi's measure sits 20,000-30,000
+ * tokens under the real fill because a projection holds no system prompt and no tool schemas, was taken out by
+ * its own regression test hours later, because the newest usage figure already counts the whole request it
+ * answered - system prompt, tool schemas and all - and pi only adds a size guess on top of it, so its measure
+ * is at least as big as ours. The padding was never written to pi's settings; what is left of that theory is a
+ * log field, piMeasureDelta, and the answer will come from those numbers rather than from this paragraph.
+ * What is not in doubt is that a settled-only rule left the session walking from the line to the wall by itself.
+ *
+ * The rule now is: a compaction may start WHILE THE LOOP WORKS, at a round boundary. Measuring happens at any
+ * moment; starting happens when nothing is answering, no tool is running, nothing is queued for the next round,
+ * and every tool call the newest answer asked for has its result back - that is the boundary between rounds,
+ * and it recurs many times in a long turn. It is still not free: ctx.compact() is pi's manual path and pi's own
+ * source begins it with `await this.abort()`, so a start mid-run interrupts the turn, and threshold compaction
+ * does not resume it. That is the price, and it is now accepted deliberately, because the alternative measured
+ * out worse: one interrupted turn against a session that reaches 200,000 tokens and is refused, and a refused
+ * session cannot be compacted at all. On top of that, within MIDRUN_DANGER_TOKENS of the window the niceties go
+ * out of the window with them and the compaction starts in front of running tools rather than not at all.
+ * Elision, the capped max_tokens and the engine's own fit_max_tokens clamp guard the quiet part of a turn
+ * exactly as before.
+ */
+const agentLoop = {
+	running: false,
+	sinceMs: 0,
+	tools: 0,
+	promptOpen: false,
+	/** Requests this process has sent and has not seen answered yet, recorded as a PAIR OF TIMESTAMPS rather
+	 *  than a counter, and only trusted while the evidence is young. The reason: the watcher's timer and the
+	 *  settle check work from a context object picked up on an earlier event, and ctx.signal captured mid-run
+	 *  stays set on that object afterwards - reading it blindly would have meant a trigger that silently never
+	 *  fires again after one long turn, the invisible dead-switch this file warns about elsewhere. A counter
+	 *  alone would have the same flaw in a subtler form (one response event missing - a request killed before
+	 *  headers, a proxy that never logged it - and the trigger is blocked for the rest of the session), so the
+	 *  evidence expires: an unanswered request holds the trigger for at most ten minutes, and a healthy pair
+	 *  of events releases it the moment the answer lands. */
+	requestsOut: 0,
+	requestStartedAtMs: 0,
+	requestAnsweredAtMs: 0,
+	lastToolEndAtMs: 0,
+	lastSettledAtMs: 0,
+	lastAbortAtMs: 0,
+};
+/** The pause is at most half an hour in this build (see auto_compaction_resumed); three refusals in a
+ *  quarter of an hour mean the trigger is firing somewhere it cannot possibly find work, so park it. */
+const noOpStrikes = { n: 0, windowStartMs: 0 };
+let settleCheckTimer: ReturnType<typeof setTimeout> | undefined;
+/** "Over the line but not at a safe point" is written down at most once a minute. */
+let lastHoldLogMs = 0;
+/** ... and the one alarm that deserves the screen - the live wire really is near the window - once per 5 min. */
+let lastHoldNoticeAtMs = 0;
+
+/** Start a fresh 15 minute window every time one expires. */
+function countNoOpStrike(nowMs: number): number {
+	if (nowMs - noOpStrikes.windowStartMs > 900_000) {
+		noOpStrikes.windowStartMs = nowMs;
+		noOpStrikes.n = 0;
+	}
+	noOpStrikes.n += 1;
+	return noOpStrikes.n;
+}
+
+/**
+ * Can a compaction start right now without disturbing anything? Returns the reason it cannot, so the log
+ * says which door was shut. Everything here is an API pi really exports (types.d.ts: isIdle(), signal,
+ * hasPendingMessages()) or a fact this file observes itself; the 2026-10-07 gates read ctx.compaction.*,
+ * which is not a member of ExtensionContext at all, so those three checks were dead code and silently
+ * never gated anything.
+ */
+// How long after an answer lands, or a tool finishes, the mid-run gate still waits before it will start a
+// compaction. The race it buys off is the one the user was bitten by on 2026-10-14 at 14:53:34: an answer
+// arrives, its tool calls have not begun to execute yet, and a start in that gap aborts a tool 0.5 s into
+// running it. One second is longer than pi needs to commit to the next round or to its tools.
+const MIDRUN_DWELL_MS = 1200;
+/** Within this many tokens of the whole window the mid-run gates stop holding: a session that gets refused
+ *  for want of room cannot be compacted at all, so an interrupted turn is the better of the two outcomes. */
+const MIDRUN_DANGER_TOKENS = 12_000;
+
+/**
+ * THE ROUND BOUNDARY (2026-10-15). Whether the newest answer's tool calls have all come back with their
+ * results, read off the projection rather than off event timing, because event timing has a gap in it: a
+ * response event can land a tick before the first tool_execution_start of the same round, and a start inside
+ * that gap is what used to abort a tool that had only just begun. Returns 0 when the round is closed (the
+ * newest answer asked for nothing, or every call it asked for has its result, or a newer answer has already
+ * followed it), otherwise the number of calls still owed a result.
+ */
+function pendingToolCalls(ctx: any): number {
+	try {
+		const projection: any = (ctx as any)?.sessionManager?.buildSessionProjection?.();
+		if (!projection?.entries) return 0;
+		const all: any[] = [];
+		for (const e of projection.entries) for (const m of e?.messages ?? []) all.push(m);
+		for (let i = all.length - 1; i >= 0; i--) {
+			const m: any = all[i];
+			if (m?.role !== 'assistant') continue;
+			const want: string[] = [];
+			for (const b of Array.isArray(m.content) ? m.content : []) {
+				if (!b) continue;
+				if (b.type === 'toolCall' || b.type === 'tool-call' || b.type === 'tool_use' || b.type === 'function_call') {
+					const id = b.id ?? b.toolCallId ?? b.callId;
+					if (id) want.push(String(id));
+				}
+			}
+			if (!want.length) return 0; // the newest answer asked for no tools: this round is closed
+			const got = new Set<string>();
+			for (let j = i + 1; j < all.length; j++) {
+				const r: any = all[j];
+				if (r?.role === 'assistant') break; // a newer answer already followed: this round is closed too
+				if (r?.role !== 'toolResult') continue;
+				if (r.toolCallId) got.add(String(r.toolCallId));
+				for (const part of Array.isArray(r.content) ? r.content : []) if (part?.toolCallId) got.add(String(part.toolCallId));
+			}
+			return want.filter((id) => !got.has(id)).length;
+		}
+		return 0;
+	} catch {
+		return 0;
+	}
+}
+
+export function compactSafePoint(ctx: any, freshCtx = false, urgent = false): { ok: boolean; why: string; midRun: boolean } {
+	// A park is honoured here as well as in the watcher (2026-10-17), so a future caller cannot
+	// slip past it: until a manual compaction re-arms the trigger, no gate here may green-light one.
+	if (parkedThisSession(loadConfig(), ctx)) return { ok: false, why: "parked for this session until a manual compaction", midRun: false };
+	const midRun = agentLoop.running === true;
+	const hold = (why: string) => ({ ok: false, why, midRun });
+	if (compactionInFlight) return hold('a compaction is already in flight');
+	if (agentLoop.requestStartedAtMs > agentLoop.requestAnsweredAtMs && Date.now() - agentLoop.requestStartedAtMs < 600_000) {
+		return hold(`a provider request has gone unanswered for ${Math.round((Date.now() - agentLoop.requestStartedAtMs) / 1000)} s`);
+	}
+	// A signal is only evidence when it came with the event now being handled; the caller that holds an old
+	// context object is answered by the request counter above.
+	if (freshCtx && (ctx as any)?.signal) return hold('a provider request is in flight');
+	if (agentLoop.promptOpen) return hold('a dialog is open on screen');
+	if (urgent) {
+		// Past the danger line the mid-run gates below are set aside rather than waited out: with a request
+		// answered and nothing unanswered, tools may well still be running, and a turn that is interrupted is
+		// the cheaper loss next to a session the engine refuses to answer. A dialog on screen and a compaction
+		// already running still hold, because those two cannot be recovered by sending another message.
+		return {
+			ok: true,
+			why: midRun
+				? agentLoop.tools > 0
+					? `the danger line - starting in front of ${agentLoop.tools} running tool(s) and ${pendingToolCalls(ctx)} tool call(s) still owed a result, because waiting for them would let the context get refused`
+					: `past the danger line mid-run, between rounds (${agentLoop.sinceMs ? `${Math.round((Date.now() - agentLoop.sinceMs) / 1000)} s into the turn` : 'mid-run, the loop has not been timed this turn'})`
+				: 'the loop is settled and the context is at the danger line',
+			midRun,
+		};
+	}
+	if (agentLoop.tools > 0) return hold(`${agentLoop.tools} tool(s) are executing`);
+	// A tool result that just landed may not be in the transcript yet; pi's own rule waited a second after
+	// the last tool call for exactly this reason.
+	if (Date.now() - agentLoop.lastToolEndAtMs < MIDRUN_DWELL_MS) return hold('a tool only just finished');
+	if (midRun) {
+		// The turn is live. Start only in the pause between rounds, and only when nothing is queued for the
+		// round that is about to start: a steering message the user typed would otherwise die with the abort.
+		const owed = pendingToolCalls(ctx);
+		if (owed > 0) return hold(`${owed} tool call(s) from the newest answer have no result yet`);
+		if (agentLoop.requestAnsweredAtMs > 0 && Date.now() - agentLoop.requestAnsweredAtMs < MIDRUN_DWELL_MS) return hold('the newest answer only just landed');
+		if ((ctx as any)?.hasPendingMessages?.() === true) return hold('a message is queued for the next round');
+		return { ok: true, why: `between rounds, mid-run (${agentLoop.sinceMs ? `${Math.round((Date.now() - agentLoop.sinceMs) / 1000)} s into the turn` : 'mid-run, the loop has not been timed this turn'})`, midRun: true };
+	}
+	const idle = (ctx as any)?.isIdle?.();
+	if (idle === false) return hold('pi reports the agent is not idle');
+	return { ok: true, why: 'the loop is settled', midRun: false };
+}
+
+/**
+ * WHAT PI'S OWN BETWEEN-ROUNDS CHECK MEASURES, AS A SIGNED DIFFERENCE AGAINST THE WIRE (2026-10-15, written
+ * down because the first theory about it was wrong and the log is what will settle it). pi arms its mid-run
+ * trigger from `settings.compaction`, and its `_exceedsCompactionThreshold` asks
+ * `estimateProjectedContextTokens`, which is the newest usage figure in the projection plus a chars-per-3.5
+ * size guess over the entries that came after it. The obvious guess was that a projection holds no system
+ * prompt, no tool schema and none of the guidance this file appends, so pi's figure would sit some 20,000
+ * tokens under the fill the server really holds, and that a line written into pi's settings ought therefore to
+ * be padded by the shortfall. The regression harness says the arithmetic runs the other way: the newest usage
+ * figure already counts the whole request it answered - system prompt, tool schemas and all - and pi only adds
+ * to it, so its measure is at least as big as ours, and padding it would have made pi's line EARLIER than
+ * ours, not later. So this number is recorded and nothing more is done with it: it is the measurement that
+ * will show, scenario by scenario, why pi's check crosses or does not cross while this file's watchdog holds.
+ * Positive means pi sees more than the wire; negative means it sees less; a zero means there was no usage
+ * figure after the newest summary to go on, which is itself a reason a check cannot fire.
+ */
+function piMeasureDelta(ctx: any): number {
+	try {
+		const wire = measureContext(ctx).wire;
+		if (!(wire > 0)) return 0;
+		const projection: any = (ctx as any)?.sessionManager?.buildSessionProjection?.();
+		const msgs: any[] = projection?.messages ?? [];
+		if (!msgs.length) return 0;
+		let like = 0;
+		let usageAt: number | null = null;
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			const m: any = msgs[i];
+			if (m?.role !== 'assistant' || !m.usage) continue;
+			// The same rule as wireTokensOf: an answer that was aborted or errored describes the context as it
+			// was, so pi passes it over when it looks for the usage figure to build its estimate on.
+			if (m.stopReason === 'aborted' || m.stopReason === 'error') continue;
+			const u = m.usage;
+			like = u.totalTokens || (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+			usageAt = i;
+			break;
+		}
+		if (usageAt === null) return 0; // no usage to go on: pi falls back to estimating the lot, we cannot say
+		for (let i = usageAt + 1; i < msgs.length; i++) like += estimateTokens(msgs[i] as never);
+		return Math.max(-60_000, Math.min(60_000, Math.round(like) - wire));
+	} catch {
+		return 0;
+	}
+}
 
 /**
  * Keep pi's own compaction settings in step with this extension's trigger (2026-10-06). pi decides by
@@ -6796,88 +7682,44 @@ const WATCHER_INTERVAL_MS = 5_000;
  * compaction extension working in a completely different way, runs exactly as designed.
  * The command /compact-plus still exists: a command nobody calls does nothing.
  */
+/**
+ * pi's own compaction flag, reported to the user once per process. Every line of this extension
+ * READS pi's settings and not one writes them: the user switches pi's compaction on or off in pi's
+ * own file, and this extension's automatic trigger works with pi's flag either way, because pi's
+ * compact() and /compact ignore it - only pi's own threshold and overflow checks consult it.
+ * (2026-10-18: the coupling that armed pi's flag on every tick is deleted, after the user found
+ * pi's compaction enabled again without ever having enabled it, twice in as many days.)
+ */
+let piFlagAdvisoryShown = false;
+function adviseOnPiFlag(ctx: any, cfg: Config): void {
+	if (piFlagAdvisoryShown) return;
+	piFlagAdvisoryShown = true;
+	if (!readPiCompactionEnabled()) return;
+	logLine(cfg, {
+		event: "info",
+		note: `pi's own compaction is enabled in ${join(AGENT_DIR, "settings.json")} (compaction.enabled); this extension reads that flag and never writes it`,
+	});
+	ctx?.ui?.notify?.(
+		`Heads-up: pi's OWN compaction is still enabled in its settings (compaction.enabled = true). This extension never touches that file. While it stays on, pi can compact by itself with pi's own summariser, and it will do so if this extension is ever stopped by an error. To keep pi's compaction off for good, set compaction.enabled to false in ${join(AGENT_DIR, "settings.json")} and /reload.`,
+		"warning",
+	);
+}
+
 function fullyOff(cfg: Config): boolean {
 	return cfg.enabled !== true && cfg.elision.enabled !== true;
 }
 
-/** pi's settings file, the compaction block only. */
-function piSettingsPath(): string {
-	return join(AGENT_DIR, 'settings.json');
-}
-
-/**
- * Give pi back the compaction settings it had before this extension wrote them. Only does something
- * while we own them, and only if nobody else has changed them since - another extension's settings or a
- * hand edit are left exactly as they are.
- */
-function releasePiTriggerLine(cfg: Config): void {
-	try {
-		if (cfg.piLineOwned !== true) return;
-		const p = piSettingsPath();
-		const d: any = JSON.parse(readFileSync(p, 'utf8'));
-		const cur = d.compaction ?? {};
-		const orig = cfg.piLineOriginal;
-		const last = cfg.piLineWritten;
-		const untouched = !last
-			|| (cur.enabled === last.enabled && cur.reserveTokens === last.reserveTokens && cur.keepRecentTokens === last.keepRecentTokens);
-		if (orig && untouched) {
-			d.compaction = { ...cur, ...orig };
-			writeFileSync(p, JSON.stringify(d, null, 2), 'utf8');
-		}
-		update((c) => void (c.piLineOwned = false));
-		logLine(loadConfig(), {
-			event: 'trigger_clock_released',
-			restored: orig && untouched ? orig : 'left as it is - somebody else changed it',
-			note: "this extension no longer owns pi's compaction settings; while both switches are off it touches nothing",
-		});
-	} catch {
-		/* leave pi's file alone */
-	}
-}
-
-function syncTriggerClock(ctx: any, cfg: Config): void {
-	try {
-		const p = piSettingsPath();
-		const d: any = JSON.parse(readFileSync(p, 'utf8'));
-		const window = (ctx as any)?.model?.contextWindow ?? 0;
-		// Before the first write, remember pi's own block, so switching this extension off can give it back.
-		if (cfg.piLineOwned !== true || !cfg.piLineOriginal) {
-			const c0 = d.compaction ?? {};
-			update((c) => {
-				c.piLineOriginal = c.piLineOriginal ?? {
-					enabled: c0.enabled === true,
-					reserveTokens: typeof c0.reserveTokens === 'number' ? c0.reserveTokens : 16384,
-					keepRecentTokens: typeof c0.keepRecentTokens === 'number' ? c0.keepRecentTokens : 20000,
-				};
-				c.piLineOwned = true;
-			});
-		}
-		const want = {
-			enabled: cfg.enabled === true && cfg.autoCompact === true && cfg.triggerClockByPi === true,
-			reserveTokens: Math.max(1, Math.round(extReserve(ctx))),
-			keepRecentTokens: Math.max(1, Math.round(extKeepRecent(ctx))),
-		};
-		const cur = d.compaction ?? {};
-		if (cur.enabled === want.enabled && cur.reserveTokens === want.reserveTokens && cur.keepRecentTokens === want.keepRecentTokens) return;
-		d.compaction = { ...cur, ...want };
-		writeFileSync(p, JSON.stringify(d, null, 2), 'utf8');
-		update((c) => {
-			c.piLineOwned = true;
-			c.piLineWritten = want;
-		});
-		logLine(cfg, { event: 'trigger_clock', enabled: want.enabled, reserveTokens: want.reserveTokens, keepRecentTokens: want.keepRecentTokens, window, note: want.enabled ? 'pi checks the line before every request; the extension still writes every summary' : 'pi does not pull the trigger; the idle watcher is the only one' });
-	} catch {
-		/* pi's settings.json stays as it is; the idle watcher keeps working either way */
-	}
-}
 
 // 2026-10-07: THE START FLOOR, not a measuring floor. The context itself is measured on every tick and
 // on every request; this stamp only says how soon a compaction may be STARTED after the last one that
 // cleared the safe-point gates.
 let nextCheckAtMs = 0;
 
-function watcherTick(): void {
-	const ctx = watcherCtx;
+function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?: any): void {
+	// The `context` event hands its own context down, so its gate reads the signal of the request it is
+	// standing in front of; the timer and the settle check work from whichever context an event last left
+	// behind and are answered by the counters on agentLoop instead (see compactSafePoint).
+	const ctx = ctxArg ?? watcherCtx;
 	if (!ctx) return;
 	let cfg: Config;
 	try {
@@ -6885,52 +7727,45 @@ function watcherTick(): void {
 	} catch {
 		return;
 	}
-	// Keep pi's pre-request line equal to ours whenever this extension is the compactor (2026-10-06:
-	// the idle watcher alone cannot fire while the agent works, so a working session overflowed instead
-	// of compacting; pi's own pre-request check is the only point where a compaction can start mid-run).
 	// NOTHING COMPACTION-WORTHY HAPPENS WHILE COMPACTION IS OFF (2026-10-06): the timer is stopped
 	// rather than left running on a guard, and pi's settings file is handed back, so an off extension
 	// leaves no timer, no writes and no trigger behind for anybody else to trip over.
 	if (!cfg.enabled || !cfg.autoCompact) {
 		stopWatcherTimer();
-		if (fullyOff(cfg)) releasePiTriggerLine(cfg);
 		return;
 	}
-	// 2026-10-07: the settings.json trigger clock is GONE. The mid-run trigger is this watchdog itself:
-	// it measures the context during work, on pi's safe points (see the gates in the try block below),
-	// so pi's own compaction flag is no longer borrowed as a clock and this extension leaves pi's
-	// settings file alone - on the way out it hands back any line an earlier version wrote.
-	// A parked trigger arms itself again after half an hour (2026-10-06: a park used to last until a
-	// manual compaction, and one session sat parked for eight hours).
-	if (cfg.autoCompactPaused) {
-		if (autoFailure.pausedAtMs > 0 && Date.now() - autoFailure.pausedAtMs > 1_800_000) {
-			autoFailure.pausedAtMs = 0;
-			autoFailure.fails = 0;
-			update((c) => void (c.autoCompactPaused = false));
-			logLine(loadConfig(), { event: "auto_compaction_resumed", note: "parked for half an hour - armed again on its own" });
-			ctx.ui?.notify?.("Auto-compaction is armed again after its half-hour cooldown.", "info");
-		} else {
-			return;
+	// pi's compaction flag is read for information only and never written by this extension.
+	// The automatic trigger here is this extension's own: it measures the live context and starts
+	// the compaction itself, so with pi's flag off automatic compaction still works - and pi never
+	// writes a summary of its own. The coupling that armed pi's flag is deleted for good.
+	if (parkedThisSession(cfg, ctx)) {
+		// PARKED MEANS PARKED (2026-10-17, reversing a decision from 2026-10-06). A park used to expire by
+		// itself after half an hour and arm the trigger again; that half-hour existed because a session once sat
+		// parked for eight hours and filled its window while nobody was watching. The answer to that was never
+		// to resume over your head. Stopping a compaction is a stop: the proactive trigger stays down until a
+		// manual compaction runs, and running one is what re-arms it. What a park gets instead of an override is
+		// a loud warning - once the room runs out you are told, and told again every ten minutes, because a
+		// session that gets refused cannot be compacted at all and silence is how the eight-hour accident, which
+		// is no longer allowed to happen, once passed unnoticed.
+		const win = (ctx as any)?.model?.contextWindow ?? 0;
+		const parked = measureContext(ctx);
+		if (win > 0 && parked.wire > win - MIDRUN_DANGER_TOKENS * 2 && Date.now() - lastParkedWarnAtMs > 600_000) {
+			lastParkedWarnAtMs = Date.now();
+			logLine(loadConfig(), { event: "auto_compaction_parked_warning", wire: parked.wire, window: win, note: "still parked until a manual compaction, and the window is nearly gone" });
+			ctx.ui?.notify?.(`Auto-compaction is parked because you stopped it, and it stays parked until you run a manual compaction. The context is at ${fmt(parked.wire)} of ${fmt(win)} tokens.`, "warning");
 		}
+		return;
 	}
 	if (compactionInFlight) return; // never re-trigger while a compaction is running
 	try {
 		const window = (ctx as any)?.model?.contextWindow ?? 0;
 		if (!(window > 0)) return;
-		// 2026-10-07: the idle gate is GONE - the check runs during work too, that is the whole point. In
-		// its place, pi's own safe-point rules, so a compaction is never started where pi would not start
-		// one: not within startCompactionAfterToolCallMs of a tool call (default 1000 ms, pi types.d.ts),
-		// not before startTurn, and not more than once every 30 s. The tick fires every five seconds, so a
-		// gate that is shut now is caught by the next tick; measuring is free, STARTING is what needs a safe
-		// point. A compaction pi starts on its own is answered by our hook, so pi's summarizer never runs.
-		{
-			const nowMs = Date.now();
-			const secSinceTool = (ctx as any)?.compaction?.getSecondsSinceLastToolCall?.();
-			if (typeof secSinceTool === "number" && secSinceTool < ((ctx as any)?.compaction?.getStartCompactionAfterToolCallMs?.() ?? 1000) / 1000) return;
-			if (typeof (ctx as any)?.compaction?.getStartTurn === "function" && (ctx as any).compaction.getStartTurn() > nowMs) return;
-			// 2026-10-07: the 30 s floor used to sit HERE, in front of the measurement, so a check that ran
-			// on an event was blind for 30 s afterwards. Measuring is cheap - it moved down to the START.
-		}
+		// MEASURING IS FREE, STARTING NEEDS A SAFE POINT (2026-10-14). The gates that decide whether a
+		// compaction may start moved to compactSafePoint(), just below the trigger line check. The
+		// 2026-10-07 gates that used to sit here read ctx.compaction.*, which pi does not expose on
+		// ExtensionContext, so they never once engaged: the watcher was starting compactions in the middle
+		// of live requests and tools from that day until this one, and every one of those aborted the work
+		// it was racing. Measuring still runs on every request and every five seconds.
 	// WHAT THE SERVER HOLDS IS THE MEASURE: the elided request the model actually sees, the same figure
 	// the status line shows first. The raw transcript on disk is bigger and is never the measure.
 	const m = measureContext(ctx);
@@ -6938,6 +7773,20 @@ function watcherTick(): void {
 	const rawTokens = m.pi || m.sum;
 	const tokens = m.tokens;
 	const line = window - extReserve(ctx);
+	// THE ONE STATE IN WHICH THERE IS NOTHING TO MEASURE (2026-10-14): the newest entry on the branch is a
+	// summary and no answer has come since it. The wire is empty, pi reports its own estimate as unknown
+	// until the next answer, and the only figure left is a guess over the summary plus the tail that stayed.
+	// Starting a compaction there cannot find anything above that tail to summarise, so pi answered
+	// "Nothing to compact (session too small)" and the user read it as a failure 0.9 s after a summary had
+	// landed. The trigger stands down; the tick comes back in 5 s and will have a real number by then.
+	if (m.justCompacted) {
+		if (Date.now() - lastWatchLogMs > 300_000) {
+			lastWatchLogMs = Date.now();
+			// (2026-10-18: this watcher record is no longer written, as asked. The tick itself still
+			//   runs - it measures the fill and decides what to do - and lastWatchLogMs still throttles it.)
+		}
+		return;
+	}
 	// 2026-10-06: a trigger that stays quiet says nothing, which is how a parked trigger sat out a whole
 	// session. Once every five minutes the watcher writes down what it measured and why it did nothing.
 	if (tokens < line) {
@@ -6946,15 +7795,49 @@ function watcherTick(): void {
 			if (m.how === 'unmeasurable') {
 				// A zero that is written down is far better than a zero that looks like an empty context:
 				// this is the state in which a trigger silently never fires.
-				logLine(cfg, { event: 'watcher', note: 'CANNOT MEASURE the context - no usage reported since the last compaction and nothing to sum; the trigger cannot decide', line, window, reserve: extReserve(ctx), idle: String((ctx as any)?.isIdle?.() ?? 'unknown') });
+				// (2026-10-18: this watcher record is no longer written, as asked. The tick itself still
+				//   runs - it measures the fill and decides what to do - and lastWatchLogMs still throttles it.)
 				return;
 			}
-			logLine(cfg, { event: 'watcher', note: 'below the trigger line', wire: wireTokens, raw: rawTokens, tokens, line, window, reserve: extReserve(ctx), idle: String((ctx as any)?.isIdle?.()) });
+			// (2026-10-18: this watcher record is no longer written, as asked. The tick itself still
+			//   runs - it measures the fill and decides what to do - and lastWatchLogMs still throttles it.)
 		}
 		return;
 	}
+		// PAST THE LINE IS A REASON TO ACT (2026-10-15, undoing 2026-10-14). Started only at a settled point, the
+		// trigger was 10,000 tokens late and too late to be useful; see the note above agentLoop. So the loop is
+		// not a veto any more: compactSafePoint now looks for the pause between rounds instead. The one case that
+		// drops even that is the danger line, MIDRUN_DANGER_TOKENS under the whole window, where a refusal is the
+		// alternative and a refused session cannot be compacted at all.
+		const urgent = wireTokens > 0 && wireTokens >= window - MIDRUN_DANGER_TOKENS;
+		const sp = compactSafePoint(ctx, source === "context", urgent);
+		if (!sp.ok) {
+			const nowMs = Date.now();
+			if (nowMs - lastHoldLogMs > 60_000) {
+				lastHoldLogMs = nowMs;
+				logLine(cfg, { event: "safe_point_held", note: `past the line but ${sp.why} - holding; nothing was started and nothing was aborted`, source, tokens: m.tokens, wire: wireTokens, raw: rawTokens, all: m.all, how: m.how, piDelta: piMeasureDelta(ctx), line, window, reserve: extReserve(ctx) });
+			}
+			// The one hold that deserves the screen: the request ALREADY SENT is close to the whole window,
+			// so the next one in this turn is heading for the wall. Elision and the engine's clamp stand in
+			// front of it; this only says so, at most once every five minutes.
+			if (wireTokens > 0 && wireTokens >= window - 12_000 && nowMs - lastHoldNoticeAtMs > 300_000) {
+				lastHoldNoticeAtMs = nowMs;
+				ctx.ui?.notify?.(`Context is close to the whole window (${fmt(wireTokens)} of ${fmt(window)} tokens) but ${sp.why}, so no compaction was started - cutting one short would abort the work in progress. Elision is holding the request down and the engine clamps what is left of the room; compaction starts the moment the loop settles.`, "warning");
+			}
+			return;
+		}
 		const now = Date.now();
 		if (now - lastAutoTriggerMs < 60_000) return; // one trigger per minute, no hammering
+		// A second compaction on a GUESS, so soon after one landed, is how a session gets compacted twice for
+		// nothing: allow it only on a measured wire figure, never on an estimate (2026-10-14).
+		if (m.how !== 'wire' && lastCompactionDoneAtMs > 0 && now - lastCompactionDoneAtMs < 45_000) {
+			if (now - lastWatchLogMs > 300_000) {
+				lastWatchLogMs = now;
+				// (2026-10-18: this watcher record is no longer written, as asked. The tick itself still
+				//   runs - it measures the fill and decides what to do - and lastWatchLogMs still throttles it.)
+			}
+			return;
+		}
 		// THE START FLOOR: over the line is checked on every request and every five-second tick, but a
 		// compaction is started at most once every 30 s (the 60 s floor above and the circuit breaker sit
 		// on top of this).
@@ -6969,11 +7852,21 @@ function watcherTick(): void {
 		}
 		lastAutoTriggerMs = now;
 		lastWatchLogMs = now;
-		logLine(cfg, { event: "auto_trigger", estimate: tokens, wire: wireTokens, raw: rawTokens, line, window, reserve: extReserve(ctx) });
+		logLine(cfg, { event: "auto_trigger", estimate: tokens, wire: wireTokens, raw: rawTokens, line, window, reserve: extReserve(ctx), source, safePoint: sp.why, midRun: sp.midRun === true, urgent });
 		lastCompactionTrigger = "auto";
-		ctx.ui?.notify?.(`Context at ${fmt(tokens)} tokens (trigger line ${fmt(line)}) - compacting now.`, "info");
+		// Arm only when this crossing is about to interrupt a running turn. A settled crossing has
+		// nothing to hand back, and an armed flag with nothing behind it would later send a continuation
+		// that reads as a user's own message.
+		if (sp.midRun === true) armHandBack();
+		else cancelHandBack("the loop had settled, so nothing was interrupted");
+		ctx.ui?.notify?.(
+			sp.midRun === true
+				? `Context at ${fmt(tokens)} tokens (trigger line ${fmt(line)}) - compacting now, mid-turn: ${sp.why}. pi's compact() interrupts this turn to let the summary land; as soon as it is in the journal this extension hands the interrupted work back to itself, so nothing needs to be typed.`
+				: `Context at ${fmt(tokens)} tokens (trigger line ${fmt(line)}) - compacting now.`,
+			"info",
+		);
 		(ctx as any).compact?.({
-			onComplete: () => ctx.ui?.notify?.("Automatic compaction finished.", "info"),
+			onComplete: () => ctx.ui?.notify?.(sp.midRun === true ? "Automatic compaction landed. The turn was interrupted to run it, and the work picks up from the summary by itself." : "Automatic compaction landed. Nothing was running, so the session simply carries on from the summary.", "info"),
 			onError: (err: any) => ctx.ui?.notify?.(`Automatic compaction failed: ${String(err?.message ?? err).slice(0, 160)}`, "error"),
 		});
 	} catch {
@@ -6989,15 +7882,40 @@ function watcherTick(): void {
 const autoFailure = { fails: 0, retryAtMs: 0, pausedAtMs: 0 };
 /** "auto" while the watcher's own compaction is in flight, "manual" for a user-run one. */
 let lastCompactionTrigger = "manual";
+/** When a compaction LANDED, whoever asked for it. While that number is young the context size cannot be
+ *  measured (the server has not answered since), so the watcher refuses to start a compaction on a guess:
+ *  2026-10-14, a session triggered again 0.9 s after a summary had landed, on the size of the whole
+ *  on-disk history, and pi answered it with "Nothing to compact (session too small)". */
+let lastCompactionDoneAtMs = 0;
+/** The "nothing left to summarise" notice is worth reading once per 15 minutes, not once a minute. */
+let lastNoOpNoticeAtMs = 0;
+/** The parked-and-the-room-is-running-out warning, throttled to once every ten minutes. */
+let lastParkedWarnAtMs = 0;
 
-/** Switch the proactive trigger off and say so loudly; a manual compaction switches it back on. */
+/** Whether the proactive trigger is parked FOR THE SESSION THIS CALL IS ABOUT (2026-10-17). A stop belongs
+ *  to the session it happened in: a new or resumed session must find the trigger armed, and the stopped
+ *  session must stay parked until a manual compaction in it re-arms it. A legacy `true` from an older file
+ *  still parks everywhere - silently un-parking a session somebody stopped would be its own betrayal, and
+ *  the overlay's switch or a manual compaction is what clears it. */
+export function parkedThisSession(cfg: any, ctx: any): boolean {
+	const v = cfg?.autoCompactPaused;
+	if (!v) return false;
+	if (v === true) return true;
+	const id = String(ctx?.sessionManager?.getSessionId?.() ?? "session");
+	return v === id || v === "session";
+}
+
+/** Switch the proactive trigger off and say so loudly. A manual compaction is the only thing that switches
+ *  it back on: there is no clock on a park (2026-10-17), and pi's stock summariser is never substituted. */
 function pauseAutoCompaction(ctx: any, reason: string, detail: string): void {
 	autoFailure.fails = 0;
 	autoFailure.retryAtMs = 0;
 	autoFailure.pausedAtMs = Date.now();
-	update((c) => void (c.autoCompactPaused = true));
-	logLine(loadConfig(), { event: "auto_compaction_paused", reason, detail: String(detail).slice(0, 300), at: new Date().toISOString() });
-	ctx?.ui?.notify?.(`AUTO-COMPACTION PAUSED (${reason}): ${String(detail).slice(0, 160)} - THE AUTO-COMPACTOR IS OFF AND WILL NOT FIRE AGAIN UNTIL YOU RUN A MANUAL COMPACTION (/compact-plus menu, "Compact now").`, "warning");
+	lastParkedWarnAtMs = 0;
+	const sid = String(ctx?.sessionManager?.getSessionId?.() ?? "session");
+	update((c) => void (c.autoCompactPaused = sid));
+	logLine(loadConfig(), { event: "auto_compaction_paused", reason, detail: String(detail).slice(0, 300), session: sid.slice(-8), at: new Date().toISOString() });
+	ctx?.ui?.notify?.(`AUTO-COMPACTION PARKED (${reason}): ${String(detail).slice(0, 160)} - IT STAYS PARKED FOR THIS SESSION UNTIL A MANUAL COMPACTION ARMS IT AGAIN. ANY OTHER SESSION, NEW OR RESUMED, STARTS ARMED.`, "warning");
 }
 
 let watcherTimer: ReturnType<typeof setInterval> | undefined;
@@ -7033,27 +7951,161 @@ function stopWatcherTimer(): void {
 
 function ensureWatcherTimer(): void {
 	if (watcherTimer) return;
-	watcherTimer = setInterval(watcherTick, WATCHER_INTERVAL_MS);
+	watcherTimer = setInterval(() => watcherTick("timer"), WATCHER_INTERVAL_MS);
 	(watcherTimer as unknown as { unref?: () => void })?.unref?.();
 }
 
 export default function piCompactPlusExtension(pi: ExtensionAPI): void {
+	extApi = pi; // for the timer-driven hand-back (tryHandBack); see the note on extApi
+	// WHAT PI DID WITH A COMPACTION AFTER THIS EXTENSION'S OWN HOOK WAS DONE (2026-10-14). The hook sees a
+	// compaction it takes part in; these two see every one, including the ones pi raises on its own side -
+	// and until now those were invisible: a refusal for want of anything to summarise appeared on screen as an
+	// ERROR with nothing in the log to explain it, and a genuine failure from that path was never counted by
+	// the circuit breaker, so the trigger could knock on the same door once a minute for the rest of the day.
+	// WHERE THE AGENT LOOP IS (2026-10-14). These handlers exist for one reason: to be able to say, at any
+	// instant, whether starting a compaction would interrupt something. pi emits them all (types.d.ts); the
+	// counters are kept defensively (a start without its end, or an end without its start, cannot drift the
+	// count below zero or leave the loop stuck as running) and every one of them also refreshes the watcher's
+	// context, so the trigger works before the first request of a session has ever gone out.
+	pi.on("agent_start", (_event: any, ctx: any) => {
+		watcherCtx = ctx;
+		agentLoop.running = true;
+		agentLoop.sinceMs = Date.now();
+		return undefined;
+	});
+	pi.on("agent_end", (_event: any, ctx: any) => {
+		watcherCtx = ctx;
+		agentLoop.running = false;
+		return undefined;
+	});
+	pi.on("agent_settled", (event: any, ctx: any) => {
+		watcherCtx = ctx;
+		agentLoop.running = false;
+		agentLoop.lastSettledAtMs = Date.now();
+		if ((event as any)?.aborted) agentLoop.lastAbortAtMs = Date.now();
+		// A hand-back waiting for the loop to settle gets woken here rather than on its own next poll:
+		// this is the event that says it settled. The attempt still asks pi's own guard before sending.
+		if (autoResumeTurn.armed) scheduleHandBack(300);
+		// THE BEST MOMENT TO COMPACT IS THE SECOND THE TURN ENDS, and the five-second timer can miss it: a
+		// queued message starts the next turn inside that gap and the gate shuts again. So look 1.2 s after
+		// the loop settles - long enough for a follow-on turn to declare itself and be waited out, early
+		// enough to shrink the context before the next request is ever built. Nothing is started by the settle
+		// itself: it asks the watcher to look, and the watcher still applies every gate.
+		if (settleCheckTimer) clearTimeout(settleCheckTimer);
+		settleCheckTimer = setTimeout(() => {
+			settleCheckTimer = undefined;
+			try {
+				watcherTick("settled");
+			} catch {
+				/* the watcher must never break a session */
+			}
+		}, 1200);
+		(settleCheckTimer as unknown as { unref?: () => void })?.unref?.();
+		return undefined;
+	});
+	pi.on("tool_execution_start", (event: any, ctx: any) => {
+		watcherCtx = ctx;
+		if ((event as any)?.parentToolCallId) return undefined; // a nested call lives inside its parent
+		agentLoop.tools += 1;
+		return undefined;
+	});
+	pi.on("tool_execution_end", (event: any, ctx: any) => {
+		watcherCtx = ctx;
+		if (!(event as any)?.parentToolCallId) agentLoop.tools = Math.max(0, agentLoop.tools - 1);
+		agentLoop.lastToolEndAtMs = Date.now();
+		return undefined;
+	});
+	pi.on("ui_prompt_start", (_event: any, ctx: any) => {
+		watcherCtx = ctx;
+		agentLoop.promptOpen = true;
+		return undefined;
+	});
+	pi.on("ui_prompt_end", (_event: any, ctx: any) => {
+		watcherCtx = ctx;
+		agentLoop.promptOpen = false;
+		return undefined;
+	});
+
+	pi.on("session_compact", (event: any) => {
+		lastCompactionDoneAtMs = Date.now();
+		// THE INTERRUPTED TURN DOES NOT WAIT FOR A KEYSTROKE (2026-10-18). The summary is in the
+		// journal now, so the turn that pi's compact() had to abort is handed back: the extension
+		// sends the continuation itself and the session carries on from the summary. One message per
+		// mid-turn compaction, only for a compaction that landed within the last 20 minutes.
+		if (autoResumeTurn.armed) {
+			// QUEUED, NOT SENT, and the difference is the whole bug (see tryHandBack):
+			// pi still holds its compaction guard at this instant and refuses a prompt, and the refusal
+			// used to vanish into an un-awaited promise. The attempt is made by the timer, which waits
+			// for pi to be reachable and logs whatever pi actually answered.
+			scheduleHandBack(700);
+		}
+
+		const entry: any = (event as any)?.compactionEntry ?? {};
+		logLine(loadConfig(), {
+			event: "compaction_landed",
+			reason: (event as any)?.reason,
+			fromExtension: Boolean((event as any)?.fromExtension),
+			summaryTokens: Math.round((((entry?.summary ?? '') as string).length * 1.15) / 4),
+			handoff: true,
+			note: "the trigger will not start another one on an unmeasured context for the next 45 s",
+		});
+		return undefined;
+	});
+	pi.on("session_compact_failed", (event: any, ctx: any) => {
+		const cfg = loadConfig();
+		if (fullyOff(cfg)) return undefined;
+		const failure: any = (event as any)?.errorMessage ?? ((event as any)?.aborted ? 'cancelled' : '');
+		const error = String(failure ?? '').trim() || 'unknown';
+		// Cancel and the extension's own failures are already logged and counted by the hook above.
+		if ((event as any)?.aborted) return undefined;
+		if ((event as any)?.fromExtension) return undefined;
+		// Nothing above the kept tail to summarise is a NO-OP, not a failure: it must not spend the one
+		// allowed retry, must not park the trigger, and must not read like a breakdown.
+		if (/nothing to compact|already compacted|too small/i.test(error)) {
+			const strikes = countNoOpStrike(Date.now());
+			logLine(cfg, { event: "compaction_no_op", reason: (event as any)?.reason, error: error.slice(0, 200), trigger: lastCompactionTrigger, strikes, windowMin: 15, note: "the summary plus the tail that stayed already cover the conversation - NOT counted as a failure, no retry spent" + (strikes >= 3 && lastCompactionTrigger === "auto" ? "; THIRD ONE IN 15 MINUTES - the trigger parks itself instead of knocking once a minute forever" : ", the trigger stays armed") });
+			if (strikes >= 3 && lastCompactionTrigger === "auto") {
+				pauseAutoCompaction(ctx, "nothing to summarise three times", `${error.slice(0, 90)} - three times in 15 minutes, which means the trigger is firing somewhere it cannot find any work; the aim and the trigger line are worth checking (/compact-plus menu)`);
+				return undefined;
+			}
+			if (Date.now() - lastNoOpNoticeAtMs > 900_000) {
+				lastNoOpNoticeAtMs = Date.now();
+				ctx?.ui?.notify?.(`Compaction found nothing to summarise (${error.slice(0, 60)}) - the conversation is already down to its summary plus the recent tail, and the full transcript is on disk. Nothing was retried and the automatic trigger is still armed.`, "info");
+			}
+			return undefined;
+		}
+		// A real failure pi raised outside this extension's path: same breaker as our own.
+		autoFailure.fails += 1;
+		if (lastCompactionTrigger === "auto" && autoFailure.fails === 1) {
+			autoFailure.retryAtMs = Date.now() + 180_000;
+			logLine(cfg, { event: "auto_compaction_failed", error: error.slice(0, 200), trigger: lastCompactionTrigger, failure: autoFailure.fails, from: "pi", retryInMs: 180_000, note: "raised by pi itself, not by this extension's compaction path" });
+			ctx?.ui?.notify?.(`COMPACTION FAILED (1 of 2): ${error.slice(0, 140)} - IT WAITS 3 MINUTES AND TRIES ONCE MORE; IF THAT FAILS TOO IT SWITCHES ITSELF OFF.`, "warning");
+			return undefined;
+		}
+		if (lastCompactionTrigger === "auto") pauseAutoCompaction(ctx, "pi refused the compaction twice", error);
+		else logLine(cfg, { event: "compaction_failed", reason: (event as any)?.reason, error: error.slice(0, 200), trigger: lastCompactionTrigger, from: "pi" });
+		return undefined;
+	});
+
 	// ELISION: rule-based stubbing of old tool results in every live request (see applyElision).
 	// The handler's returned message list is what actually gets sent; stored history is untouched,
 	// so pi's own compaction machinery always sees the raw originals. The handler also captures the
 	// freshest extension ctx for the auto-compact watcher above.
 	pi.on("context", (event: any, ctx: any) => {
-		// Every request is also the moment to keep pi's own pre-request line equal to ours (2026-10-06):
-		// pi's check is the only trigger that fires while the agent works, and it reads its reserve from
-		// settings.json. Writing only on a difference keeps this cheap.
+		// The same moment is used to say the quiet part out loud, once: if pi's own compaction flag is on,
+		// two compactors would be live in this session (adviseOnPiFlag, which nags at most once an hour and
+		// writes nothing anywhere). This is NOT where pi's line used to be kept equal to ours - the pre-request
+		// coupling that did that came out on 2026-10-18, and pi's settings.json is read here and never written.
+		// A comment claiming a write survived three days longer than the code that justified it did.
 		try {
 			const cc = loadConfig();
 			// FULLY OFF = invisible (2026-10-06): no settings write, no timer, no elision, no log line.
-			if (fullyOff(cc)) {
-				releasePiTriggerLine(cc);
-				return undefined;
-			}
-			// 2026-10-07: no settings.json trigger clock here any more - the watchdog covers the run.
+			if (fullyOff(cc)) return undefined;
+			adviseOnPiFlag(ctx, cc);
+			// pi's compaction flag is read for information only and never written by this extension.
+			// The automatic trigger here is this extension's own: it measures the live context and starts
+			// the compaction itself, so with pi's flag off automatic compaction still works - and pi never
+			// writes a summary of its own. The coupling that armed pi's flag is deleted for good.
 		} catch {
 			/* never blocks a request */
 		}
@@ -7077,7 +8129,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		// timer stays as the backstop for one very long generation with no requests in between.
 		if (cfgForHookTimer()) {
 			try {
-				watcherTick();
+				watcherTick("context", ctx);
 			} catch {
 				/* the trigger must never block a live request */
 			}
@@ -7121,9 +8173,21 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	// 00:25). With the cap the request always fits until real ~ window - cap. The fork's own
 	// compaction requests size themselves via genCap and never pass this hook (only the agent
 	// loop carries onPayload).
-	pi.on("before_provider_request", (event: any) => {
-		// This hook REWRITES the outgoing request, so it is the one place where an off extension would be
-		// most visible to pi and to other extensions (2026-10-06): it runs only while compaction is on.
+	pi.on("before_provider_request", (event: any, ctx: any) => {
+		// A request this process sent and has not seen answered yet (see the two timestamps on
+		// agentLoop for why the gate trusts this only while it is young). The hook also REWRITES the outgoing
+		// payload below, which is why an extension that is switched off stays out of it entirely (2026-10-06).
+		watcherCtx = ctx;
+		agentLoop.requestsOut += 1;
+		agentLoop.requestStartedAtMs = Date.now();
+		// CHAT max_tokens cap: pi sizes each chat request's generation permission as
+		// window - context estimate - 4,096, which balloons on big-window models (943,718 on
+		// glm-flash-latest) and then gets the whole request rejected whenever pi's estimate
+		// undercounts the real wire by more than the 4,096 cushion - the overflow class behind the
+		// 630k and 295k emergency compactions (the estimate undercounted by ~69k on 2026-10-01
+		// 00:25). With the cap the request always fits until real ~ window - cap. The fork's own
+		// compaction requests size themselves via genCap and never pass this hook (only the agent
+		// loop carries onPayload).
 		const cfgHook = loadConfig();
 		if (!cfgHook.enabled) return undefined;
 		const cap = cfgHook.chatMaxTokensCap;
@@ -7147,6 +8211,13 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		return p;
 	});
 
+	pi.on("after_provider_response", (_event: any, ctx: any) => {
+		watcherCtx = ctx;
+		agentLoop.requestsOut = Math.max(0, agentLoop.requestsOut - 1);
+		agentLoop.requestAnsweredAtMs = Date.now();
+		return undefined;
+	});
+
 	pi.on("session_before_compact", async (event: any, ctx: any) => {
 		// FIRST THING (2026-10-06): with this extension's compaction switched off, this hook answers
 		// NOTHING - not a summary, not a cancel - so pi's own compaction, or another extension's, runs
@@ -7155,7 +8226,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		try {
 			const c0 = loadConfig();
 			if (!c0.enabled) {
-				if (fullyOff(c0)) releasePiTriggerLine(c0);
 				return undefined;
 			}
 		} catch {
@@ -7191,10 +8261,10 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			// cancelled: falling through at any point below would let pi write a summary with the session
 			// model, which is the double compaction this setup must never do.
 			const cooling = autoFailure.retryAtMs > 0 && Date.now() < autoFailure.retryAtMs;
-			if (cfg.autoCompactPaused || cooling) {
+			if (parkedThisSession(cfg, ctx) || cooling) {
 				logLine(cfg, {
 					event: "auto_compaction_skipped",
-					note: cfg.autoCompactPaused
+					note: parkedThisSession(cfg, ctx)
 						? "parked after repeated failures - pi's stock summarizer was NOT allowed to run"
 						: `waiting for the one allowed retry - pi's stock summarizer was NOT allowed to run`,
 					secondsLeft: autoFailure.retryAtMs > 0 ? Math.max(0, Math.round((autoFailure.retryAtMs - Date.now()) / 1000)) : undefined,
@@ -7205,14 +8275,16 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			}
 		}
 		lastCompactionTrigger = "manual";
-		if (trigger === "manual" && cfg.autoCompactPaused) {
+		if (trigger === "manual" && parkedThisSession(cfg, ctx)) {
 			update((c) => void (c.autoCompactPaused = false));
-			logLine(cfg, { event: "auto_compaction_resumed", note: "a manual compaction ran - the proactive trigger is armed again" });
+			logLine(cfg, { event: "auto_compaction_resumed", session: String(ctx?.sessionManager?.getSessionId?.() ?? "session").slice(-8), note: "a manual compaction ran in this session - the proactive trigger is armed again, for this session" });
 		}
 		const refs = Object.keys(cfg.models);
 		if (!cfg.enabled || refs.length === 0) {
-		// An automatic trigger must never fall through to pi's stock summarizer; a manual one still can,
-		// because the user asked for a summary here and now.
+		// pi's compaction flag is read for information only and never written by this extension.
+		// The automatic trigger here is this extension's own: it measures the live context and starts
+		// the compaction itself, so with pi's flag off automatic compaction still works - and pi never
+		// writes a summary of its own. The coupling that armed pi's flag is deleted for good.
 		return trigger === "auto" ? { cancel: true } : undefined;
 	} // the compaction switch; elision has its own
 
@@ -7247,38 +8319,42 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 
 		if (!outcome.ok) {
 			if (outcome.error === "cancelled") {
-				// A cancel is NOT a failure (2026-10-06). It used to park the trigger for good: one
-				// session sat parked for eight hours, the context filled past the trigger line and nothing
-				// fired until pi's overflow path caught the session at 88 percent of its window. A cancel
-				// now just stands this round down; the next idle tick past the line tries again.
-				logLine(cfg, { event: "auto_compaction_cancelled", trigger, note: "cancelled before any model finished - the trigger stays armed" });
-				ctx.ui?.notify?.("Compaction cancelled - the auto-compaction trigger stays armed.", "info");
-				// pi's threshold fires again at the next request, so the rotation has to refuse on its own
-				// terms: cancel keeps pi's stock summarizer out and lets the breaker decide when to retry.
-				return trigger === "auto" ? { cancel: true } : undefined;
+				// pi's compaction flag is read for information only and never written by this extension.
+				// The automatic trigger here is this extension's own: it measures the live context and starts
+				// the compaction itself, so with pi's flag off automatic compaction still works - and pi never
+				// writes a summary of its own. The coupling that armed pi's flag is deleted for good.
+				pauseAutoCompaction(ctx, "you stopped the compaction", outcome.error);
+				return { cancel: true };
 			}
 			autoFailure.fails += 1;
-			if (trigger === "auto" && autoFailure.fails === 1) {
+			if (autoFailure.fails === 1) {
 				// First failure: keep the trigger armed but wait 3 minutes for the single retry.
 				autoFailure.retryAtMs = Date.now() + 180_000;
 				logLine(cfg, { event: "auto_compaction_failed", error: outcome.error, trigger, failure: autoFailure.fails, retryInMs: 180_000, note: "one retry allowed, 3 minutes from now" });
-				ctx.ui?.notify?.(`AUTO-COMPACTION FAILED (1 of 2): ${String(outcome.error).slice(0, 160)} - IT WAITS 3 MINUTES AND TRIES ONCE MORE; IF THAT FAILS TOO IT SWITCHES ITSELF OFF. PI'S OWN SUMMARIZER IS NOT USED IN THE MEANTIME.`, "warning");
-				return trigger === "auto" ? { cancel: true } : undefined;
+				ctx.ui?.notify?.(`COMPACTION FAILED (1 of 2): ${String(outcome.error).slice(0, 160)} - IT WAITS 3 MINUTES AND TRIES ONCE MORE. PI'S OWN SUMMARIZER IS NOT USED.`, "warning");
+				return { cancel: true };
 			}
-			if (trigger === "auto") pauseAutoCompaction(ctx, "the auto-compaction failed twice", outcome.error);
-			logLine(cfg, { event: "give_up", error: outcome.error, trigger, note: trigger === "auto" ? "cancelled - pi's stock summarizer was NOT allowed to run" : "pi does this compaction itself" });
+			// Nothing landed, so nothing may be resumed on the strength of this trigger: an armed hand-back
+			// would wake, ask pi to continue a turn whose compaction never happened, and get an answer built
+			// on the old oversized context.
+			cancelHandBack("the compaction rotation failed and gave up");
+			pauseAutoCompaction(ctx, "compaction failed twice", outcome.error);
+			logLine(cfg, { event: "give_up", error: outcome.error, trigger, note: "automatic attempts rest for 30 minutes; pi's stock summarizer was NOT allowed to run" });
 			ctx.ui?.notify?.(
-				trigger === "auto"
-					? `COMPACTION MODELS ALL FAILED (${String(outcome.error).slice(0, 200)}) - THE AUTOMATIC COMPACTION IS SWITCHED OFF UNTIL A MANUAL ONE RUNS, AND PI'S OWN SUMMARIZER WAS NOT USED. Fix the model list or compact by hand.`
-					: `Compaction models all failed (${String(outcome.error).slice(0, 220)}). Letting pi do it with the session model.`,
-				trigger === "auto" ? "error" : "warning",
+				`Compaction models all failed (${String(outcome.error).slice(0, 200)}). AUTOMATIC COMPACTION RESTS FOR 30 MINUTES AND PI'S OWN SUMMARIZER WILL NOT BE SUBSTITUTED - fix the model list, or ask for a manual compaction, which is allowed right away.`,
+				"error",
 			);
-			// A manual compaction still falls through to pi, so the user gets a summary; an automatic one
-			// cancels, because pi's session model is exactly what these settings avoid.
-			return trigger === "auto" ? { cancel: true } : undefined;
+			// And that is the whole rule (2026-10-17, after a session lost two hours of work this way): failing
+			// is not the same as handing over. The extension rests, the trigger stays ours, and pi's summary -
+			// written by the session model, in a shape this session's settings exist to avoid - is never the
+			// fallback for a failure. If pi's compaction is wanted, that is a switch the user flips.
+			return { cancel: true };
 		}
 		autoFailure.fails = 0;
 		autoFailure.retryAtMs = 0;
+		// A summary that landed is also the end of any rest period (2026-10-17): the 30-minute pause exists to
+		// stop a broken model list from knocking every round, not to outlast a good compaction that came after it.
+		autoFailure.pausedAtMs = 0;
 
 		const r = outcome.result;
 		// The chained-compaction counter rides in the entry's details (read by the next compaction).
@@ -7287,8 +8363,26 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		} catch {
 			/* counter is best-effort */
 		}
+		r.compaction.summary = appendCompactionReceipt(cfg, ctx, r, r.compaction.summary);
 		r.compaction.summary = appendTranscriptPointer(cfg, ctx, r.compaction.summary);
-		logLine(cfg, { event: "done", ref: r.ref, status: "ok", measured: r.measured, min: r.min, max: r.max, seconds: r.seconds, reason: event.reason });
+		logLine(cfg, {
+				event: "done",
+				ref: r.ref,
+				status: "ok",
+				trigger,
+				session: String(ctx?.sessionManager?.getSessionId?.() ?? "session").slice(-8),
+				seconds: r.seconds,
+				measured: r.measured,
+				min: r.min,
+				target: (r as any).target,
+				max: r.max,
+				words: r.words,
+				via: (r as any).via,
+				before: realContextTokens(ctx),
+				line: (ctx as any)?.compaction?.reserveTokens ?? 0,
+				window: (ctx as any)?.model?.contextWindow ?? 0,
+				reason: event.reason,
+			});
 		ctx.ui?.notify?.(
 			`Summary written by ${slotLabel(r.ref, r.model)} in ${r.seconds}s — ${fmt(r.measured)} tok (accepted ${fmt(r.min)}–${fmt(r.max)}).`,
 			"info",
@@ -7313,35 +8407,25 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				case "status":
 					return say(describe(cfg, ctx));
 				case "on":
-					// ONE compactor is ever on: turning this extension's compaction on turns pi's own off - and
-					// it is refused outright while a THIRD one (another manager) is installed (2026-10-07).
-					{
-						const blocked = enableBlockedByOtherCompactor();
-						if (blocked) return say(`NOT ENABLED: ${blocked} is present. Only one compaction extension can run in a session - disable that one first, then turn this on.`);
-						const piWasOn = readPiCompactionEnabled();
-						update((c) => void (c.enabled = true));
-						if (piWasOn) writePiCompactionEnabled(false);
-						return say(
-							"COMPACTION IS ON" +
-								(piWasOn ? " - AND PI'S OWN COMPACTION WAS SWITCHED OFF IN THE SAME ACTION: ONE COMPACTOR AT A TIME." : ".") +
-								" pi reads its own settings.json at startup, so /reload to make pi's side stick.",
-						);
-					}
+					// One compactor at a time: while another manager is installed, enabling this is refused (2026-10-07).
+					// pi's own compaction is not part of that bargain and is never touched from here.
+					const blocked = enableBlockedByOtherCompactor();
+					if (blocked) return say(`NOT ENABLED: ${blocked} is present. Only one compaction extension can own the context at a time.`);
+					update((c) => void (c.enabled = true));
+					return say(
+						"COMPACTION IS ON. This extension compacts on its own trigger with its own models, and it answers /compact. " +
+						"pi's own compaction is untouched by this command: nothing here writes pi's settings, so while compaction.enabled is true there, pi can still compact by itself with pi's own summariser. Read-only state of that flag: /compact-plus pi.",
+					);
 				case "off":
 					update((c) => void (c.enabled = false));
 					return say("THIS EXTENSION'S COMPACTION IS OFF. pi's own compaction stays as it is - if it was off too, NOTHING COMPACTS ANY MORE until one of the two is on.");
-				case "pi": {
-					const on = parts[1] !== "off";
-					const wrote = writePiCompactionEnabled(on);
-					update((c) => void (on ? (c.enabled = false) : c));
+				case "pi":
 					return say(
-						!wrote
-							? "COULD NOT WRITE PI'S settings.json - EDIT IT BY HAND (compaction.enabled)."
-							: on
-								? "PI'S OWN COMPACTION IS NOW ON AND THIS EXTENSION'S COMPACTION IS NOW OFF - ONE COMPACTOR AT A TIME. pi reads settings.json at startup, so NOTHING CHANGES UNTIL YOU /RELOAD."
-								: "PI'S OWN COMPACTION IS NOW OFF. THIS EXTENSION'S COMPACTION WAS ALREADY OFF TOO, SO NOTHING COMPACTS UNTIL YOU TURN ONE OF THEM ON. /reload to make pi's setting stick.",
+						`pi's own compaction is ${readPiCompactionEnabled() ? "ENABLED" : "DISABLED"} in ${join(AGENT_DIR, "settings.json")} (compaction.enabled). THIS EXTENSION NEVER WRITES THAT FILE, and no command here switches pi's compaction on or off: that flag is pi's, for pi's own threshold and overflow checks. This extension's own automatic trigger and /compact work with it either way. Edit the number in that file yourself, then /reload.` +
+						(loadConfig().enabled
+							? " This extension: compaction ON, automatic trigger " + (loadConfig().autoCompact ? "armed." : "PARKED or OFF, and a manual /compact re-arms it when it is parked.")
+							: " This extension: compaction OFF, so nothing compacts on its own until it is switched back on."),
 					);
-				}
 				case "models": {
 					if (!parts[1]) {
 						const reserve = extReserve(ctx);
@@ -7375,11 +8459,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				}
 				case "options": {
 					const ref = refArg(parts);
-					if (!ref) return say("Use: options <provider/model> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [draft <off|mini|full>] [inputstubs on|off] [argcap <0-1000|full>] [stubs <verbatim|detailed|summary|brief>] [user <..>] [replies <..>] [thought <..>] [chain <fold|attach|skip>] [tag on|off]");
+					if (!ref) return say("Use: options <provider/model> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [inputstubs on|off] [argcap <0-1000|full>] [stubs <verbatim|detailed|summary|brief>] [user <..>] [replies <..>] [thought <..>] [chain <fold|attach|skip>] [tag on|off]");
 					if (parts.length === 2) {
 						const model = lookupRef(ref, ctx);
 						const o = optionsFor(loadConfig(), ref, model);
-						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${o.summaryPercent}% of the ctx window, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, draft ${o.draft}, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
+						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${o.summaryPercent}% of the ctx window, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
 					}
 					const patch: Partial<ModelOptions> = {};
 					for (let i = 2; i < parts.length; i += 2) {
@@ -7391,7 +8475,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						else if (key === "aim" || key === "pct") patch.summaryPercent = clamp(Math.round(Number(value)), 1, 99);
 						else if (key === "min") patch.summaryMinTokens = clamp(Math.round(Number(value)), 0, 1_000_000);
 						else if (key === "max") patch.summaryMaxTokens = clamp(Math.round(Number(value)), 1, 1_000_000);
-						else if (key === "draft" && DRAFT_CYCLE.includes(value as Draft)) patch.draft = value as Draft;
+						
 						else if (key === "inputstubs") patch.inputStubs = value === "on";
 						else if (key === "argcap") patch.argCap = parseCharCap(value, 500);
 						else if (key === "stubs" && isPreserve(value)) patch.preserveStubs = value;
@@ -7406,7 +8490,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (!loadConfig().models[ref]) rotateAdd(ref);
 					setModelOptions(ref, patch);
 					const o2 = optionsFor(loadConfig(), ref, lookupRef(ref, ctx));
-					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${o2.summaryPercent}% of the ctx window, limits min ${fmt(o2.summaryMinTokens)} / max ${fmt(o2.summaryMaxTokens)} tok, draft ${o2.draft}, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
+					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${o2.summaryPercent}% of the ctx window, limits min ${fmt(o2.summaryMinTokens)} / max ${fmt(o2.summaryMaxTokens)} tok, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
 				}
 				case "elision": {
 					const sub = (parts[1] ?? "").toLowerCase();
@@ -7486,7 +8570,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						const keptText = kept.map((m: any) => `[${String(m.role)} - kept]: ${contentTextOf(m.content).slice(0, 200)}`).join("\n");
 						const inputTokens = Math.ceil((main.text.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
 						const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: ctx?.model?.contextWindow ?? 0 }, 0);
-						const instructions = buildInstructions({ sizes, inputTokens, kind: isLocalModel(model) ? "local" : "online", options: profile, additionalInstruction: cfg2.additionalInstruction, customInstructions: undefined });
+						const instructions = buildInstructions({ sizes, inputTokens, segmentTokens: inputTokens - SUMMARISER_FRAMING_TOKENS, kind: isLocalModel(model) ? "local" : "online", options: profile, additionalInstruction: cfg2.additionalInstruction, customInstructions: undefined });
 						const text = [
 							"PREVIEW - what the direct summarization request would contain (approximation: the real region is chosen by pi's cut logic at compaction time; the last two messages stand in for the kept tail).",
 							"",
@@ -7525,7 +8609,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					return say("The old words are gone. Use: /compact-plus options <provider/model> [...] — or open the menu with no argument. New: elision [on|off] [start <50-95>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>].");
 				default:
 					return say(
-						"Use /compact-plus with no argument for the menu, or:\nstatus | on | off | models [add <ref> | remove <ref>] | move <ref> <up|down|n>\noptions <ref> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [draft <off|mini|full>] [inputstubs on|off] [argcap <0-1000|full>] [stubs|user|replies|thought <verbatim|detailed|summary|brief>] [chain <fold|attach|skip>] [tag on|off]\nelision [on|off] [start <50-95>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>]\nretries <0-5> [sec] | marker <text|clear> | instruction [text | reset] | log",
+						"Use /compact-plus with no argument for the menu, or:\nstatus | on | off | models [add <ref> | remove <ref>] | move <ref> <up|down|n>\noptions <ref> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [inputstubs on|off] [argcap <0-1000|full>] [stubs|user|replies|thought <verbatim|detailed|summary|brief>] [chain <fold|attach|skip>] [tag on|off]\nelision [on|off] [start <50-95>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>]\nretries <0-5> [sec] | marker <text|clear> | instruction [text | reset] | log",
 					);
 			}
 		},
