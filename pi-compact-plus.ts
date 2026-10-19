@@ -1547,8 +1547,13 @@ export async function countTextAt(base: string, text: string, estimate: number, 
  */
 type Sizes = { min: number; target: number; max: number; genCap: number; notes: string[] };
 
-/** Slack above `max` on the generation cap only, so a summary landing exactly on max is not cut. */
-const GEN_MARGIN = 1000;
+/** Slack above `max` on the generation cap only, so a summary landing exactly on max is not cut.
+ *  It is also the slack above `max` on what the ENGINE IS TOLD to generate, and the two are held to
+ *  the same line: the request asks for at most Summary max + GEN_MARGIN, and a summary of up to that
+ *  size is accepted rather than thrown away. 2026-10-19, on the user's hard rule after pi crashed:
+ *  this stays 512 and nothing may push the instruction past it, because a local engine asked for more
+ *  than its window holds does not fail politely - it takes the session down as a crash. */
+const GEN_MARGIN = 512;
 
 /** What a scratchpad is worth reserving for when the template asks for one and the model can afford
  *  it (2026-10-18). Since the draft setting was deleted the only way to want a scratchpad is to write
@@ -2368,26 +2373,24 @@ export function samplingParamsFor(ref: string, s: SamplingFlags | undefined): Re
 	return Object.keys(out).length ? out : undefined;
 }
 
-/** Per-request chat-template kwargs that make the THINKING EFFORT real for a local llama server:
- *  pi-ai sends nothing thinking-related for a plain openai-format model (its reasoning branches do
- *  not cover it), so low/medium/xhigh would otherwise be silently dropped. ik_llama.cpp merges
- *  chat_template_kwargs over the server's --chat-template-kwargs defaults. "off" used to send
- *  nothing on the theory that the no-think tag in the prompt was enough - see below for what that
- *  cost on 2026-10-19. */
+/** Per-request kwargs that make the THINKING EFFORT real for a local server: pi-ai sends nothing
+ *  thinking-related for a plain openai-format model (its reasoning branches do not cover it), so
+ *  low/medium/xhigh would otherwise be silently dropped as this reasoning_effort key. 2026-10-19, the
+ *  user set the record straight about the other half: their model is served by strata with a
+ *  hand-written chat template, and that engine reads no such flag - the template switches modes by
+ *  looking for the no-think tag inside the message text, which buildRequestParts already writes there
+ *  when thinking is off. So "off" sends no body key, exactly as it did before that detour. */
 export function chatTemplateKwargsFor(thinking: Level): Record<string, unknown> | undefined {
 	const level = thinking === "minimal" ? "low" : thinking === "high" ? "xhigh" : thinking;
 	if (level === "low" || level === "medium" || level === "xhigh") return { reasoning_effort: level };
-	// "off" has to be an instruction, not a silence (2026-10-19, live failure): a thinking-by-default
-	// chat template keeps reasoning when we send nothing, and the server then spends most of the
-	// request budget on that hidden reasoning - 25,956 of 34,608 tokens, leaving 8,652 for the
-	// summary, which then hit the cap and looked like a broken extension. The spellings vary by
-	// template and server build, so the known ones all go, and a template that does not know a key
-	// ignores it: ik_llama.cpp merges chat_template_kwargs over its --chat-template-kwargs defaults, and
-	// that server's own README documents the key with {"enable_thinking": false} as its example.
-	// They ride INSIDE chat_template_kwargs, never beside it - pi-ai copies samplingParams straight
-	// into the request body, so an unknown top-level key is a coin flip with the server.
-	if (thinking === "off") return { chat_template_kwargs: { enable_thinking: false, thinking_enable: false, reasoning_budget: 0, thinking_budget: 0 } };
-	// "max" and anything else: send nothing thinking-related, exactly as before 2026-10-19.
+	// "off" is carried by the no-think tag in the text, not by a body key (2026-10-19, corrected after a
+	// detour): this user's model runs under strata with a hand-written chat template, that engine reads no
+	// chat-template flag at all, and the template switches modes by looking for the tag inside the message
+	// - which buildRequestParts already writes there when thinking is off. A key the engine does not read
+	// would only have made the request look as if thinking had been switched off when nothing was.
+	// tagWritten, further down in directCompact, is the honest record of whether the tag went out.
+	// "off" and "max" therefore send no thinking key of any kind; if some future server does want the
+	// body key, this is the single line to put it back on.
 	return undefined;
 }
 
@@ -2759,11 +2762,22 @@ export async function directCompact(args: {
 		systemPrompt: COMPACTOR_SYSTEM_PROMPT,
 		messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
 	};
+	// The engine's instruction ceiling, and a hard one (2026-10-19, the user's rule after a crash):
+	// Summary max plus GEN_MARGIN, never a token more. The scratch and thinking allowances used to be
+	// ADDED on top of this, which is how a model with a 30,000 aim ended up being told to generate
+	// 34,608 - past the point where the engine runs out of window and dies. From here they may only ever
+	// trim the ask, never raise it, however much room a model might theoretically have had.
+	const dCeiling = sizes.max + GEN_MARGIN;
 	const dScratch = scratchAllowanceFor(model, sizes.genCap);
-	const requestOptions: Record<string, unknown> = { maxTokens: sizes.genCap + dScratch.allowance, signal: args.signal, cacheRetention: "none" };
+	const dAsk = Math.min(sizes.genCap + dScratch.allowance, dCeiling);
+	// Whether the no-think tag went out with this request, logged, because "thinking is off in the
+	// settings" and "the engine was told" are two different claims, and last night needed the second one
+	// written down somewhere a person could read it.
+	const noteWritten = args.thinking === "off" && args.kind === "local" && !!options.noThinkMarker;
+	const requestOptions: Record<string, unknown> = { maxTokens: dAsk, signal: args.signal, cacheRetention: "none" };
 	if (model?.reasoning && args.thinking !== "off") requestOptions.reasoning = args.thinking;
-	// The per-model sampling flags + (local) effort kwargs ride into the request body here; the
-	// adapter merges samplingParams over the named fields, and llama-server reads them per request.
+	// The per-model sampling flags, plus (for a local model that takes an effort level) the effort
+	// itself, ride into the request body here; the adapter merges samplingParams over the named fields.
 	const dParams = samplingParamsFor(args.ref, options.sampling);
 	const dKwargs = refLooksLocal(args.ref) ? chatTemplateKwargsFor(args.thinking) : undefined;
 	if (dParams || dKwargs) requestOptions.samplingParams = { ...(dParams ?? {}), ...(dKwargs ?? {}) };
@@ -2833,12 +2847,13 @@ export async function directCompact(args: {
 				`generation stopped at the request cap (${fmt(requestCap)} tok) before a usable summary had arrived: ~${fmt(visTokens)} tok of readable summary out of ${fmt(wroteAll)} tok written` +
 					(reasonedAll > 0 ? `, of which ~${fmt(reasonedAll)} tok went to the model's own hidden reasoning` : "") +
 					(shaped ? "" : ", and what did arrive has no ledger shape in it") +
-					` - that reasoning is what strata's "of budget ... (max ...)" line was telling you about. Lower Thinking for this candidate, raise Summary max (now ${fmt(sizes.max)} tok), or move the trigger earlier so the segments get smaller.`,
+					` - that reasoning is what strata's "of budget ... (max ...)" line was telling you about. The instruction tops out at Summary max + ${GEN_MARGIN} and will not go higher, because past that the engine leaves its own window and crashes: so lower Thinking for this candidate, raise Summary max (now ${fmt(sizes.max)} tok), or move the trigger earlier so the segments get smaller.` +
+					(noteWritten ? ` The no-think tag WAS in this request and ${fmt(reasonedAll)} tok still came back as reasoning, so the fault is in the template strata is actually running, not in these settings.` : " No no-think tag was in this request (thinking is off but this model has no marker set), so the model was never told not to reason."),
 			)
 		}
 		// A kept truncation is a fact worth telling the user about, not a detail: the summary is short
 		// because the budget ran out, and the reader of the next summary deserves to know that.
-		logLine(loadConfig(), { event: "note", ref: args.ref, cutAtCap: requestCap, writtenTokens: wroteAll, reasoningTokens: reasonedAll, visibleTokens: visTokens, note: "the generation stopped at the request cap, but what arrived is a summary of at least the acceptance floor with its ledger shape intact - kept instead of moving to the next model" + (fromReasoning ? " (the text came from the reasoning channel)" : "") });
+		logLine(loadConfig(), { event: "note", ref: args.ref, cutAtCap: requestCap, tagWritten: noteWritten, writtenTokens: wroteAll, reasoningTokens: reasonedAll, visibleTokens: visTokens, note: "the generation stopped at the request cap, but what arrived is a summary of at least the acceptance floor with its ledger shape intact - kept instead of moving to the next model" + (fromReasoning ? " (the text came from the reasoning channel)" : "") });
 	}
 	// The exact conversation text the request carried - the stub-coverage gate counts the stub
 	// markers in it against the copies in the summary.
@@ -3117,8 +3132,12 @@ export async function summarizeWithRotation(
 		// initialization" and pi kept re-triggering on a context it could not compact. The allowance is
 		// therefore unconditional now (the template asks for scratch work anyway) and is clamped by what
 		// this model is permitted to emit, which is the only hard ceiling there is.
-		const scratch = scratchAllowanceFor(c.model, realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0));
-		const genCapFinal = realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0) + scratch.allowance;
+		// The same hard ceiling as the direct request (2026-10-19, the user's rule): what we tell the
+		// engine to generate tops out at Summary max + GEN_MARGIN, however much thinking and scratch room
+		// this model could theoretically have been given. Asking past that is how it ran off its window.
+		const dCeilingFallback = realSizes.max + GEN_MARGIN;
+		const scratch = scratchAllowanceFor(c.model, realSizes.genCap);
+		const genCapFinal = Math.min(realSizes.genCap + (THINKING_ALLOWANCE[th.level] ?? 0) + scratch.allowance, dCeilingFallback);
 		if (scratch.note) logLine(cfg, { event: "note", ref: c.ref, note: scratch.note });
 		let instructions = buildInstructions({
 			sizes: realSizes,
