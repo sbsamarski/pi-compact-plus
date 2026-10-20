@@ -7557,6 +7557,40 @@ let watcherCtx: Ctx | null = null;
  * session_compact handler below once the summary is really in the journal, and expired by age so a
  * cancelled compaction cannot resume a turn much later.
  */
+/**
+ * THE GATE: should a compaction that PI started be held back for now?
+ *
+ * pi's threshold and this extension's trigger point are two different numbers on purpose. pi's is set
+ * low (its settings.json `compaction.reserveTokens`) so that pi asks early - pi's request-time check is
+ * the one trigger that reliably fires while a session is mid-turn, which no timer of ours can promise.
+ * This extension's line is `window - extReserve(ctx)`, the percentage on the settings board, and it is
+ * the number that decides when a compaction is actually worth writing.
+ *
+ * Between the two, the answer is a cancel: nothing is summarised, nothing is cut, pi asks again on the
+ * next request, and the same request gets a real summary once our line is reached.
+ *
+ * Returns a sentence for the log while it should be held, and null when the compaction may proceed.
+ * Pure numbers by design - no files, no pi objects - so the rule is testable with a rig.
+ */
+export function holdUntilOurLine(args: {
+	reason: string;
+	fill: number;
+	window: number;
+	line: number;
+}): string | null {
+	// Only pi's threshold is a candidate. "manual" is the operator's own /compact, and an overflow is pi
+	// asking because a request was already refused for room - holding either would be a refusal.
+	if (args.reason !== "threshold") return null;
+	// Nothing measured, or no line to compare against: never invent a veto out of a zero.
+	if (!(args.window > 0) || !(args.fill > 0) || !(args.line > 0)) return null;
+	if (args.fill >= args.line) return null;
+	const pct = args.line > 0 ? Math.round((args.fill / args.line) * 100) : 0;
+	return `pi's threshold asked at ${fmt(args.fill)} of ${fmt(args.window)} tokens; this extension's own trigger point is ${fmt(args.line)} (${pct}% of the way there) - held, nothing written, pi will ask again on the next request`;
+}
+
+/** When the gate last said "held" on the screen. The log records every hold on its own throttle below. */
+let lastGateHoldNoticeAtMs = 0;
+
 const autoResumeTurn = { armed: false, warnedLongWait: false, atMs: 0, tries: 0, timer: undefined as any };
 /** pi's own API object, remembered at install. Everything else in this file reaches pi through a handler's
  *  parameter; these hand-back helpers run from a timer, with no handler on the stack, so the object has to be
@@ -7993,10 +8027,10 @@ function adviseOnPiFlag(ctx: any, cfg: Config): void {
 		event: "info",
 		note: `pi's own compaction is enabled in ${join(AGENT_DIR, "settings.json")} (compaction.enabled): pi's threshold is the trigger, this extension answers it with its own summary; nothing here writes that file`,
 	});
-	ctx?.ui?.notify?.(
-		`pi's OWN compaction is enabled in ${join(AGENT_DIR, "settings.json")} (compaction.enabled = true), and that is the arrangement this extension is built for now: pi's threshold is the trigger, pi asks through session_before_compact, and this extension answers with its own summary from its own model rotation - and stands its own timer down while the flag is on, so nothing races pi. Two things follow, and both are deliberate. If every model in the rotation fails, the last resort is pi's own summariser, so a summary still lands. If this extension is stopped by an error, pi compacts on its own. Set compaction.enabled back to false only if you want this extension's own timer to be the trigger again - it still works, and its trigger line is on the settings board.`,
-		"warning",
-	);
+	// The flag is logged, never announced. An explanation of pi's compaction flag is on the settings
+	// board in one line, and popping a paragraph over the operator's own prompt was the wrong place for
+	// it (2026-10-21, on request: 'get rid of this').
+
 }
 
 function fullyOff(cfg: Config): boolean {
@@ -8008,6 +8042,10 @@ function fullyOff(cfg: Config): boolean {
 // on every request; this stamp only says how soon a compaction may be STARTED after the last one that
 // cleared the safe-point gates.
 let nextCheckAtMs = 0;
+
+/** How recently the gate said "held" in the log - the log is the record, so every hold is written at most
+ *  once a minute rather than once per request. */
+let lastGateHoldLogMs = 0;
 
 function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?: any): void {
 	// The `context` event hands its own context down, so its gate reads the signal of the request it is
@@ -8590,6 +8628,30 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		if (skipNextStockCompaction) {
 			skipNextStockCompaction = false;
 			return undefined;
+		}
+		// PI RINGS THE DOORBELL, THIS EXTENSION OPENS THE DOOR (2026-10-21, the operator's design). pi's
+		// threshold is deliberately set earlier than our own trigger point; between the two, the compaction
+		// is held. The cancel answers pi so plainly that pi does not fall back to its own summariser.
+		{
+			const win = ctx.model?.contextWindow ?? Number(event.windowSize ?? 0) ?? 0;
+			const note = holdUntilOurLine({
+				reason: String(event.reason ?? ""),
+				fill: realContextTokens(ctx),
+				window: win,
+				line: win - extReserve(ctx),
+			});
+			if (note !== null) {
+				const nowMs = Date.now();
+				if (nowMs - lastGateHoldLogMs > 60_000) {
+					lastGateHoldLogMs = nowMs;
+					logLine(c0, { event: "auto_compaction_held", reason: event.reason, note });
+				}
+				if (nowMs - lastGateHoldNoticeAtMs > 600_000) {
+					lastGateHoldNoticeAtMs = nowMs;
+					ctx.ui?.notify?.(`Compaction held: ${note}`, "info");
+				}
+				return { cancel: true };
+			}
 		}
 		compactionInFlight = true;
 		try {
