@@ -4820,12 +4820,17 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 		ctx.ui.notify(`${name} left unchanged.`, "info");
 		return back;
 	}
+	// Was this the active template before this edit - by name, or by the text it still matched (entries
+	// activated before names existed)? Same rule as the library's own editor, 2026-10-20.
+	const wasActive = cfg.activeTemplateName === name || (!!cfg.templateUserDefaults?.trim() && found.text.trim() === cfg.templateUserDefaults.trim());
 	cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { ...t, text } : t));
-	// The active template follows its name (2026-10-20, the operator's design): editing the active one here
-	// refreshes what gets sent rather than detaching the choice from the row.
+	if (wasActive) {
+		cfg.activeTemplateName = name;
+		cfg.templateUserDefaults = text;
+	}
 	if (cfg.activeTemplateName === name) cfg.templateUserDefaults = text;
 	saveConfig(cfg);
-	ctx.ui.notify(`${name} saved.`, "info");
+	ctx.ui.notify(`${name} saved${wasActive ? " - still the active template" : ""}.`, "info");
 	return back;
 }
 
@@ -4894,7 +4899,7 @@ class UserTemplateMenu implements Component, Focusable {
 				// read differently on exactly the row you use (2026-10-07 report). One format for every row.
 				currentValue: `${!extActive && (t.name === activeName || t.text.trim() === active) ? "ACTIVE • " : ""}${t.text.split("\n").length} lines`,
 				values: ["open"],
-				description: "Enter opens it in the editor (Enter saves, Esc discards). Ctrl+A makes this the active template, Ctrl+K copies it under a new name, Ctrl+D deletes it after asking, Ctrl+Y puts its text on the clipboard.",
+				description: "Enter opens it in the editor (Enter saves, Esc discards). Ctrl+P makes this the active template, Ctrl+K copies it under a new name, Ctrl+D deletes it after asking, Ctrl+Y puts its text on the clipboard.",
 			});
 		}
 		this.items = items;
@@ -4942,12 +4947,18 @@ class UserTemplateMenu implements Component, Focusable {
 			return;
 		}
 		const cfg = loadConfig();
+		// Was THIS the active template before the edit? Answer from the state as it stands now: the stored
+		// name, or - for any library entry activated before names existed - the text it still matches.
+		// Fixing the 2026-10-20 report: editing the active template used to leave the list with nothing
+		// active, because the identity was the text and the edit had just changed it.
+		const wasActive = cfg.activeTemplateName === name || (!!cfg.templateUserDefaults?.trim() && found.text.trim() === cfg.templateUserDefaults.trim());
 		cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { name, text: saved } : t));
-		// The active template follows its name (2026-10-20, the operator's design): editing the one that is
-		// active refreshes what gets sent instead of silently un-binding the choice.
-		if (cfg.activeTemplateName === name) cfg.templateUserDefaults = saved;
+		if (wasActive) {
+			cfg.activeTemplateName = name;
+			cfg.templateUserDefaults = saved;
+		}
 		saveConfig(cfg);
-		this.ctx.ui.notify(`${name} saved (${saved.split("\n").length} lines). Ctrl+A makes it the active template.`, "info");
+		this.ctx.ui.notify(`${name} saved (${saved.split("\n").length} lines)${wasActive ? " - still the active template" : ". Ctrl+P makes it the active template."}.`, "info");
 		this.rebuild();
 	}
 
@@ -5009,7 +5020,12 @@ class UserTemplateMenu implements Component, Focusable {
 			this.createNew();
 			return;
 		}
-		if (data === "\x0b" || data === "\x04" || data === "\x01") {
+		if (data === "\x0b" || data === "\x04" || data === "\x01" || data === "\x10") {
+			// Ctrl+P (\x10) was added on 2026-10-20 because Ctrl+A stopped reaching this screen: pi binds
+			// ctrl+a to the editor action cursor-home, and whatever pi does with it, the byte never arrives
+			// here to be argued with. Ctrl+A stays accepted in case a terminal still delivers it, and Ctrl+P
+			// is the one that works. The key is named in the header line and in every row description, so the
+			// operator is never hunting for an undocumented binding.
 			const t = this.selectedTarget();
 			if (t === undefined) return;
 			if (data === "\x0b") this.onDone(`tpl-dup:${encodeURIComponent(t ?? "")}`); // modal, board loop
@@ -5035,7 +5051,7 @@ class UserTemplateMenu implements Component, Focusable {
 		// 2026-10-07: the key list used to be the FIRST ROW of the library, so it could be highlighted
 		// and 'opened' - it is an instruction, not an option. Printed above the list now, with the count.
 		const head = truncateToWidth(
-			`  Enter opens - Ctrl+N new - Ctrl+K duplicate - Ctrl+D delete - Ctrl+A set active - Ctrl+Y clipboard - ${loadConfig().userTemplates.length} saved`,
+			`  Enter opens - Ctrl+N new - Ctrl+K duplicate - Ctrl+D delete - Ctrl+P set active - Ctrl+Y clipboard - ${loadConfig().userTemplates.length} saved`,
 			Math.max(20, width),
 		);
 		return this.list ? [head, "", ...this.list.render(width)] : [];
