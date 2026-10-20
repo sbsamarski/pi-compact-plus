@@ -3527,6 +3527,7 @@ function keyOf(data: string): string {
 	}
 	// Still worth answering the plain characters directly: a terminal that never negotiated the new
 	// protocol, and a unit test that hands us bytes, both arrive here.
+	if (data === "\x1b") return "escape";
 	if (data === "\r" || data === "\n") return "enter";
 	if (data === " ") return "space";
 	if (data === "\x7f" || data === "\b") return "backspace";
@@ -6440,6 +6441,26 @@ function templateMenu(done: (selectedValue?: string) => void): Component {
 	);
 }
 
+/** Break one line into screen rows of at most `width` columns, cutting at a space where there is one.
+ *  2026-10-21, on request: a template line is written as one long line, and the read-only preview cut it
+ *  at the right edge, so the middle of every sentence was simply invisible. A word longer than the row is
+ *  split rather than dropped - nothing in a preview may be unreachable. */
+function wrapToWidth(line: string, width: number): string[] {
+	const w = Math.max(10, width);
+	if (!line) return [""];
+	if (line.length <= w) return [line];
+	const out: string[] = [];
+	let rest = line;
+	while (rest.length > w) {
+		const cut = rest.lastIndexOf(" ", w) > 0 ? rest.lastIndexOf(" ", w) : w;
+		out.push(rest.slice(0, cut));
+		rest = rest.slice(cut).replace(/^ +/, "");
+		if (!rest) break;
+	}
+	if (rest) out.push(rest);
+	return out.length ? out : [""];
+}
+
 /**
  * A text screen of this extension's own (2026-10-06). pi's extension UI context carries only select,
  * confirm, input and notify - there is NO editor in it - so every editor and preview this extension
@@ -6451,11 +6472,16 @@ function templateMenu(done: (selectedValue?: string) => void): Component {
  * type, Backspace deletes before the caret, Enter starts a new line (in a one-line field it saves),
  * Ctrl+S saves, Escape closes without saving.
  */
+/** How many screen rows a read-only view shows at once - the same window the editable view uses. */
+const READONLY_PAGE = 19;
+
 export class TextScreen implements Component, Focusable {
 	private lines: string[];
 	private line = 0;
 	private col = 0;
 	private top = 0;
+	/** Where the read-only view starts, counted in screen rows after wrapping. */
+	private vrow = 0;
 	private dirty = false;
 	private isFocused = false;
 
@@ -6499,12 +6525,15 @@ export class TextScreen implements Component, Focusable {
 			return;
 		}
 		if (!this.editable) {
-			if (k === 'up') this.move(this.line - 1, 0);
-			else if (k === 'down') this.move(this.line + 1, 0);
-			else if (k === 'pgup') this.move(this.line - 20, 0);
-			else if (k === 'pgdn') this.move(this.line + 20, 0);
-			else if (k === 'home') this.move(0, 0);
-			else if (k === 'end') this.move(this.lines.length - 1, 0);
+			// Read-only scrolling moves by SCREEN rows, not source lines (2026-10-21, the same report as the
+			// word wrap): one wrapped paragraph is several rows, so a line at a time jumped past whatever was
+			// actually on screen. 'end' asks for more than exists and render() clamps it to the last page.
+			if (k === 'up') this.vrow = Math.max(0, this.vrow - 1);
+			else if (k === 'down') this.vrow += 1;
+			else if (k === 'pgup') this.vrow = Math.max(0, this.vrow - READONLY_PAGE);
+			else if (k === 'pgdn') this.vrow += READONLY_PAGE;
+			else if (k === 'home') this.vrow = 0;
+			else if (k === 'end') this.vrow = Number.MAX_SAFE_INTEGER;
 			this.tui.requestRender();
 			return;
 		}
@@ -6565,6 +6594,21 @@ export class TextScreen implements Component, Focusable {
 				: 'type to edit - Enter saves, Esc closes without saving')
 			: 'Up/Down or PgUp/PgDn to scroll - Esc closes';
 		const out: string[] = ['', head, typeof theme?.dim === 'function' ? theme.dim(keys) : keys, ''];
+		if (!this.editable) {
+			// WORD WRAP, read-only only (2026-10-21, the operator: "the preview does not word wrap, so i
+			// cannot see what it says"). The editor below deliberately keeps one long line per line: the caret
+			// position, the arrow keys and the saved text all speak in real lines, and wrapping the editing
+			// view would break the first two to fix the third.
+			const rows: string[] = [];
+			for (const l of this.lines) rows.push(...wrapToWidth(l.replace(/\t/g, "  "), inner - 2));
+			const maxTop = Math.max(0, rows.length - READONLY_PAGE);
+			this.vrow = Math.max(0, Math.min(this.vrow, maxTop));
+			for (let i = this.vrow; i < Math.min(rows.length, this.vrow + READONLY_PAGE); i++) out.push("  " + rows[i]);
+			if (!rows.length) out.push("  (nothing to show)");
+			const where = `  row ${String(this.vrow + 1)}-${String(Math.min(rows.length, this.vrow + READONLY_PAGE))} of ${String(rows.length)}`;
+			out.push(typeof theme?.dim === 'function' ? theme.dim(where) : where);
+			return out.map((l) => truncateToWidth(l, inner));
+		}
 		if (this.line - this.top > 17) this.top = this.line - 17;
 		if (this.line < this.top) this.top = this.line;
 		const last = Math.min(this.lines.length, this.top + 19);
@@ -6621,9 +6665,14 @@ async function editField(ctx: Ctx, title: string, value: string): Promise<string
 async function previewRequest(ctx: Ctx, ref: string, full = false): Promise<void> {
 	const cfg = loadConfig();
 	const model = lookupRef(ref, ctx);
+	// 2026-10-21, on request: "if the current compaction model number 1 is not available, the preview
+	// refuses to open. but that should not happen, because the preview does not depend on a model". It was
+	// right - a preview sends nothing, and what it shows (the active template with its tags filled, the
+	// size block, the stubbing, the caps) is read from the saved settings for that ref, not measured from
+	// a live model. So it previews, and says plainly which one figure came out of the session's own window
+	// because the model itself was not there to be asked.
 	if (!model) {
-		ctx.ui?.notify?.(`Model not in the try order: ${ref}`, "error");
-		return;
+		ctx.ui?.notify?.(`Previewing ${ref} from its saved settings - that model is not available right now, so nothing about it was measured live.`, "info");
 	}
 	const profile = profileFor(cfg, model, ref);
 	const projection: any = (ctx as any)?.sessionManager?.buildSessionProjection?.();
@@ -6638,8 +6687,8 @@ async function previewRequest(ctx: Ctx, ref: string, full = false): Promise<void
 	const main = serializeRegion(region, { startTurn: prevTurn.lastTurn, inputStubs: profile.inputStubs, argCap: profile.argCap });
 	const keptText = kept.map((m: any) => `[${String(m.role)} - kept]: ${contentTextOf(m.content).slice(0, 400)}`).join("\n\n");
 	const inputTokens = Math.ceil((main.text.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
-	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: (ctx as any)?.model?.contextWindow ?? 0 }, 0);
-	const instructions = buildInstructions({ sizes, inputTokens, segmentTokens: inputTokens - SUMMARISER_FRAMING_TOKENS, kind: isLocalModel(model) ? "local" : "online", options: profile, additionalInstruction: cfg.additionalInstruction ?? null, userDefault: cfg.templateUserDefaults, customInstructions: undefined });
+	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: model?.contextWindow ?? (ctx as any)?.model?.contextWindow ?? 0 }, 0);
+	const instructions = buildInstructions({ sizes, inputTokens, segmentTokens: inputTokens - SUMMARISER_FRAMING_TOKENS, kind: model ? (isLocalModel(model) ? "local" : "online") : (/localhost|127\.0\.0\.1/i.test(ref) ? "local" : "online"), options: profile, additionalInstruction: cfg.additionalInstruction ?? null, userDefault: cfg.templateUserDefaults, customInstructions: undefined });
 	// 2026-10-07 ORDER FIX ("it shows random code, not the request"): the conversation region used to come
 	// FIRST, and in a session full of scripts and JSON that is a wall of code, with the filled template
 	// pushed off the bottom. The request is presented in the order a reader wants it: the INSTRUCTIONS (the
