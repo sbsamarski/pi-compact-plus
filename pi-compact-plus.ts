@@ -1115,15 +1115,58 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
 	}
 }
 
+/** The events that are bookkeeping rather than news. They stay in the file - they are how a strange
+ *  compaction gets diagnosed afterwards - but they are not what the operator opens the log to read, and
+ *  in a long session they pushed the result lines off the screen entirely (2026-10-21, on request:
+ *  "sometimes I cannot even see the compaction info because the log is filled with some silly useless
+ *  lines"). 'v' in the log view shows them again.
+ *
+ *  Deliberately NOT here: start, attempt, ok, fail, direct_fail, accepted_with_warnings, give_up, done,
+ *  every *_failed, retry, skip, elision_error, auto_trigger. Skip stays because "model X was not in the
+ *  model list" is the answer to a question the operator asks; auto_trigger stays because it is the
+ *  reason a compaction started. */
+const LOG_CHATTER = new Set([
+	"auto_resume_waiting",
+	"auto_resume_turn",
+	"auto_resume_retrying",
+	"auto_resume_cancelled",
+	"auto_resume_failed",
+	"auto_resume_not_needed",
+	"auto_resume_dropped",
+	"preprocess",
+	"sizes",
+	"note",
+	"info",
+	"trim",
+	"user_prompts",
+	"elision",
+	"elision_off",
+	"elision_hold",
+	"two_compactors",
+	"safe_point_held",
+	"compaction_landed",
+]);
+
 /**
  * The log, human-readable: date and time first, then status, model, elapsed time and the transfer
  * figures in tokens (words are not logged - they were the old sizing flaw, and tokens are what the
  * acceptance window is written in). Unknown fields are simply left out.
  */
-function tailLogPretty(lines = 16): string {
+function tailLogPretty(lines = 16, verbose = false): string {
 	try {
-		const all = readFileSync(LOG_PATH, "utf8").split("\n").filter(Boolean).slice(-lines);
-		if (!all.length) return "(the log is empty so far)";
+		// Read far more lines than are shown, because filtering drops most of them: 201 of the last 400
+		// entries in a real session were one bookkeeping event.
+		const raw = readFileSync(LOG_PATH, "utf8").split("\n").filter(Boolean).slice(verbose ? -lines : -lines * 60);
+		const all = verbose
+			? raw.slice(-lines)
+			: raw.filter((l: string) => {
+					try {
+						return !LOG_CHATTER.has(String(JSON.parse(l)?.event ?? ""));
+					} catch {
+						return true; /* a line we cannot read is not a line to hide */
+					}
+				}).slice(-lines);
+		if (!all.length) return verbose ? "(the log is empty so far)" : "(no result lines yet - press v to see every line, including the bookkeeping)";
 		return all
 			.map((l: string) => {
 				try {
@@ -6382,24 +6425,27 @@ export class LogView implements Component {
 	handleInput(data: string): void {
 		const k = keyOf(data);
 		if (k === "escape" || k === "enter" || k === "q") this.done();
+		else if (k === "v") { this.verbose = !this.verbose; this.offset = -1; this.tui?.requestRender?.(); }
 		else if (k === "up") { this.offset = Math.max(0, this.offset - 1); this.tui?.requestRender?.(); }
 		else if (k === "down") { this.offset += 1; this.tui?.requestRender?.(); }
 		else if (k === "pgup") { this.offset = Math.max(0, this.offset - 30); this.tui?.requestRender?.(); }
 		else if (k === "pgdn") { this.offset += 30; this.tui?.requestRender?.(); }
 	}
 	private offset = -1; // -1 = start at the newest page
+	/** false = the result lines only; true = every line, bookkeeping included (v toggles it) */
+	private verbose = false;
 
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		const all = tailLogPretty(200).split("\n");
+		const all = tailLogPretty(200, this.verbose).split("\n");
 		const perPage = 30;
 		const maxOffset = Math.max(0, all.length - perPage);
 		if (this.offset < 0) this.offset = maxOffset; // the first open shows the NEWEST entries
 		this.offset = Math.min(this.offset, maxOffset);
 		const shown = all.slice(this.offset, this.offset + perPage);
 		const lines = [
-			`Log — showing ${all.length - this.offset - shown.length + 1}-${all.length - this.offset} of ${all.length} recent lines — Up/Down or PgUp/PgDn to scroll, Esc to go back`,
+			`Log — ${this.verbose ? "EVERY line, bookkeeping included" : "results only"} — showing ${all.length - this.offset - shown.length + 1}-${all.length - this.offset} of ${all.length} — v shows ${this.verbose ? "just the results" : "every line"}, Up/Down or PgUp/PgDn to scroll, Esc to go back`,
 			"",
 			...shown,
 		];
