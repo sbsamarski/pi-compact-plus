@@ -284,6 +284,13 @@ type Config = {
 	/** The USER DEFAULT for the main summary template - a checkpoint saved from the submenu. When
 	 *  the active template is empty (null), it follows this; "" pins the extension default. */
 	templateUserDefaults: string | null;
+	/** Which library entry is the active one, by NAME (2026-10-20, the operator's design). The text copy in
+	 *  templateUserDefaults above is what actually gets sent, and it stays in step with this name: choosing
+	 *  a template writes both, editing that template refreshes the copy, deleting it clears the name. Before
+	 *  this there was only the text, so editing the active template detached it from its library row and the
+	 *  list showed nothing as active - a choice that looked lost. null or a name that no longer exists falls
+	 *  back to the text comparison, so a config written before this field still reads correctly. */
+	activeTemplateName: string | null;
 	/** A whole template that an older config kept in the "additional instruction" slot. Kept for
 	 *  reference, never sent: the template is the single text in templateUserDefaults. */
 	templatePreviousCopy: string | null;
@@ -391,6 +398,7 @@ const DEFAULT_CONFIG: Config = {
 	categorySentences: null,
 	categoryUserDefaults: null,
 	templateUserDefaults: null,
+	activeTemplateName: null,
 	userTemplates: [],
 	templatePreviousCopy: null,
 };
@@ -3934,6 +3942,13 @@ export class OrderList implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
+		// 2026-10-20, learned the hard way with a keystroke harness (TMP/pcp_keys.mts): the model options
+		// screen is mounted by SWAPPING this.list for it, not by the list widget's own submenu, so the
+		// widget reports no submenu for the whole time the options screen is legitimately open. A guard here
+		// that trusted widget.submenuComponent released the capture on the first keystroke and threw the
+		// operator straight back out of the options screen - the harness caught that before it was ever
+		// loaded. If this capture is ever hardened, it needs its own bookkeeping (keep the child screen and
+		// clear the flag when it goes away), not the widget's state.
 		// While a model's options screen is open it owns the keyboard wholesale - digits and space
 		// belong to its own rows there, not to the list underneath.
 		if (this.inSubmenu) {
@@ -4778,6 +4793,12 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 			return back;
 		}
 		cfg.userTemplates = cfg.userTemplates.filter((t) => t.name !== name);
+		// 2026-10-20: if the deleted entry was the active one, the choice goes back to the extension default
+		// openly, rather than leaving a name that resolves to nothing and a list that shows no active row.
+		if (cfg.activeTemplateName === name) {
+			cfg.activeTemplateName = null;
+			cfg.templateUserDefaults = null;
+		}
 		saveConfig(cfg);
 		ctx.ui.notify(`${name} deleted.`, "info");
 		return back;
@@ -4800,6 +4821,9 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 		return back;
 	}
 	cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { ...t, text } : t));
+	// The active template follows its name (2026-10-20, the operator's design): editing the active one here
+	// refreshes what gets sent rather than detaching the choice from the row.
+	if (cfg.activeTemplateName === name) cfg.templateUserDefaults = text;
 	saveConfig(cfg);
 	ctx.ui.notify(`${name} saved.`, "info");
 	return back;
@@ -4830,6 +4854,12 @@ class UserTemplateMenu implements Component, Focusable {
 		const cfg = loadConfig();
 		const active = this.activeText();
 		const extActive = active === DEFAULT_TEMPLATE_TEXT.trim();
+		// The ACTIVE marker follows the name, not the text (2026-10-20, the operator's design): editing the
+		// active template used to detach it from its own row, so the list showed nothing active at all. A
+		// config that never stored a name still resolves, by matching the text once here.
+		const activeName = cfg.activeTemplateName && cfg.userTemplates.some((t) => t.name === cfg.activeTemplateName)
+			? cfg.activeTemplateName
+			: cfg.userTemplates.find((t) => t.text.trim() === active)?.name ?? null;
 		// The model that would be asked: number 1 in the compaction try order. Its own settings fill the tags
 		// of the request preview below (2026-10-07, on request).
 		const firstRef = Object.keys(cfg.models)[0] ?? "";
@@ -4862,7 +4892,7 @@ class UserTemplateMenu implements Component, Focusable {
 				label: t.name,
 				// The active template showed only "ACTIVE" - the line count was dropped for it, so the column
 				// read differently on exactly the row you use (2026-10-07 report). One format for every row.
-				currentValue: `${!extActive && t.text.trim() === active ? "ACTIVE • " : ""}${t.text.split("\n").length} lines`,
+				currentValue: `${!extActive && (t.name === activeName || t.text.trim() === active) ? "ACTIVE • " : ""}${t.text.split("\n").length} lines`,
 				values: ["open"],
 				description: "Enter opens it in the editor (Enter saves, Esc discards). Ctrl+A makes this the active template, Ctrl+K copies it under a new name, Ctrl+D deletes it after asking, Ctrl+Y puts its text on the clipboard.",
 			});
@@ -4913,6 +4943,9 @@ class UserTemplateMenu implements Component, Focusable {
 		}
 		const cfg = loadConfig();
 		cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { name, text: saved } : t));
+		// The active template follows its name (2026-10-20, the operator's design): editing the one that is
+		// active refreshes what gets sent instead of silently un-binding the choice.
+		if (cfg.activeTemplateName === name) cfg.templateUserDefaults = saved;
 		saveConfig(cfg);
 		this.ctx.ui.notify(`${name} saved (${saved.split("\n").length} lines). Ctrl+A makes it the active template.`, "info");
 		this.rebuild();
@@ -4930,12 +4963,17 @@ class UserTemplateMenu implements Component, Focusable {
 		const text = name === null ? "" : cfg.userTemplates.find((t) => t.name === name)!.text;
 		if (!text.trim() && name !== null) {
 			cfg.templateUserDefaults = "";
+			cfg.activeTemplateName = name;
 			saveConfig(cfg);
 			this.ctx.ui.notify(`${name} is empty, so making it active pins the EXTENSION default (that is what an empty template means). Put text in it, then Ctrl+A again.`, "warning");
 			this.rebuild();
 			return;
 		}
 		cfg.templateUserDefaults = text;
+		// The name is what the list marks ACTIVE and what keeps the choice attached through an edit
+		// (2026-10-20, the operator's design). null means the extension default, which the list shows on its
+		// own row.
+		cfg.activeTemplateName = name;
 		saveConfig(cfg);
 		this.ctx.ui.notify(name === null ? "The active template is the extension default again." : `${name} is now the ACTIVE template - this is the text the summarizer gets.`, "info");
 		this.rebuild();
