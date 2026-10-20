@@ -7991,10 +7991,10 @@ function adviseOnPiFlag(ctx: any, cfg: Config): void {
 	if (!readPiCompactionEnabled()) return;
 	logLine(cfg, {
 		event: "info",
-		note: `pi's own compaction is enabled in ${join(AGENT_DIR, "settings.json")} (compaction.enabled); this extension reads that flag and never writes it`,
+		note: `pi's own compaction is enabled in ${join(AGENT_DIR, "settings.json")} (compaction.enabled): pi's threshold is the trigger, this extension answers it with its own summary; nothing here writes that file`,
 	});
 	ctx?.ui?.notify?.(
-		`Heads-up: pi's OWN compaction is still enabled in its settings (compaction.enabled = true). This extension never touches that file. While it stays on, pi can compact by itself with pi's own summariser, and it will do so if this extension is ever stopped by an error. To keep pi's compaction off for good, set compaction.enabled to false in ${join(AGENT_DIR, "settings.json")} and /reload.`,
+		`pi's OWN compaction is enabled in ${join(AGENT_DIR, "settings.json")} (compaction.enabled = true), and that is the arrangement this extension is built for now: pi's threshold is the trigger, pi asks through session_before_compact, and this extension answers with its own summary from its own model rotation - and stands its own timer down while the flag is on, so nothing races pi. Two things follow, and both are deliberate. If every model in the rotation fails, the last resort is pi's own summariser, so a summary still lands. If this extension is stopped by an error, pi compacts on its own. Set compaction.enabled back to false only if you want this extension's own timer to be the trigger again - it still works, and its trigger line is on the settings board.`,
 		"warning",
 	);
 }
@@ -8104,6 +8104,28 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 		// drops even that is the danger line, MIDRUN_DANGER_TOKENS under the whole window, where a refusal is the
 		// alternative and a refused session cannot be compacted at all.
 		const urgent = wireTokens > 0 && wireTokens >= window - MIDRUN_DANGER_TOKENS;
+		// ONE TRIGGER, NOT TWO (2026-10-21, the operator's design, after pi's compaction.enabled was set to
+		// true). pi's threshold in its settings.json is the trigger now: pi measures the same context, fires
+		// session_before_compact, and this extension answers with its own summary. Starting our own
+		// compaction a moment earlier would only race it - two schedulers, two opinions about the safe point,
+		// and the second compaction of a turn nobody asked for. So the watcher reports and stands back.
+		// The exception is the danger line, kept on purpose: at MIDRUN_DANGER_TOKENS under the window the next
+		// request is refused for room, a refused session cannot be compacted at all, and there is no pi
+		// request left to wait for. Then the watcher still acts.
+		if (!urgent && readPiCompactionEnabled()) {
+			if (Date.now() - lastWatchLogMs > 600_000) {
+				lastWatchLogMs = Date.now();
+				logLine(cfg, {
+					event: "auto_trigger",
+					estimate: tokens,
+					wire: wireTokens,
+					line,
+					window,
+					note: "standing back: pi's own threshold (settings.json compaction.enabled) is the trigger; this extension answers it",
+				});
+			}
+			return;
+		}
 		const sp = compactSafePoint(ctx, source === "context", urgent);
 		if (!sp.ok) {
 			const nowMs = Date.now();
