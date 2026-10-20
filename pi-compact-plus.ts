@@ -1126,6 +1126,8 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
  *  model list" is the answer to a question the operator asks; auto_trigger stays because it is the
  *  reason a compaction started. */
 const LOG_CHATTER = new Set([
+	// Nothing writes these any more (the automatic continuation was deleted 2026-10-21), but the log file
+	// still holds years of them, and the results-only view must go on hiding them.
 	"auto_resume_waiting",
 	"auto_resume_turn",
 	"auto_resume_retrying",
@@ -5918,7 +5920,7 @@ class CompactionMenu implements Component, Focusable {
 					this.onAction(
 						"__exit:notice:" +
 							(on
-								? "COMPACTION IS ON. THE TRIGGER IS THIS EXTENSION'S OWN CHECK: it measures the context on every tick, including during a long tool-calling run, and compacts when your start point is passed. No pi setting is involved. THIS EXTENSION WRITES EVERY SUMMARY."
+								? `COMPACTION IS ON. WHO TIMERS DEPENDS ON PI'S OWN SWITCH: with pi's compaction enabled, pi's threshold fires first and this extension HOLDS the compaction until its own start point is reached; with pi's switched off, this extension's own check is the trigger. Either way THIS EXTENSION WRITES EVERY SUMMARY. Your start point is on the settings board. pi's settings are read, never written.`
 								: "THIS EXTENSION'S COMPACTION IS OFF, and nothing of it touches pi's settings. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS UNTIL ONE OF THE TWO IS ON."),
 					);
 					return;
@@ -7591,169 +7593,13 @@ export function holdUntilOurLine(args: {
 /** When the gate last said "held" on the screen. The log records every hold on its own throttle below. */
 let lastGateHoldNoticeAtMs = 0;
 
-const autoResumeTurn = { armed: false, warnedLongWait: false, atMs: 0, tries: 0, timer: undefined as any };
-/** pi's own API object, remembered at install. Everything else in this file reaches pi through a handler's
- *  parameter; these hand-back helpers run from a timer, with no handler on the stack, so the object has to be
- *  kept. It is the same object pi passes to every handler - this is a reference, not a second path into pi.
- */
-let extApi: any;
-/** The sentence the interrupted turn is picked up with. Short on purpose: it is a nudge, not a brief - the
- *  summary above it already says what the work was and what comes next.
- */
-const HAND_BACK_TEXT =
-	"The automatic compaction landed and interrupted the turn that was running. Continue that work from the summary above: do not greet me, do not re-read what you had already read, and do not redo a step the summary marks as finished. Pick up at the current point.";
+// NO AUTOMATIC CONTINUATION (deleted 2026-10-21, on the operator's instruction). This extension used
+// to send its own message into the session after a mid-turn compaction, worded to read as the
+// operator's own prompt, with a timer and retries behind it to push it through pi's guards. That put
+// words in the operator's mouth inside their own session. A mid-turn compaction still interrupts the
+// turn - pi's compact() has to abort it to write the summary - and now the operator decides how to
+// pick the work back up. The notices below say exactly that, and nothing else.
 
-/** Queue one attempt at the hand-back. One flight at a time: while a timer is pending, further nudges from
- *  other events are no-ops, so agent_settled and session_compact cannot stack up attempts that each send a
- *  message of their own.
- */
-function scheduleHandBack(ms: number, api: any = extApi): void {
-	if (autoResumeTurn.timer !== undefined) return;
-	autoResumeTurn.timer = setTimeout(() => {
-		autoResumeTurn.timer = undefined;
-		runTimerBody("hand-back", () => tryHandBack(api));
-	}, ms);
-	(autoResumeTurn.timer as unknown as { unref?: () => void })?.unref?.();
-}
-
-/** Arm the hand-back: a mid-run crossing is about to interrupt a turn, and that turn must not wait for a
- *  keystroke. Spent by tryHandBack when pi accepts the message, dropped when pi refuses for good, and expired
- *  by age so a compaction that was cancelled cannot resume a turn much later.
- */
-function armHandBack(): void {
-	autoResumeTurn.armed = true;
-	autoResumeTurn.atMs = Date.now();
-	autoResumeTurn.tries = 0;
-	autoResumeTurn.warnedLongWait = false;
-}
-
-/** Stop expecting a hand-back: a settled crossing interrupts nothing, and a compaction rotation that failed
- *  twice lands no summary to continue from. Only says so in the log if something had already been attempted,
- *  because "nothing was ever armed" and "we gave up trying" are different facts worth different records.
- */
-function cancelHandBack(why: string): void {
-	const wasArmed = autoResumeTurn.armed;
-	const attempted = autoResumeTurn.tries > 0;
-	if (autoResumeTurn.timer !== undefined) {
-		clearTimeout(autoResumeTurn.timer);
-		autoResumeTurn.timer = undefined;
-	}
-	autoResumeTurn.armed = false;
-	autoResumeTurn.tries = 0;
-	autoResumeTurn.warnedLongWait = false;
-	if (wasArmed && attempted) logLine(loadConfig(), { event: "auto_resume_cancelled", note: why });
-}
-
-/** Whether the user took the session back on their own before the hand-back could go out. Their own message
- *  IS the resumption; sending ours as well would only talk over them. Newest-first, so the scan stops at the
- *  first user entry it finds, whatever that entry's date turns out to be.
- */
-function userSpokeSince(atMs: number, ctx: any): boolean {
-	try {
-		const branch: any[] = (ctx as any)?.sessionManager?.getBranch?.() ?? [];
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const e = branch[i];
-			if (!e || e.type !== "message" || e.message?.role !== "user") continue;
-			const t = Date.parse(String(e.timestamp ?? ""));
-			return Number.isFinite(t) ? t >= atMs - 2_000 : true;
-		}
-		return false;
-	} catch {
-		return false;
-	}
-}
-
-/** THE HAND-BACK ITSELF - and why it runs on a timer instead of inline.
-
- *  The first version sent the continuation from inside the session_compact handler and wrote a log line
- *  saying the turn had been handed back. Nothing reached the transcript. pi's compact() emits session_compact
- *  while its own _compactionAbortController is still set, and clears that state a few lines later, with a
- *  comment that says the quiet part out loud: "compaction_end listeners may submit queued prompts, so expose
- *  idle state before notifying them". A prompt submitted from the handler dies on pi's guard, "Cannot submit
- *  a prompt while compaction is in progress" - and because sendUserMessage returns a promise nobody was
- *  waiting for, that refusal was thrown into the wind: no log, no notice on screen, summary in place, turn
- *  unresumed. The user's words for it: "it did NOT resume after it".
- *
- *  compaction_end never reaches an extension (it is not in the extension event union), so the fix is to
- *  submit the message at a moment pi will take it: wait for the session to be idle, retry while pi still
- *  refuses, keep the whole thing inside the 20-minute age limit, and record what actually happened - took it,
- *  still waiting, refused for good, or not needed because the user got there first.
- */
-async function tryHandBack(api: any = extApi): Promise<void> {
-	if (!autoResumeTurn.armed) return;
-	const cfg = loadConfig();
-	const waited = Date.now() - autoResumeTurn.atMs;
-	if (waited > 1_200_000) {
-		cancelHandBack("the armed continuation went stale");
-		logLine(cfg, {
-			event: "auto_resume_dropped",
-			seconds: Math.round(waited / 1000),
-			note: "the armed continuation was older than 20 minutes, so nothing was sent",
-		});
-		(watcherCtx as any)?.ui?.notify?.("The summary landed, but the automatic continuation went stale. Send any message and the work carries on from the summary.", "warning");
-		return;
-	}
-	if (userSpokeSince(autoResumeTurn.armed ? autoResumeTurn.atMs : 0, watcherCtx)) {
-		cancelHandBack("a message from the user resumed the session first");
-		logLine(cfg, {
-			event: "auto_resume_not_needed",
-			seconds: Math.round(waited / 1000),
-			note: "a user message landed after the interrupt, so the session was already moving again",
-		});
-		return;
-	}
-	// pi's own idle check covers "no active agent run, compaction, branch summary, retry, or queued
-	// continuation", which is exactly the state in which a prompt is accepted. If the context says busy, wait:
-	// the price of waiting is two seconds, the price of guessing wrong is a lost turn.
-	if ((watcherCtx as any)?.isIdle?.() === false) {
-		// Deliberately silent (2026-10-19, on request). This line went out every two seconds for the
-		// whole length of a compaction - 423 identical entries in one episode - which buried the one
-		// thing worth reading, namely which model was writing the summary. A wait is the expected
-		// state while pi holds the session busy, so it earns no log line at all. The one case that
-		// does is a wait that has gone on past a minute with no compaction running: that is no longer
-		// a wait, it is being stuck, and it says so once.
-		if (Date.now() - autoResumeTurn.atMs > 60_000 && !autoResumeTurn.warnedLongWait) {
-			autoResumeTurn.warnedLongWait = true;
-			logLine(cfg, {
-				event: "auto_resume_waiting",
-				seconds: Math.round((Date.now() - autoResumeTurn.atMs) / 1000),
-				note: "no continuation has gone out for over a minute and no compaction is running - something is holding the session",
-			});
-			watcherCtx?.ui?.notify?.("The automatic continuation has been waiting over a minute; send any short message and the work picks up from the summary.", "warning");
-		}
-		scheduleHandBack(2_000, api);
-		return;
-	}
-	autoResumeTurn.tries += 1;
-	try {
-		// No deliverAs: the session is idle, so pi appends the message and starts the turn now. Passing
-		// "followUp" was the other half of the old bug - it queued the message into a queue that a run which
-		// had just been aborted never comes back to drain.
-		await api?.sendUserMessage?.(HAND_BACK_TEXT);
-		autoResumeTurn.armed = false;
-		logLine(cfg, {
-			event: "auto_resume_turn",
-			seconds: Math.round(waited / 1000),
-			tries: autoResumeTurn.tries,
-			note: "pi took the continuation, so the interrupted turn is running again",
-		});
-	} catch (err: any) {
-		const msg = String(err?.message ?? err);
-		// pi's own wording for the two cases that ask to be tried again: compaction still in progress, and the
-		// agent already processing something. Anything else is a refusal nobody asked us to work around.
-		const later = /compaction is in progress|already processing|wait for/i.test(msg);
-		if (later && autoResumeTurn.tries < 150) {
-			if (autoResumeTurn.tries === 1 || autoResumeTurn.tries % 15 === 0) {
-				logLine(cfg, { event: "auto_resume_retrying", tries: autoResumeTurn.tries, seconds: Math.round(waited / 1000), note: msg.slice(0, 160) });
-			}
-			scheduleHandBack(2_000, api);
-			return;
-		}
-		cancelHandBack(later ? "pi kept refusing the prompt for five minutes of retries" : "pi refused the prompt and did not ask for a retry");
-		logLine(cfg, { event: "auto_resume_failed", tries: autoResumeTurn.tries, error: msg.slice(0, 200) });
-		(watcherCtx as any)?.ui?.notify?.("The summary landed, but the automatic continuation failed. Send any message and the work carries on from the summary.", "warning");
-	}
-}
 let lastAutoTriggerMs = 0;
 /** The watcher writes its "nothing to do" decision at most once every five minutes. */
 let lastWatchLogMs = 0;
@@ -8208,19 +8054,17 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 		lastWatchLogMs = now;
 		logLine(cfg, { event: "auto_trigger", estimate: tokens, wire: wireTokens, raw: rawTokens, line, window, reserve: extReserve(ctx), source, safePoint: sp.why, midRun: sp.midRun === true, urgent });
 		lastCompactionTrigger = "auto";
-		// Arm only when this crossing is about to interrupt a running turn. A settled crossing has
-		// nothing to hand back, and an armed flag with nothing behind it would later send a continuation
-		// that reads as a user's own message.
-		if (sp.midRun === true) armHandBack();
-		else cancelHandBack("the loop had settled, so nothing was interrupted");
+		// Nothing is armed here any more. The interruption below is real - pi's compact() aborts the running
+		// turn to write the summary - but the continuation is the operator's to send (2026-10-21).
+
 		ctx.ui?.notify?.(
 			sp.midRun === true
-				? `Context at ${fmt(tokens)} tokens (trigger line ${fmt(line)}) - compacting now, mid-turn: ${sp.why}. pi's compact() interrupts this turn to let the summary land; as soon as it is in the journal this extension hands the interrupted work back to itself, so nothing needs to be typed.`
+				? `Context at ${fmt(tokens)} tokens (trigger line ${fmt(line)}) - compacting now, mid-turn: ${sp.why}. pi's compact() interrupts this turn to let the summary land; when it finishes, send any message and the session continues from the summary.`
 				: `Context at ${fmt(tokens)} tokens (trigger line ${fmt(line)}) - compacting now.`,
 			"info",
 		);
 		(ctx as any).compact?.({
-			onComplete: () => ctx.ui?.notify?.(sp.midRun === true ? "Automatic compaction landed. The turn was interrupted to run it, and the work picks up from the summary by itself." : "Automatic compaction landed. Nothing was running, so the session simply carries on from the summary.", "info"),
+			onComplete: () => ctx.ui?.notify?.(sp.midRun === true ? "Automatic compaction landed. The turn was interrupted to run it - send any message and the session continues from the summary." : "Automatic compaction landed. Nothing was running, so the session simply carries on from the summary.", "info"),
 			onError: (err: any) => ctx.ui?.notify?.(`Automatic compaction failed: ${String(err?.message ?? err).slice(0, 160)}`, "error"),
 		});
 	} catch {
@@ -8329,7 +8173,6 @@ function noteDeadTimer(where: string, e: any): void {
 	if (!stale) return;
 	stopWatcherTimer();
 	watcherCtx = null;
-	cancelHandBack("the session behind this timer was replaced or reloaded");
 }
 /** Run the body of a timer, sync or async, and route anything it throws - including a rejection - to
  *  noteDeadTimer rather than letting it reach pi's process-level handler, where an uncaughtException
@@ -8350,7 +8193,6 @@ function ensureWatcherTimer(): void {
 }
 
 export default function piCompactPlusExtension(pi: ExtensionAPI): void {
-	extApi = pi; // for the timer-driven hand-back (tryHandBack); see the note on extApi
 	// WHAT PI DID WITH A COMPACTION AFTER THIS EXTENSION'S OWN HOOK WAS DONE (2026-10-14). The hook sees a
 	// compaction it takes part in; these two see every one, including the ones pi raises on its own side -
 	// and until now those were invisible: a refusal for want of anything to summarise appeared on screen as an
@@ -8377,9 +8219,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		agentLoop.running = false;
 		agentLoop.lastSettledAtMs = Date.now();
 		if ((event as any)?.aborted) agentLoop.lastAbortAtMs = Date.now();
-		// A hand-back waiting for the loop to settle gets woken here rather than on its own next poll:
-		// this is the event that says it settled. The attempt still asks pi's own guard before sending.
-		if (autoResumeTurn.armed) scheduleHandBack(300);
 		// THE BEST MOMENT TO COMPACT IS THE SECOND THE TURN ENDS, and the five-second timer can miss it: a
 		// queued message starts the next turn inside that gap and the gate shuts again. So look 1.2 s after
 		// the loop settles - long enough for a follow-on turn to declare itself and be waited out, early
@@ -8421,17 +8260,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_compact", (event: any) => {
 		lastCompactionDoneAtMs = Date.now();
-		// THE INTERRUPTED TURN DOES NOT WAIT FOR A KEYSTROKE (2026-10-18). The summary is in the
-		// journal now, so the turn that pi's compact() had to abort is handed back: the extension
-		// sends the continuation itself and the session carries on from the summary. One message per
-		// mid-turn compaction, only for a compaction that landed within the last 20 minutes.
-		if (autoResumeTurn.armed) {
-			// QUEUED, NOT SENT, and the difference is the whole bug (see tryHandBack):
-			// pi still holds its compaction guard at this instant and refuses a prompt, and the refusal
-			// used to vanish into an un-awaited promise. The attempt is made by the timer, which waits
-			// for pi to be reachable and logs whatever pi actually answered.
-			scheduleHandBack(700);
-		}
 
 		const entry: any = (event as any)?.compactionEntry ?? {};
 		logLine(loadConfig(), {
@@ -8753,10 +8581,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				ctx.ui?.notify?.(`COMPACTION FAILED (1 of 2): ${String(outcome.error).slice(0, 160)} - IT WAITS 3 MINUTES AND TRIES ONCE MORE. PI'S OWN SUMMARIZER IS NOT USED.`, "warning");
 				return { cancel: true };
 			}
-			// Nothing landed, so nothing may be resumed on the strength of this trigger: an armed hand-back
-			// would wake, ask pi to continue a turn whose compaction never happened, and get an answer built
-			// on the old oversized context.
-			cancelHandBack("the compaction rotation failed and gave up");
 			pauseAutoCompaction(ctx, "compaction failed twice", outcome.error);
 			logLine(cfg, { event: "give_up", error: outcome.error, trigger, note: "automatic attempts rest for 30 minutes; pi's stock summarizer was NOT allowed to run" });
 			ctx.ui?.notify?.(
@@ -8832,7 +8656,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (blocked) return say(`NOT ENABLED: ${blocked} is present. Only one compaction extension can own the context at a time.`);
 					update((c) => void (c.enabled = true));
 					return say(
-						"COMPACTION IS ON. This extension compacts on its own trigger with its own models, and it answers /compact. " +
+						"COMPACTION IS ON. This extension writes every summary and answers /compact. Who times it depends on pi's own switch: with pi's compaction enabled, pi fires first and this extension holds the compaction until its own start point; with pi's off, this extension's own check is the trigger. " +
 						"pi's own compaction is untouched by this command: nothing here writes pi's settings, so while compaction.enabled is true there, pi can still compact by itself with pi's own summariser. Read-only state of that flag: /compact-plus pi.",
 					);
 				case "off":
