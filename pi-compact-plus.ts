@@ -705,10 +705,14 @@ export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean,
 		else if (writtenOut) { if (!out.includes(value)) absent.push(token); }
 		else missing.push(value);
 	};
-	sub("{TOOL CALLS SUMMARY}", `- ${sentenceFor("stubs", o.preserveStubs)}`);
-	sub("{USER PROMPT SUMMARY}", `- ${sentenceFor("user", o.preserveUser)}`);
-	sub("{ASSISTANT REPLIES SUMMARY}", `- ${sentenceFor("replies", o.preserveReplies)}`);
-	sub("{ASSISTANT THINKING SUMMARY}", `- ${sentenceFor("thinking", o.preserveThinking)}`);
+	// THE CATEGORY SENTENCES, AS PLAIN LINES (2026-10-21, defect #51). These used to arrive as
+	// `- <sentence>`, which put a bullet in front of every category block no matter what the template
+	// author wanted - and they can want a bullet, so they can write one: the tag now fills with the
+	// sentence alone, and the surrounding line belongs to the template.
+	sub("{TOOL CALLS SUMMARY}", sentenceFor("stubs", o.preserveStubs));
+	sub("{USER PROMPT SUMMARY}", sentenceFor("user", o.preserveUser));
+	sub("{ASSISTANT REPLIES SUMMARY}", sentenceFor("replies", o.preserveReplies));
+	sub("{ASSISTANT THINKING SUMMARY}", sentenceFor("thinking", o.preserveThinking));
 	sub(
 		"{STUB EXAMPLE RULE}",
 		inputStubs
@@ -3655,6 +3659,24 @@ function timeoutLabel(ms: number): string {
  * The internal defaults for a model that was never selected: it is only ever asked with these if
  * it is put in the Compaction models list and the user never opens its submenu.
  */
+/**
+ * The options a model gets when it JOINS the try order (2026-10-21, defect #53).
+ *
+ * Every new model started with every sampling flag on "ignore". For an online model that is right - the
+ * provider's server already knows how that model should be driven. For a local Qwen it is wrong in a way
+ * the operator pays for on the next compaction: the server default is a chat-tuned temperature with no
+ * top_k and no min_p, which is how a local model produces a wandering summary. Qwen publishes instruct
+ * values, so a model whose name says Qwen joins with those, and every other model joins exactly as before.
+ *
+ * A model already in the config is never touched - including one whose flags the operator set back to
+ * ignore on purpose. This is a starting point, shown on the Sampling flags page and changed there.
+ */
+export function defaultOptionsFor(ref: string): ModelOptions {
+	const o: ModelOptions = { ...DEFAULT_OPTIONS, sampling: { ...SAMPLING_DEFAULTS } };
+	if (/qwen/i.test(ref)) o.sampling = { ...QWEN_INSTRUCT_SAMPLING };
+	return o;
+}
+
 export const DEFAULT_OPTIONS: ModelOptions = {
 	sampling: { ...SAMPLING_DEFAULTS },
 	thinking: "off",
@@ -3734,7 +3756,7 @@ function setModelOptions(ref: string, patch: Partial<ModelOptions>): void {
 function rotateAdd(ref: string, options?: ModelOptions): void {
 	update((c) => {
 		if (c.models[ref]) return;
-		c.models[ref] = options ?? { ...DEFAULT_OPTIONS };
+		c.models[ref] = options ?? defaultOptionsFor(ref);
 	});
 }
 
@@ -4029,14 +4051,14 @@ export class OrderList implements Component, Focusable {
 		private tui: TUI,
 		private ctx: Ctx,
 		private done: (selectedValue?: string) => void,
-		private restore?: { optionsRef?: string; optionKey?: string },
+		private restore?: { optionsRef?: string; optionKey?: string; subKey?: string },
 		/** When set, the model options screen shows only these rows (the 2026-10-06 split). */
 		private filter?: readonly string[],
 	) {
 		this.rebuild();
 		if (this.restore?.optionsRef) {
 			this.highlightRef(this.restore.optionsRef);
-			this.openHighlighted(this.restore.optionKey);
+			this.openHighlighted(this.restore.optionKey, this.restore.subKey);
 		}
 	}
 
@@ -4088,7 +4110,7 @@ export class OrderList implements Component, Focusable {
 
 	/** Enter: a SELECTED model opens its options submenu; an UNSELECTED model joins the END of the
 	 *  order with default options (rotateAdd appends). */
-	private openHighlighted(initialKey?: string): void {
+	private openHighlighted(initialKey?: string, openSub?: string): void {
 		const ref = this.highlightRef();
 		if (!ref) return;
 		const cfg = loadConfig();
@@ -4121,6 +4143,7 @@ export class OrderList implements Component, Focusable {
 			},
 			initialKey,
 			this.filter,
+			openSub,
 		);
 		this.list = screen as unknown as SettingsList;
 		this.tui.requestRender();
@@ -4289,7 +4312,17 @@ export const MODEL_MOVED_ROWS = ["summaryPct", "summaryMin", "summaryMax", "inpu
  *   7. no-think tag (the marker or empty)
  * Esc goes back; changes save the moment they are made.
  */
-export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: () => void, onExit?: (action: string) => void, initialKey?: string, only?: readonly string[]): Component {
+export function modelOptionsScreen(
+	ctx: Ctx,
+	ref: string,
+	model: any,
+	onDone: () => void,
+	onExit?: (action: string) => void,
+	initialKey?: string,
+	only?: readonly string[],
+	/** Open this row's submenu as soon as the screen is built (2026-10-21, defect #52). */
+	openSub?: string,
+): Component {
 	const buildItems = (): SettingItem[] => {
 		const cfg = loadConfig();
 		const o = optionsFor(cfg, ref, model);
@@ -4520,6 +4553,18 @@ export function modelOptionsScreen(ctx: Ctx, ref: string, model: any, onDone: ()
 	if (initialKey) {
 		const i = items.findIndex((it) => it.id === initialKey);
 		if (i >= 0) (list as unknown as { selectedIndex: number }).selectedIndex = i;
+	}
+	// COME BACK WHERE YOU WERE (2026-10-21, defect #52, the operator's report: changing a sampling flag and
+	// pressing Enter "drops them back into the previous menu"). The flag itself has to be edited over the
+	// plain chat - pi's input box hangs while a screen is mounted - so this screen is rebuilt afterwards.
+	// Landing on the row that opens the flags page is still one menu up from the page the operator was
+	// using, so the page is opened on arrival. Highlighting the row and feeding it Enter is pi's own
+	// public way into a submenu; no private internals, and if the list ever stops offering it the screen
+	// simply comes back as it used to.
+	if (openSub) {
+		const nav = list as unknown as { selectItem?: (id: string) => void; handleInput?: (d: string) => void };
+		nav.selectItem?.(openSub);
+		nav.handleInput?.("\r");
 	}
 	return list;
 }
@@ -5999,6 +6044,10 @@ interface BoardResult {
  *  options edit - the Compaction models list with that model's options screen open, on the edited
  *  row. (2026-10-01: the loop used to reopen the board at the top level after every edit.) */
 interface BoardRestore {
+	/** After the board reopens a model's options screen, open this row's submenu as well (2026-10-21,
+	 *  defect #52). A sampling flag is edited over the plain chat, and coming back on the row that
+	 *  opens the flags page still left the operator one menu up from where they had been working. */
+	subKey?: string;
 	rowId?: string;
 	orderRef?: string;
 	optionKey?: string;
@@ -6201,7 +6250,7 @@ export class CompactionBoard implements Component, Focusable {
 					this.tui,
 					this.ctx,
 					done,
-					this.restore?.orderRef ? { optionsRef: this.restore.orderRef, optionKey: this.restore.optionKey } : undefined,
+					this.restore?.orderRef ? { optionsRef: this.restore.orderRef, optionKey: this.restore.optionKey, subKey: this.restore.subKey } : undefined,
 					MODEL_KEEP_ROWS,
 				) as unknown as Component,
 			description:
@@ -6992,7 +7041,8 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			// A sampling flag is not a row of its own on the model screen - it lives behind the "Sampling
 			// flags" page - so the position is restored on that row, not on a row that is not there.
 			const mKey = at > 0 ? body.slice(at + 1) : "";
-			restore = at > 0 ? { orderRef: body.slice(0, at), optionKey: (SAMPLING_KEYS as readonly string[]).includes(mKey) ? "sampling" : mKey } : undefined;
+			restore = at > 0
+				? { orderRef: body.slice(0, at), subKey: (SAMPLING_KEYS as readonly string[]).includes(mKey) ? "sampling" : undefined, optionKey: (SAMPLING_KEYS as readonly string[]).includes(mKey) ? "sampling" : mKey } : undefined;
 			continue;
 		}
 		if (result.action?.startsWith("edit-category-sentence:")) {
@@ -7180,9 +7230,10 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
 		const fv = clamp(parsed0, rng[0], rng[1]);
 		setModelOptions(ref, { sampling: { ...o.sampling, [sk]: fv } });
 		ctx.ui?.notify?.(`${key} = ${fv} for ${ref.split("/").pop()} - saved${fv === 0 ? " (0 is a real value: it is sent to the server)" : ""}.`, "info");
-		if (fv === undefined) return;
-		save(fv);
-		ctx.ui?.notify?.(`${key} = ${shown(fv)} for ${ref.split("/").pop()} - saved.`, "info");
+		// And stop here. This branch used to fall through to the shared tail below, which called the generic
+		// save (a no-op for a flag, so harmless) and then announced the same change a SECOND time in generic
+		// words - the reason a sampling flag looked like it had been edited twice, or bounced.
+
 		return;
 	} else {
 		// An unknown key used to return in silence, which is exactly the "I press Enter and nothing ever
