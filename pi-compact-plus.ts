@@ -47,7 +47,7 @@ import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SettingItem } from "@earendil-works/pi-tui";
-import { SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
+import { SettingsList, truncateToWidth, isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { spawnSync } from "node:child_process";
 import type { Component, Focusable, KeybindingsManager, TUI } from "@earendil-works/pi-tui";
 
@@ -3478,10 +3478,56 @@ function opt(title: string, hint: string): string {
 	return hint ? `${title}\n${hint}` : title;
 }
 
+/** The names this file uses for its keys, and pi's name for the same key. pi's parser answers in its
+ *  own vocabulary; the rest of the file was written around these shorter names, so they are translated
+ *  here rather than renaming every comparison in every screen. */
+const KEY_ALIASES: [string, string][] = [
+	["escape", "escape"],
+	["enter", "enter"],
+	["up", "up"],
+	["down", "down"],
+	["left", "left"],
+	["right", "right"],
+	["home", "home"],
+	["end", "end"],
+	["pageUp", "pgup"],
+	["pageDown", "pgdn"],
+	["delete", "delete"],
+	["backspace", "backspace"],
+];
+
+/**
+ * Which key is this keystroke? 2026-10-21, and this is the fix for "no key works in the settings".
+ *
+ * This function used to compare bytes: Escape was the single character 0x1b, Up was the four
+ * characters ESC [ A, Ctrl+A was the byte 0x01. That stopped being true when pi turned on the Kitty
+ * keyboard protocol (pi 1.3.0, and Windows Terminal accepts it): a keystroke now arrives as an escape
+ * sequence, a held key sends release and repeat events between the presses, and a lone Escape is
+ * encoded as well. Every hand-decoded comparison in the file went quiet in the same moment, which is
+ * exactly what the operator reported - Ctrl+ shortcuts dead, Escape not leaving a screen, holding an
+ * arrow registering only the first press.
+ *
+ * The encoding is pi's business now, so pi decodes it: matchesKey() knows both the old sequences and
+ * the new ones. A key release is answered with "" so the screens ignore it, otherwise a held arrow
+ * would step twice per repeat, once for the press and once for the release.
+ */
 function keyOf(data: string): string {
 	if (!data) return "";
+	try {
+		if (isKeyRelease(data)) return "";
+	} catch {
+		/* an older pi without the release query: nothing to skip */
+	}
+	for (const [piName, ours] of KEY_ALIASES) {
+		try {
+			if (matchesKey(data, piName as never)) return ours;
+		} catch {
+			/* a name this pi does not know: fall through to the byte comparison below */
+		}
+	}
+	// Still worth answering the plain characters directly: a terminal that never negotiated the new
+	// protocol, and a unit test that hands us bytes, both arrive here.
 	if (data === "\r" || data === "\n") return "enter";
-	if (data === "\x1b") return "escape";
 	if (data === " ") return "space";
 	if (data === "\x7f" || data === "\b") return "backspace";
 	if (data.startsWith("\x1b[")) {
@@ -3506,6 +3552,19 @@ function keyOf(data: string): string {
 	}
 	if (data.length === 1) return data.toLowerCase();
 	return "";
+}
+
+/** Is this keystroke this control combination, in whichever encoding the terminal is using today?
+ *  Wraps pi's matcher so the screens read as sentences and an older pi cannot throw. */
+function chord(data: string, ...piNames: string[]): boolean {
+	for (const n of piNames) {
+		try {
+			if (matchesKey(data, n as never)) return true;
+		} catch {
+			/* unknown name for this pi: try the next one */
+		}
+	}
+	return false;
 }
 
 function cut(text: string, width: number): string {
@@ -4655,7 +4714,7 @@ class CategoryDescList implements Component, Focusable {
 				return;
 			}
 		}
-		if (data === "\x1b" && this.pending) {
+		if (chord(data, "escape") && this.pending) {
 			this.pending = null;
 			this.rebuild();
 			this.tui.requestRender();
@@ -5016,11 +5075,11 @@ class UserTemplateMenu implements Component, Focusable {
 	handleInput(data: string): void {
 		// The library keys (the terminal bytes for Ctrl+N / Ctrl+K / Ctrl+D / Ctrl+A / Ctrl+Y), all on
 		// the highlighted row. Everything else, Escape included, goes to the list (Esc = back).
-		if (data === "\x0e") {
+		if (chord(data, "ctrl+n")) {
 			this.createNew();
 			return;
 		}
-		if (data === "\x0b" || data === "\x04" || data === "\x01" || data === "\x10") {
+		if (chord(data, "ctrl+k", "ctrl+d", "ctrl+a", "ctrl+p")) {
 			// Ctrl+P (\x10) was added on 2026-10-20 because Ctrl+A stopped reaching this screen: pi binds
 			// ctrl+a to the editor action cursor-home, and whatever pi does with it, the byte never arrives
 			// here to be argued with. Ctrl+A stays accepted in case a terminal still delivers it, and Ctrl+P
@@ -5028,12 +5087,12 @@ class UserTemplateMenu implements Component, Focusable {
 			// operator is never hunting for an undocumented binding.
 			const t = this.selectedTarget();
 			if (t === undefined) return;
-			if (data === "\x0b") this.onDone(`tpl-dup:${encodeURIComponent(t ?? "")}`); // modal, board loop
-			else if (data === "\x04") this.removeTemplate(t);
+			if (chord(data, "ctrl+k")) this.onDone(`tpl-dup:${encodeURIComponent(t ?? "")}`); // modal, board loop
+			else if (chord(data, "ctrl+d")) this.removeTemplate(t);
 			else void this.setActive(t);
 			return;
 		}
-		if (data === "\x19") {
+		if (chord(data, "ctrl+y")) {
 			const t = this.selectedTarget();
 			if (t === undefined) return;
 			copyTextToClipboard(this.ctx, t === null ? DEFAULT_TEMPLATE_TEXT : loadConfig().userTemplates.find((x) => x.name === t)?.text ?? "", t === null ? "Extension default" : t);
@@ -6435,7 +6494,7 @@ export class TextScreen implements Component, Focusable {
 			this.done(undefined);
 			return;
 		}
-		if (data === '\x13') {
+		if (chord(data, 'ctrl+s')) {
 			this.done(this.lines.join('\n'));
 			return;
 		}
