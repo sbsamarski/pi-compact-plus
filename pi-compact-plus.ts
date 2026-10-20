@@ -8644,7 +8644,9 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				const nowMs = Date.now();
 				if (nowMs - lastGateHoldLogMs > 60_000) {
 					lastGateHoldLogMs = nowMs;
-					logLine(c0, { event: "auto_compaction_held", reason: event.reason, note });
+					// `loadConfig()` here, not the config from the try block above: that one is block-scoped and
+					// does not reach this line, which is how a hold would have thrown instead of cancelling.
+					logLine(loadConfig(), { event: "auto_compaction_held", reason: event.reason, note });
 				}
 				if (nowMs - lastGateHoldNoticeAtMs > 600_000) {
 					lastGateHoldNoticeAtMs = nowMs;
