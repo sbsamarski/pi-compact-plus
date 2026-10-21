@@ -1077,8 +1077,18 @@ function sanitizeCategorySentences(raw: any): { [kind: string]: { [level: string
 	return Object.keys(out).length ? out : null;
 }
 
+/** Test harnesses point COMPACTION_PLUS_CONFIG at a scratch copy and set COMPACTION_PLUS_READ_ONLY,
+ *  so a harness that forgets the copy still cannot write into the operator's files. Twice now a test
+ *  run polluted a real record: elision events on 2026-10-04, and 18 fake trigger lines on
+ *  2026-10-21 - the second time because a static `import` runs before the harness can set the
+ *  override, which is why the switch is a separate variable and not the path. */
+function writesBlocked(): boolean {
+	return process.env.COMPACTION_PLUS_READ_ONLY === "1";
+}
+
 function saveConfig(cfg: Config): void {
 	mkdirSync(AGENT_DIR, { recursive: true });
+	if (writesBlocked()) return;
 	writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
@@ -1113,6 +1123,7 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
 		// session and a test harness driving the same code - and on 2026-10-18 that distinction was the whole
 		// question twice: once when an old build's writes were mistaken for the new one's, and once when a
 		// harness's own events had to be told apart from a real compaction's.
+		if (writesBlocked()) return;
 		appendFileSync(LOG_PATH, JSON.stringify({ ts: localStamp(), pid: process.pid, ...record }) + "\n", "utf8");
 	} catch {
 		/* logging must never break compaction */
@@ -1126,9 +1137,9 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
  *  lines"). 'v' in the log view shows them again.
  *
  *  Deliberately NOT here: start, attempt, ok, fail, direct_fail, accepted_with_warnings, give_up, done,
- *  every *_failed, retry, skip, elision_error, auto_trigger. Skip stays because "model X was not in the
- *  model list" is the answer to a question the operator asks; auto_trigger stays because it is the
- *  reason a compaction started. */
+ *  every *_failed, retry, skip, elision_error, auto_compaction_held. Skip stays because "model X was not in"
+ *  the model list" is the answer to a question the operator asks; auto_compaction_held stays because when
+ *  pi asks early and nothing happens, that line is the only place saying why. */
 const LOG_CHATTER = new Set([
 	// Nothing writes these any more (the automatic continuation was deleted 2026-10-21), but the log file
 	// still holds years of them, and the results-only view must go on hiding them.
@@ -1151,6 +1162,11 @@ const LOG_CHATTER = new Set([
 	"two_compactors",
 	"safe_point_held",
 	"compaction_landed",
+	// auto_trigger is the watcher's own arithmetic: the estimate, the line, the window, and - while
+	// pi's threshold holds the trigger, a standing-back note repeated on a throttle. What the operator opens
+	// the log for is the compaction, and `start` already carries the reason it happened, so this is
+	// bookkeeping for a later diagnosis, not news (2026-10-21: "i don't need to see that line").
+	"auto_trigger",
 ]);
 
 /**
@@ -1214,7 +1230,9 @@ function tailLogPretty(lines = 16, verbose = false): string {
 											? "DONE"
 											: d.event === "start"
 												? "START"
-												: String(d.event ?? "").toUpperCase();
+												: d.event === "auto_compaction_held"
+																	? "HELD"
+																: String(d.event ?? "").toUpperCase();
 					// An accepted-with-warnings line must say WHAT was not as asked - the warnings array is the
 					// list of rule violations the summary was accepted despite (2026-10-07, on request).
 					const why =
@@ -1224,9 +1242,18 @@ function tailLogPretty(lines = 16, verbose = false): string {
 							: d.error
 								? String(d.error).split("\n")[0].slice(0, 90)
 								: "");
+					// A line the operator is shown should say something when it is shown. `note` used to be
+					// dropped, so the gate's hold - the one line that explains why a compaction did NOT
+					// happen - arrived as a bare AUTO_COMPACTION_HELD with nothing after it (2026-10-21).
+					// Bookkeeping events are filtered out of the results view anyway, so putting the note
+					// here only ever adds words where the operator asked to be told.
+					const note =
+						typeof d.note === "string" && !LOG_CHATTER.has(String(d.event ?? ""))
+							? d.note.replace(/\s+/g, " ").slice(0, 160)
+							: "";
 					// The elision events carry their own figures.
 					const elision = d.event === "elision" ? [`${fmt(d.applied ?? 0)} result${d.applied === 1 ? "" : "s"} elided`, `${fmt(d.resultsTokens ?? 0)} tok -> ${fmt(d.stubTokens ?? 0)} tok`, `saved ${fmt(d.savedTokens ?? 0)} tok`, `ctx ~${fmt(d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`].join(" · ") : "";
-					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why].filter(Boolean).join(" · ");
+					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, note].filter(Boolean).join(" · ");
 				} catch {
 					return l.slice(0, 160);
 				}
@@ -5934,10 +5961,27 @@ class CompactionMenu implements Component, Focusable {
 			{
 				id: "piReserve",
 				label: `pi's own compaction numbers (read-only):`,
-				currentValue: `${fmt(readPiReserveTokens())} tok reserve`,
+				// Two numbers the operator has to keep in step, shown side by side (2026-10-21): where pi asks,
+				// and where this extension is ready. While pi asks early, every held turn re-reads the whole
+				// context before a summary is written, so the row says what to set instead of leaving a puzzle.
+				currentValue: (() => {
+					const win = (this.ctx as any)?.model?.contextWindow ?? 0;
+					const piReserve = readPiReserveTokens();
+					if (!(win > 0)) return `${fmt(piReserve)} tok reserve`;
+					const ours = win - extReserve(this.ctx);
+					const theirs = Math.max(0, win - piReserve);
+					const agree = Math.abs(theirs - ours) <= Math.max(1_000, Math.round(win * 0.01));
+					return agree
+						? `pi asks at ${fmt(theirs)} = our point ${fmt(ours)} tok (agreed)`
+						: `pi asks at ${fmt(theirs)} tok, we wait for ${fmt(ours)} - set reserveTokens to ${fmt(win - ours)}`;
+				})(),
 				values: [],
 				description:
-					"pi's settings.json, read for information only - this extension never writes it. Those numbers apply only to pi's own compaction; this extension uses its own reserve and keep-recent numbers, which are the rows above.",
+					"pi's settings.json, read only - this extension never writes it. pi asks when the context passes " +
+					"window minus reserveTokens; this extension is ready at the trigger point shown above. While pi asks " +
+					"EARLIER, each ask is held and the session keeps running on the uncompacted context, which means a " +
+					"pass over the whole of it before any summary is written. Set reserveTokens to the number shown above " +
+					"to make the two agree.",
 			},
 			numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."),
 		];
@@ -7576,6 +7620,22 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 		`Compaction models, in try order (if all fail, pi's own compaction runs):`,
 		`  trigger: estimate crosses window - ${fmt(reserve)} tok · auto-compact while idle: ${cfg.autoCompact ? (parkedThisSession(cfg, ctx) ? "PARKED FOR THIS SESSION (a manual compaction arms it again)" : "ON") : "off"} · chat max_tokens cap: ${cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "off"}`,
 	];
+	// pi's threshold is the trigger while pi's own switch is on, so its ask point belongs in the status
+	// next to this extension's line: when the two disagree, the operator can read the cost here too.
+	if (readPiCompactionEnabled() && (ctx as any)?.model?.contextWindow) {
+		const win = (ctx as any).model.contextWindow as number;
+		const piAsk = Math.max(0, win - readPiReserveTokens());
+		const ours = win - reserve;
+		const gap = ours - piAsk;
+		// A one percent band counts as agreement: pi and this extension measure the same context two ways.
+		const agree = gap <= Math.max(1_000, Math.round(win * 0.01));
+		lines.push(
+			`  pi asks at ${fmt(piAsk)} tok; this extension is ready at ${fmt(ours)} tok` +
+			(agree
+				? " - agreed, so no context is re-read waiting for the line."
+				: ` - pi is ${fmt(gap)} tok early; set reserveTokens to ${fmt(win - ours)} to stop the waiting.`),
+	);
+}
 	const refs = Object.keys(cfg.models);
 	refs.forEach((ref, i) => {
 		const model = lookupRef(ref, ctx);
@@ -7622,6 +7682,18 @@ let watcherCtx: Ctx | null = null;
  * Between the two, the answer is a cancel: nothing is summarised, nothing is cut, pi asks again on the
  * next request, and the same request gets a real summary once our line is reached.
  *
+ * A HOLD IS NOT FREE, and the operator found the price on 2026-10-21: "autocompaction now initially
+ * triggers full context re-read before it starts creating the summary. this wasn' happening before.
+ * Correct, and this rule is the mechanism. Cancelling pi's ask lets the session carry on, so every turn
+ * in that gap goes to the model with the context UNCOMPACTED - a pass over the whole of it, minutes on
+ * a local model, before the summary is finally written. With pi's reserveTokens at 50,000 and this line
+ * at window-30,600 the gap was 19,400 tokens of re-reading, which is exactly what was reported.
+ *
+ * So the two numbers have to agree. When they do not, the log line, the notice and the settings board
+ * all name the reserveTokens value that ends it. The gate stays for what it is genuinely for: a
+ * compaction that arrives materially early, which once the numbers are aligned means a mis-set
+ * number or a session on a different window - not the everyday path.
+ *
  * Returns a sentence for the log while it should be held, and null when the compaction may proceed.
  * Pure numbers by design - no files, no pi objects - so the rule is testable with a rig.
  */
@@ -7630,15 +7702,27 @@ export function holdUntilOurLine(args: {
 	fill: number;
 	window: number;
 	line: number;
+	/** How far below the line a compaction is still accepted. pi counts from the server's own usage
+	 *  figures and this extension counts its own way, so the two differ by a little; a hold is not free
+	 *  (see above), so a hair's-breadth miss must not cause one. Callers pass about 1% of the window. */
+	slack?: number;
+	/** The reserveTokens value that would put pi's ask point on this line, so the log and the notice can
+	 *  name the number that ends the waiting instead of leaving the operator to derive it. */
+	matchReserve?: number;
 }): string | null {
 	// Only pi's threshold is a candidate. "manual" is the operator's own /compact, and an overflow is pi
 	// asking because a request was already refused for room - holding either would be a refusal.
 	if (args.reason !== "threshold") return null;
 	// Nothing measured, or no line to compare against: never invent a veto out of a zero.
 	if (!(args.window > 0) || !(args.fill > 0) || !(args.line > 0)) return null;
-	if (args.fill >= args.line) return null;
-	const pct = args.line > 0 ? Math.round((args.fill / args.line) * 100) : 0;
-	return `pi's threshold asked at ${fmt(args.fill)} of ${fmt(args.window)} tokens; this extension's own trigger point is ${fmt(args.line)} (${pct}% of the way there) - held, nothing written, pi will ask again on the next request`;
+	if (args.fill >= args.line - (args.slack ?? 0)) return null;
+	// One line of the log view, no more: the view truncates. It must still name both numbers, and it
+	// ends with the setting that stops this happening on the next request.
+	const fix =
+		typeof args.matchReserve === "number" && args.matchReserve > 0
+			? `; reserveTokens ${fmt(args.matchReserve)} would end the wait`
+			: "";
+	return `pi asked at ${fmt(args.fill)}/${fmt(args.window)} tok, our point is ${fmt(args.line)} tok - held, nothing written${fix}`;
 }
 
 /** When the gate last said "held" on the screen. The log records every hold on its own throttle below. */
@@ -8048,7 +8132,10 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 		// request is refused for room, a refused session cannot be compacted at all, and there is no pi
 		// request left to wait for. Then the watcher still acts.
 		if (!urgent && readPiCompactionEnabled()) {
-			if (Date.now() - lastWatchLogMs > 600_000) {
+			// Once an hour at most. This line exists only to prove, afterwards, that the timer really was
+			// asleep while pi held the trigger. The event worth having is the gate's own hold, which the hook
+			// writes every time pi actually asks.
+			if (Date.now() - lastWatchLogMs > 3_600_000) {
 				lastWatchLogMs = Date.now();
 				logLine(cfg, {
 					event: "auto_trigger",
@@ -8518,6 +8605,12 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				fill: realContextTokens(ctx),
 				window: win,
 				line: win - extReserve(ctx),
+				// One percent of the window, floor 1,000 tokens. pi measures the context from the server's own
+				// usage figures and this extension measures its own way; refusing a compaction over that
+				// difference would cost a full pass over the context for nothing.
+				slack: Math.max(1_000, Math.round(win * 0.01)),
+				// The reserveTokens that would place pi's ask point exactly on this line, for the message.
+				matchReserve: extReserve(ctx),
 			});
 			if (note !== null) {
 				const nowMs = Date.now();
