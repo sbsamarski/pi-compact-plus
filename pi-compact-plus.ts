@@ -3179,9 +3179,6 @@ export async function summarizeWithRotation(
 		return { ok: false, error: missing.length ? `no model found for ${missing.join(", ")}` : "no models configured" };
 	}
 
-	// What the summariser will really be sent: the flattened region (tool results clipped to 2,000
-	// characters by pi) plus the previous summary. No system prompt, no tool definitions.
-	const needTokens = summariserInputTokens(preparation);
 	const prevTurn = readPrevTurnInfo(ctx, preparation);
 	const failures: string[] = [];
 
@@ -3223,6 +3220,8 @@ export async function summarizeWithRotation(
 		const pre = preprocessForSummariser(prep, { ...profile, stubTailChars: cfg.elision.stubTailChars });
 		prep = pre.prep;
 		if (pre.stubbed || pre.argsCapped) logLine(cfg, { event: "preprocess", ref: c.ref, stubbed: pre.stubbed, argsCapped: pre.argsCapped, rawChars: pre.rawChars, keptChars: pre.keptChars, savedChars: pre.savedChars });
+		// What the summariser is really sent: the flattened region (tool results clipped to 2,000
+		// characters by pi) plus the previous summary. No system prompt, no tool definitions.
 		const inputTokens = summariserInputTokens(prep);
 		const sizes = sizesFor(profile, {
 			inputTokens,
@@ -4504,10 +4503,6 @@ export function modelOptionsScreen(
 		(id: string, value: string) => {
 			const o = optionsFor(loadConfig(), ref, model);
 			const reserveTokens = extReserve(ctx);
-			const patchRow = (text: string) => {
-				const row = items.find((i) => i.id === id);
-				if (row) row.currentValue = text;
-			};
 			if (id === "thinking") {
 				setModelOptions(ref, { thinking: (value === "none" ? "off" : value) as Level });
 			} else if (id === "timeout") {
@@ -5827,7 +5822,6 @@ class CompactionMenu implements Component, Focusable {
 
 	private rows(): SettingItem[] {
 		const cfg = loadConfig();
-		const piOn = readPiCompactionEnabled();
 		// The settings that are one setting for every model in the try order: the first model stands for
 		// all of them, because setModelOptions writes those keys to every model in the order.
 		const sharedRef = Object.keys(cfg.models)[0] ?? "";
