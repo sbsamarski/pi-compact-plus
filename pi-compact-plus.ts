@@ -158,7 +158,8 @@ type ElisionConfig = {
 type ModelOptions = {
 	/** Thinking level for this model's summarisation request. */
 	thinking: Level;
-	/** Abort the request after this long. 0 = unlimited. */
+	/** How long to keep the request when NOTHING is arriving. Every character that comes in restarts
+	 *  it, so this is a silence limit rather than a length limit (2026-10-19). 0 = unlimited. */
 	timeoutMs: number;
 	/** THE SUMMARY AIM: this percent of the model's ctx window (2026-10-03: everything - aim, min,
 	 *  max - is a window percent; the numbers the settings show are the numbers enforced). */
@@ -2959,6 +2960,10 @@ export async function directCompact(args: {
 	 */
 	additionalInstruction?: string | null;
 	userDefault?: string | null;
+	/** Called with the length of every piece of text that arrives (2026-10-19, item (a)). The caller
+	 *  keeps the silence clock restarted for as long as the model is writing: a request that streams
+	 *  is a request that is alive, whatever the wall clock says. Absent keeps the old behaviour. */
+	onActivity?: (chars: number) => void;
 }): Promise<{ text: string; usage: any; lastTurn: number; inputText: string; segmentBy: "count" | "estimate"; fromReasoning: boolean }> {
 	const { preparation, model, registry, sizes, options } = args;
 	const startTurn = args.prevTurn > 0 ? args.prevTurn : 0;
@@ -3029,7 +3034,20 @@ export async function directCompact(args: {
 		if (dKwargs && dBudget) merged.chat_template_kwargs = { ...(((dBudget.fields as any)?.chat_template_kwargs as Record<string, unknown>) ?? {}), ...(((dKwargs as any)?.chat_template_kwargs as Record<string, unknown>) ?? {}) };
 		requestOptions.samplingParams = merged;
 	}
-	const response: any = await registry.streamSimple(model, context, requestOptions).result();
+	// Consuming the stream rather than waiting on its result is what makes the silence clock mean
+	// anything: the events are the only place where "still writing" is visible. The result is read
+	// off the same stream afterwards, which is what .result() would have waited for anyway.
+	const dStream: any = registry.streamSimple(model, context, requestOptions);
+	let response: any;
+	if (typeof args.onActivity === "function" && typeof dStream?.[Symbol.asyncIterator] === "function") {
+		for await (const ev of dStream) {
+			const dText = typeof (ev as any)?.delta === "string" ? (ev as any).delta : "";
+			args.onActivity(dText.length);
+		}
+		response = await dStream.result();
+	} else {
+		response = await dStream.result();
+	}
 	// A generation that ran out of room is not automatically worthless, and treating it that way is
 	// what stopped every compaction tonight (2026-10-19, live): the local model's hidden reasoning
 	// ate most of the request budget, the visible summary stopped at the cap, and the attempt was
@@ -3173,6 +3191,84 @@ function combineSignals(signal: AbortSignal | undefined, ms: number, onTimeout?:
 	};
 }
 
+/** What "timed out" ought to mean (2026-10-19, item (a) of the 19:15 report). The plain wall-clock
+ *  ceiling above cannot tell a slow model from a dead request: it cut a generation that was still
+ *  producing at exactly ten minutes, and the online model that took over then finished the same
+ *  summary and billed 29.2k output tokens. Two clocks say what anybody meant. SILENCE is the one the
+ *  operator sets, and every character that arrives restarts it, so a model that keeps writing keeps
+ *  its request. The BACKSTOP is the one nobody sets, because a stream that produces forever is still
+ *  a stream that will never finish. Whichever expires first aborts, and the record says which it was:
+ *  "it went silent" and "it was still writing when the ceiling arrived" are different faults with
+ *  different cures, and "timed out" hid the difference.
+ */
+function silenceWatch(
+	signal: AbortSignal | undefined,
+	opts: { silenceMs: number; backstopMs: number; onTimeout: (why: "silence" | "backstop") => void },
+): { signal: AbortSignal | undefined; dispose: () => void; beat: (chars: number) => void } {
+	const ctrl = new AbortController();
+	let idle: ReturnType<typeof setTimeout> | undefined;
+	let lastArm = 0;
+	const arm = () => {
+		if (!opts.silenceMs || opts.silenceMs <= 0) return;
+		clearTimeout(idle);
+		lastArm = Date.now();
+		idle = setTimeout(() => {
+				opts.onTimeout("silence");
+				ctrl.abort(new Error(`nothing arrived for ${secs(opts.silenceMs)}`));
+			}, opts.silenceMs);
+	};
+	// A streaming reply says delta twenty times a second; re-arming a timer twenty times a second is
+	// waste. The throttle is capped at a third of the window, though, because a one second slop on a
+	// clock measured in minutes is nothing while the same slop on a short test clock would abort a
+	// model that was writing all along.
+	const beat = (chars: number) => {
+		if (chars <= 0) return;
+		if (Date.now() - lastArm < Math.min(1000, Math.max(1, Math.round(opts.silenceMs / 3)))) return;
+		arm();
+	};
+	arm();
+	const backstop =
+		opts.backstopMs > 0
+			? setTimeout(() => {
+					opts.onTimeout("backstop");
+					ctrl.abort(new Error(`still writing after ${secs(opts.backstopMs)}`));
+				}, opts.backstopMs)
+			: undefined;
+	// A cancel from outside is not a timeout: stop both clocks first, or the person who pressed Escape is
+	// recorded as a model that went silent, and the next model is blamed for nothing.
+	const onAbort = () => {
+		clearTimeout(idle);
+		if (backstop) clearTimeout(backstop);
+		ctrl.abort((signal as any)?.reason);
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
+	return {
+		signal: ctrl.signal,
+		beat,
+		dispose: () => {
+			clearTimeout(idle);
+			if (backstop) clearTimeout(backstop);
+			signal?.removeEventListener("abort", onAbort);
+		},
+	};
+}
+
+/** How fast this model wrote the last time we measured it, in summary tokens per second. Kept for
+ *  the life of the process, which is exactly the horizon over which "this box does 15 tok/s" holds. */
+const observedRate = new Map<string, number>();
+
+/** The ceiling on a stream that never stops: twice what the last measured rate says this summary
+ *  should take, never under twenty minutes, never over two hours. A model that has never been
+ *  measured is assumed slow (4 tokens a second locally, 25 online), because guessing high costs a
+ *  wait while guessing low throws away a summary that was nearly finished - the mistake this
+ *  change exists to stop. "Unlimited" on the board means unlimited: no ceiling behind it either. */
+function backstopMsFor(kind: Kind, targetTokens: number, silenceMs: number, ref: string): number {
+	if (silenceMs <= 0) return 0;
+	const seen = observedRate.get(ref);
+	const tps = seen && seen > 0.2 ? seen : kind === "local" ? 4 : 25;
+	const estimate = targetTokens > 0 ? Math.round((targetTokens / tps) * 1000) * 2 : 0;
+	return Math.min(7_200_000, Math.max(1_200_000, estimate, silenceMs));
+}
 function fmt(n: any): string {
 	return typeof n === "number" ? n.toLocaleString("en-US") : "?";
 }
@@ -3443,6 +3539,10 @@ export async function summarizeWithRotation(
 			customInstructions,
 		});
 		const started = Date.now();
+		// The ceiling on a model that never stops writing, worked out against the aim rather than the
+		// max: a summary that overruns the aim is judged later by the size checks, it is no reason to
+		// cut a request that is still producing.
+		const backstop = backstopMsFor(c.kind, realSizes.target, profile.timeoutMs, c.ref);
 		logLine(cfg, {
 			event: "attempt",
 			// Which ceiling on the model's own thinking actually went out with this request (2026-10-20). The
@@ -3463,11 +3563,22 @@ export async function summarizeWithRotation(
 			window: ctx?.model?.contextWindow ?? 0,
 			genCap: genCapFinal,
 			thinking: th.level,
+			// Two numbers with two meanings (2026-10-19): timeoutMs is how long to wait with NOTHING
+			// arriving, backstopMs is how long to wait however much is arriving. Both are recorded, so a
+			// fail line that names its clock can be checked against what that clock was set to.
 			timeoutMs: profile.timeoutMs,
+			backstopMs: backstop,
 			extraTries: cfg.retries,
 		});
-		let timedOut = false;
-		const combined = combineSignals(signal, profile.timeoutMs, () => void (timedOut = true));
+		// Which clock stopped it, not merely that one did: silence means the request was dead, backstop
+		// means the model was still writing when the ceiling arrived. dChars is the proof of production.
+		let timedOut: "" | "silence" | "backstop" = "";
+		let dChars = 0;
+		const combined = silenceWatch(signal, {
+			silenceMs: profile.timeoutMs,
+			backstopMs: backstop,
+			onTimeout: (why) => void (timedOut = why),
+		});
 		// --- the DIRECT request (pi-compact-plus): the whole request built here. On failure we move
 		// to the NEXT candidate; pi's compact() runs only at the very end, after every candidate has
 		// failed (or in legacy mode, directRequest off).
@@ -3487,6 +3598,12 @@ export async function summarizeWithRotation(
 					customInstructions,
 					ref: c.ref,
 					kind: c.kind,
+					// Every character restarts the silence clock and is counted, so a record about being cut
+					// short can say how much had already arrived.
+					onActivity: (n: number) => {
+						dChars += n;
+						combined.beat(n);
+					},
 				});
 				const dSeconds = Math.round(((Date.now() - started) / 1000) * 10) / 10;
 				const cleaned = stripRoughWork(raw.text);
@@ -3503,7 +3620,12 @@ export async function summarizeWithRotation(
 					logLine(cfg, { event: "fail", ref: c.ref, via: "direct", seconds: dSeconds, measured: measured.tokens, min: realSizes.min, max: realSizes.max, words, reason, ...split });
 					return new Error(reason);
 				};
-				if (timedOut) throw dFail(`timed out with a half written summary`);
+				if (timedOut)
+				throw dFail(
+						timedOut === "backstop"
+							? `still writing when the ${secs(backstop)} ceiling arrived, after ${fmt(dChars)} characters had come in - half a summary either way`
+							: `nothing arrived for ${secs(profile.timeoutMs)}, after ${fmt(dChars)} characters had come in - the request was cut as dead`,
+				);
 				if (!summary || summary.trim().length < 80) throw dFail("empty summary");
 				if (measured.tokens < realSizes.min) throw dFail(`too thin - the summary is ~${fmt(measured.tokens)} tok vs the acceptance floor is ${fmt(realSizes.min)} tok absolute (aim ${fmt(realSizes.target)} tok, ceiling ${fmt(realSizes.max)} tok). Raise this model's Summary min, or lower the aim %.`);
 				// The ceiling for REJECTION is the ceiling the request was actually capped at - max plus GEN_MARGIN
@@ -3576,7 +3698,9 @@ export async function summarizeWithRotation(
 				if (warnings.length) {
 					logLine(cfg, { event: "accepted_with_warnings", ref: c.ref, via: "direct", measured: measured.tokens, min: realSizes.min, max: realSizes.max, warnings });
 				}
-				logLine(cfg, { event: "ok", ref: c.ref, via: "direct", kind: c.kind, seconds: dSeconds, measured: measured.tokens, measuredBy: measured.by, segmentBy: raw.segmentBy, fromReasoning: raw.fromReasoning || undefined, roughWorkStripped: cleaned.strippedChars || undefined, min: realSizes.min, target: realSizes.target, max: realSizes.max, words, stubsIn: inStubs || undefined, stubsCopied: gotStubs || undefined, input: u.input, output: u.output, reasoning: u.reasoning });
+				// What this model just proved about its own speed, in the units the backstop thinks in.
+				if (dSeconds > 0 && measured.tokens > 0) observedRate.set(c.ref, measured.tokens / dSeconds);
+				logLine(cfg, { event: "ok", ref: c.ref, via: "direct", kind: c.kind, tokPerSec: dSeconds > 0 ? Math.round((measured.tokens / dSeconds) * 10) / 10 : undefined, seconds: dSeconds, measured: measured.tokens, measuredBy: measured.by, segmentBy: raw.segmentBy, fromReasoning: raw.fromReasoning || undefined, roughWorkStripped: cleaned.strippedChars || undefined, min: realSizes.min, target: realSizes.target, max: realSizes.max, words, stubsIn: inStubs || undefined, stubsCopied: gotStubs || undefined, input: u.input, output: u.output, reasoning: u.reasoning });
 				logLine(cfg, { event: "user_prompts", ref: c.ref, quoted: upc.linesAnywhere, given, ledgerTurns: upc.turns, ledgerQuoted: upc.withPrompt });
 				const compaction = {
 					summary: summary + fileOpsAppendix(preparation.fileOps),
@@ -3592,7 +3716,11 @@ export async function summarizeWithRotation(
 					logLine(cfg, { event: "note", note: "cancelled", ref: c.ref });
 					return { ok: false, error: "cancelled" };
 				}
-				logLine(cfg, { event: "direct_fail", ref: c.ref, error: String(dErr?.message ?? dErr).slice(0, 220), stop: dErr?.stopReason, inTok: dErr?.usage?.input, outTok: dErr?.usage?.output, reasonTok: dErr?.usage?.reasoning, note: "moving to the next candidate; pi's compact() runs only after every candidate failed" });
+				// `clock` and `chars` are what this line could not say on 2026-10-19, where the whole record was
+					// error "aborted": the library swallows the reason our own clock gave, so the two numbers that
+					// distinguish a dead request (a clock fired, nothing arriving) from a slow one (the ceiling
+					// fired while characters were still coming) are recorded here instead of in its message.
+					logLine(cfg, { event: "direct_fail", ref: c.ref, clock: timedOut || undefined, chars: dChars || undefined, error: String(dErr?.message ?? dErr).slice(0, 220), stop: dErr?.stopReason, inTok: dErr?.usage?.input, outTok: dErr?.usage?.output, reasonTok: dErr?.usage?.reasoning, note: "moving to the next candidate; pi's compact() runs only after every candidate failed" });
 				failures.push(`${c.ref}: direct: ${String(dErr?.message ?? dErr).split("\n")[0].slice(0, 100)}`);
 				combined.dispose();
 				continue;
@@ -3637,8 +3765,22 @@ export async function summarizeWithRotation(
 			// A summary cut off by our own timeout is half a summary and must not be kept.
 			// (pi already throws when the model stops at its token ceiling.)
 			if (timedOut) {
-				logLine(cfg, { event: "fail", ref: c.ref, seconds, measured: measured.tokens, reason: "timed out with a half written summary", timeoutMs: profile.timeoutMs, ...split });
-				failures.push(`${c.ref}: nothing finished within ${secs(profile.timeoutMs)}`);
+				// pi's own compact() path keeps the stream inside the library, so nothing can report
+				// production there and only the silence clock can fire - the old behaviour, with a truer sentence.
+				logLine(cfg, {
+					event: "fail",
+					ref: c.ref,
+					seconds,
+					measured: measured.tokens,
+					reason:
+						timedOut === "backstop"
+							? `still writing when the ${secs(backstop)} ceiling arrived`
+							: `nothing arrived for ${secs(profile.timeoutMs)}`,
+					timeoutMs: profile.timeoutMs,
+					backstopMs: backstop,
+					...split,
+				});
+				failures.push(`${c.ref}: nothing finished within ${secs(timedOut === "backstop" ? backstop : profile.timeoutMs)}`);
 				continue;
 			}
 			if (!summary || summary.trim().length < 80) {
@@ -3656,10 +3798,13 @@ export async function summarizeWithRotation(
 				failures.push(`${c.ref}: ~${fmt(measured.tokens)} tok, ceiling is ${fmt(realSizes.max)}`);
 				continue;
 			}
+			// The same lesson from pi's own compact() path, where the timing is all we get.
+			if (seconds > 0 && measured.tokens > 0) observedRate.set(c.ref, measured.tokens / seconds);
 			logLine(cfg, {
 				event: "ok",
 				ref: c.ref,
 				kind: c.kind,
+				tokPerSec: seconds > 0 && measured.tokens > 0 ? Math.round((measured.tokens / seconds) * 10) / 10 : undefined,
 				seconds,
 				measured: measured.tokens,
 				measuredBy: measured.by,
@@ -4523,7 +4668,7 @@ export function modelOptionsScreen(
 			currentValue: timeoutLabel(o.timeoutMs),
 			values: [EDIT_NUMBER, "unlimited"],
 			description:
-				"Enter opens a free numeric entry in minutes (0 = unlimited); cycling reaches 'unlimited'. After this the try is given up and the next model in the Compaction models list is asked. A local model writes 10-20 tokens a second, so a 13,000-token summary needs 11-22 minutes - a 10-minute timeout is only for fast models.",
+				"Enter opens a free numeric entry in minutes (0 = unlimited); cycling reaches 'unlimited'. This is how long to wait with NOTHING arriving: every character that comes in restarts the clock, so a model that keeps writing keeps its request however slow it is. A second ceiling nobody sets - twice what this model's last measured speed says the summary should take, never under 20 minutes, never over 2 hours - stops a stream that produces forever. When either one fires the next model in the Compaction models list is asked, and the log says which clock it was.",
 		});
 		rows.push({
 			id: "summaryPct",
@@ -7622,7 +7767,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 			},
 			{
 				label: `Summary timeout period - now ${timeoutLabel(o.timeoutMs)}`,
-				hint: "2 → 3 → 5 → 7 → 10 → 15 → 20 → 30 → 45 → 60 min → unlimited. After this the next model is asked.",
+				hint: "2 → 3 → 5 → 7 → 10 → 15 → 20 → 30 → 45 → 60 min → unlimited. How long to wait with nothing arriving; output restarts the clock.",
 				run: async () => {
 					const labels = TIMEOUT_STEPS.map(timeoutLabel);
 					const chosen = await ctx.ui.select("Timeout period", withCurrent(labels, timeoutLabel(o.timeoutMs)));
