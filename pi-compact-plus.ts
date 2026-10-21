@@ -7912,6 +7912,26 @@ let watcherCtx: Ctx | null = null;
  * cancelled compaction cannot resume a turn much later.
  */
 /**
+ * Tell pi-stamp-plus that THIS compaction was cancelled on purpose (2026-10-21, on request).
+ *
+ * pi reports every cancelled compaction the same way: `session_compact_failed` with `aborted: true`
+ * and no error message, so a hold from the gate above and an Escape key pressed during a summary look
+ * identical to anything listening. pi-stamp-plus stamps that as `Compaction . ABORTED`, which reads
+ * like a fault when it is a Tuesday. The two extensions cannot read each other's mind, so the moment
+ * of cancelling is written down next to the session file; pi-stamp-plus drops the stamp for that note
+ * and for nothing else. This extension never reads the file back, and a session file pi did not tell
+ * us about means no note and no change.
+ */
+function markCompactionHeld(): void {
+	const sf = (process.env.PI_SESSION_FILE ?? "").trim();
+	if (!sf || writesBlocked()) return;
+	try {
+		writeFileSync(`${sf}.pcp-held.json`, JSON.stringify({ at: Date.now(), by: "pi-compact-plus", why: "not time yet" }), "utf8");
+	} catch {
+		/* A note nobody can write is a stamp nobody suppresses: the honest ABORTED line still appears. */
+	}
+}
+/**
  * THE GATE: should a compaction that PI started be held back for now?
  *
  * pi's threshold and this extension's trigger point are two different numbers on purpose. pi's is set
@@ -8885,6 +8905,9 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					// does not reach this line, which is how a hold would have thrown instead of cancelling.
 					logLine(loadConfig(), { event: "auto_compaction_held", reason: event.reason, note });
 				}
+				// pi-stamp-plus is told before the cancel goes back to pi, because pi stamps the
+				// failed compaction the instant it receives the answer.
+				markCompactionHeld();
 				if (nowMs - lastGateHoldNoticeAtMs > 600_000) {
 					lastGateHoldNoticeAtMs = nowMs;
 					ctx.ui?.notify?.(`Compaction held: ${note}`, "info");

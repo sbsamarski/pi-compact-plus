@@ -212,29 +212,36 @@ Read-only — a look before you compact.
 
 ## Percentages, not magic numbers
 
-Pi's built-in compaction numbers are absolute token counts — a reserve of 16,384 and a keep-recent
-of 20,000 — sized for small windows and quietly wrong everywhere else. This extension ignores those
-two settings completely and computes every threshold from the current model's context window, as a
-percentage with clamps. The board groups them into two submenus:
-
-**Auto-compaction** — when compaction starts by itself:
-
-| Setting | Default | What it controls |
-|---|---|---|
-| Start at % of window | 82% | the trigger point; the context crossing this share starts the compaction. |
-| Min / Max reserve tokens | 12,288 / 80,000 | clamps on the space kept free — on a 1M window the max caps it at 80,000. |
-
-**Preserve recent tokens** — what stays word for word:
+Pi's built-in compaction numbers are absolute token counts - a reserve of 16,384 and a keep-recent
+of 20,000 - sized for small windows and quietly wrong everywhere else. This extension keeps its own
+two numbers, both plain token counts, both in the **Compaction settings** menu. (Until 2026-10-21
+they were percentages of the window with min/max clamps in two submenus of their own; a config that
+still holds percentages is translated once, when it is read, into the token counts it really meant,
+so nothing moves on the board by itself.)
 
 | Setting | Default | What it controls |
 |---|---|---|
-| Preserve recent % | 20% | the newest tail kept outside every summary (and protected from elision). |
-| Min / Max preserve tokens | 16,384 / 100,000 | clamps on that tail. |
+| Auto-compaction trigger point | 0 = wherever this model has to compact | the context size, in tokens, at which the summary is written. |
+| Preserve tokens | 20,000 | the newest tail kept word for word outside every summary (and protected from elision). |
 
-Both submenus open with a **read-only line showing the current computed value** — the actual trigger
-point and the actual preserved window, in tokens, for the active model, right now. Switch models
-mid-session and every value recomputes instantly, no reload. If the window is unknown, pi's classic
-16,384 / 20,000 figures are used as safe fallbacks.
+Each row shows the value IN FORCE for the active model, in tokens: the trigger point shown is the
+EARLIER of your number and the point this model has to compact at anyway, and the preserve figure is
+cut down when a small window cannot carry that much verbatim tail. Switch models mid-session and both
+recompute instantly, no reload. If the window is unknown, pi's classic 16,384 / 20,000 figures are
+used as safe fallbacks.
+
+The other half of the pair lives in pi's own `settings.json`: pi is the one that notices the context
+filling, so it asks at *window minus `compaction.reserveTokens`*, and this extension either writes the
+summary or answers "not yet". The trigger point is never later than that ask, so on a small-context
+model the earlier ask wins and nothing is ever held waiting for a line that is above the window. The
+read-only **pi's own reserve** row shows both points and says what `reserveTokens` would make them
+agree; this extension never edits that file.
+
+A "not yet" is bookkeeping and stays out of the log, but pi prints its own `Auto-compaction cancelled`
+line for it, and pi-stamp-plus stamped the same moment as `Compaction` . `ABORTED`. A hold now leaves
+a one-use note beside the session file (`<session>.jsonl.pcp-held.json`) which pi-stamp-plus consumes,
+so only a hold is silenced - a compaction that really is aborted is still stamped, even one second
+later.
 
 One more number: the **generation cap** on chat requests (default 65,536 tokens, 0 disables). Pi asks
 providers for an output permission of *window minus its estimate minus a small margin* — on a 1M
