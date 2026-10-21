@@ -259,6 +259,11 @@ type Config = {
 	 *  pre-compaction context, which is why "compacted from 163,000 tokens" looks nothing like the
 	 *  49,000 tokens the summariser was given. */
 	summaryReceipt: boolean;
+	/** ON = a compaction this extension starts while a turn is running is landed by appending the summary
+	 *  straight to the session, instead of going through pi's manual compaction entry point - which stops
+	 *  the turn, prints 'operation aborted' and waits for the operator to type a message. OFF until it has
+	 *  been watched on a real long run (2026-10-22, #43); file-only for now, no menu row. */
+	landWithoutAbort: boolean;
 	/** ON = the extension builds the whole summarization request itself (turn-numbered input,
 	 *  labelled previous summary, ONE instruction source) and calls the model through the registry;
 	 *  a direct failure moves to the NEXT candidate, and pi's compact() runs only after every
@@ -430,6 +435,7 @@ const DEFAULT_CONFIG: Config = {
 	log: true,
 	transcriptPointer: true,
 	summaryReceipt: true,
+	landWithoutAbort: false,
 	directRequest: true,
 	shapeGate: true,
 	chatMaxTokensCap: 65_536,
@@ -479,13 +485,50 @@ function readPiReserveTokens(): number {
  *  not us, never again us. You hold that line in pi's own settings, and a change made in the file needs a
  *  restart, because pi reads settings.json at startup and then holds what it read - which is how a flag
  *  switched off at 23:29:55 was still reported as on by the pi that started at 23:29:36. */
-export function readPiCompactionEnabled(): boolean {
+/** pi's compaction block, as written in its own settings.json, with pi's own defaults filled in for
+ *  anything absent. The flag alone used to be read; the two numbers are needed since this extension
+ *  builds pi's own preparation object for a compaction it lands without stopping the turn (#43), and
+ *  the cut point depends on `keepRecentTokens`. Read at call time, like the flag, because pi holds what
+ *  it read at startup and an edit in the file is exactly what the operator is testing. */
+/** pi's own compaction module (`dist/core/compaction/compaction.js`), which holds
+ *  `prepareCompaction` - the function that decides what a summary covers and where the verbatim tail
+ *  starts. It is NOT in the package's root exports, so it is reached by resolving the same specifier
+ *  the top of this file already imports and following it to that file. Nothing here copies pi's
+ *  arithmetic: if the module or the function cannot be found, the caller falls back to pi's own path. */
+let piCompactionMod: Promise<any> | undefined;
+function piCompactionModLoad(): Promise<any> {
+	if (!piCompactionMod) {
+		piCompactionMod = (async () => {
+			const root = import.meta.resolve("@earendil-works/pi-coding-agent");
+			return import(new URL("./core/compaction/compaction.js", root).href);
+		})().catch((err) => {
+			// A failed lookup must not be remembered as a permanent answer: pi can be upgraded under us.
+			piCompactionMod = undefined;
+			throw err;
+		});
+	}
+	return piCompactionMod;
+}
+
+export function readPiCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	const off = { enabled: false, reserveTokens: DEFAULT_RESERVE_TOKENS, keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS };
 	try {
 		const raw = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
-		return raw?.compaction?.enabled === true;
+		const c = raw?.compaction ?? {};
+		const num = (v: unknown, dflt: number) => (Number(v) > 0 ? Math.round(Number(v)) : dflt);
+		return {
+			enabled: c.enabled === true,
+			reserveTokens: num(c.reserveTokens, DEFAULT_RESERVE_TOKENS),
+			keepRecentTokens: num(c.keepRecentTokens, DEFAULT_KEEP_RECENT_TOKENS),
+		};
 	} catch {
-		return false;
+		return off;
 	}
+}
+
+/** Whether pi would compact by itself. Kept as its own name because half the file asks exactly that. */
+export function readPiCompactionEnabled(): boolean {
+	return readPiCompactionSettings().enabled;
 }
 
 /** pi's default keepRecentTokens, used when the preparation carries no settings of its own. */
@@ -1094,6 +1137,9 @@ export function loadConfig(): Config {
 				? raw.activeTemplateName
 				: base.activeTemplateName,
 		summaryReceipt: typeof raw.summaryReceipt === "boolean" ? raw.summaryReceipt : base.summaryReceipt,
+		// Read it or the operator can never switch it on: `missingConfigKeys` fails a setting the loader
+		// does not carry, which is how this field would have stayed permanently off while looking settable.
+		landWithoutAbort: typeof raw.landWithoutAbort === "boolean" ? raw.landWithoutAbort : base.landWithoutAbort,
 		userTemplates: Array.isArray(raw?.userTemplates)
 			? (raw.userTemplates as any[])
 					.filter((t) => t && typeof t.name === "string" && typeof t.text === "string")
@@ -1274,6 +1320,9 @@ const LOG_ROW_NAMES: Record<string, string> = {
 	ok: "COMPACTION SUMMARY",
 	done: "COMPACTION DONE",
 	compaction_landed: "COMPACTION END",
+	// The append path of #43 explaining itself is worth a row: it is the difference between "nothing
+	// happened" and "it fell back to the interrupting route, and here is why".
+	no_abort_landing_failed: "NO-ABORT LANDING FAILED",
 	fail: "COMPACTION TRY FAILED",
 	direct_fail: "COMPACTION TRY FAILED",
 	give_up: "COMPACTION GAVE UP",
@@ -8474,6 +8523,31 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 				: `Context at ${fmt(tokens)} tokens (trigger line ${fmt(line)}) - compacting now.`,
 			"info",
 		);
+		// LAND IT WITHOUT STOPPING THE TURN when the operator has switched that on and we are not at the
+		// danger line. The call runs detached, exactly like `ctx.compact()` (which is fire-and-forget by
+		// contract and takes minutes here): the timer must not wait, and `compactionInFlight` inside keeps
+		// a second compaction from starting meanwhile. A failure says so and falls back to pi's path, so
+		// the session still gets compacted - by the interrupting route, which is the behaviour this
+		// switch exists to move away from, but never a session left to overflow.
+		if (cfg.landWithoutAbort && !urgent && landNoAbortHook) {
+			void landNoAbortHook(ctx, source)
+				.then((r) => {
+					if (r.ok) {
+						ctx.ui?.notify?.("Compaction landed without interrupting the turn - the next request already carries the summary.", "info");
+						return;
+					}
+					const note = String(r.note ?? "").slice(0, 160);
+					logLine(loadConfig(), { event: "no_abort_landing_failed", note, source, line, window });
+					ctx.ui?.notify?.(`Compaction could not land without an interrupt (${note.slice(0, 90)}) - using pi's own path, which stops the turn.`, "warning");
+					(ctx as any).compact?.({
+						onComplete: () => ctx.ui?.notify?.("Automatic compaction landed. The turn was interrupted to run it - send any message and the session continues from the summary.", "info"),
+						onError: (err: any) => ctx.ui?.notify?.(`Automatic compaction failed: ${String(err?.message ?? err).slice(0, 160)}`, "error"),
+					});
+				})
+				.catch((err: any) => logLine(loadConfig(), { event: "no_abort_landing_failed", note: `unhandled: ${String(err?.message ?? err).slice(0, 140)}`, source }));
+			return;
+		}
+
 		(ctx as any).compact?.({
 			onComplete: () => ctx.ui?.notify?.(sp.midRun === true ? "Automatic compaction landed. The turn was interrupted to run it - send any message and the session continues from the summary." : "Automatic compaction landed. Nothing was running, so the session simply carries on from the summary.", "info"),
 			onError: (err: any) => ctx.ui?.notify?.(`Automatic compaction failed: ${String(err?.message ?? err).slice(0, 160)}`, "error"),
@@ -8498,6 +8572,11 @@ let lastCompactionTrigger = "manual";
  *  2026-10-14, a session triggered again 0.9 s after a summary had landed, on the size of the whole
  *  on-disk history, and pi answered it with "Nothing to compact (session too small)". */
 let lastCompactionDoneAtMs = 0;
+/** The no-abort landing of #43, which lives inside install() because `handleCompaction` does. The
+ *  watcher is a top-level function and cannot see into that closure, so the landing hands itself to the
+ *  module here - and if nothing ever assigned it (a rig that loads the file without installing it, or a
+ *  future build where the code moved), the watcher simply uses pi's own path. */
+let landNoAbortHook: ((ctx: any, why: string) => Promise<{ ok: boolean; note?: string }>) | undefined;
 /** The "nothing left to summarise" notice is worth reading once per 15 minutes, not once a minute. */
 let lastNoOpNoticeAtMs = 0;
 /** The parked-and-the-room-is-running-out warning, throttled to once every ten minutes. */
@@ -8933,7 +9012,106 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	async function handleCompaction(event: any, ctx: any) {
+	/**
+	 * LAND THE SUMMARY WITHOUT STOPPING THE TURN (2026-10-22, #43), when `landWithoutAbort` is on.
+	 *
+	 * Today this extension starts its compactions with `ctx.compact()`, which is pi's MANUAL path: pi
+	 * stops the running loop, writes the summary, and waits for the operator to type something. That is
+	 * the pair of messages the operator reported - "operation aborted" and the ABORTED stamp - and it is
+	 * not a pi limitation: pi's own threshold compaction happens inside the request pipeline and never
+	 * stops anything, because a compaction that is merely APPENDED to the session is picked up by the
+	 * loop's next request on its own (pi rebuilds `context.messages` from `buildSessionProjection()` in
+	 * `prepareRequest`, agent-session.js:434-446).
+	 *
+	 * So: build pi's own preparation, hand it to the same `summarizeWithRotation` the event handler
+	 * uses (identical model rotation, shape gate, retries and log rows), and append the result with the
+	 * same six arguments pi passes at agent-session.js:2268. What is NOT reproduced is pi's
+	 * `session_compact` event, which an extension cannot emit: the on-screen transcript may keep the
+	 * pre-compaction view until a reload, and pi-stamp-plus writes no stamp for it. Both are recorded
+	 * here in the log instead, and the switch stays off until that has been watched on a real run.
+	 *
+	 * The danger line never takes this path: inside MIDRUN_DANGER_TOKENS a request is about to be
+	 * refused, and a refused session cannot be compacted at all, so an interrupted turn is the lesser
+	 * failure and pi's interrupting path stays in charge.
+	 */
+	async function landCompactionNoAbort(ctx: any, why = "timer"): Promise<{ ok: boolean; note?: string }> {
+		const cfg = loadConfig();
+		const sm: any = ctx?.sessionManager;
+		// `ctx` types the session manager as read-only; at runtime pi passes the real object
+		// (agent-session-services.js:136). If a future build really does hand out a read-only view, this
+		// check says so and the caller uses pi's path instead of half-landing a summary.
+		if (typeof sm?.appendCompaction !== "function") return { ok: false, note: "this pi gives extensions a read-only session manager" };
+		let mod: any;
+		try {
+			mod = await piCompactionModLoad();
+		} catch (err: any) {
+			return { ok: false, note: `pi's compaction module could not be loaded: ${String(err?.message ?? err).slice(0, 110)}` };
+		}
+		if (typeof mod?.prepareCompaction !== "function") return { ok: false, note: "pi's prepareCompaction is not exported in this build" };
+		const pathEntries: any[] = sm.getBranch?.() ?? [];
+		if (pathEntries.length === 0) return { ok: false, note: "the session branch is empty" };
+		const piSettings = readPiCompactionSettings();
+		let preparation: any;
+		try {
+			preparation = mod.prepareCompaction(pathEntries, {
+				...(mod.DEFAULT_COMPACTION_SETTINGS ?? {}),
+				reserveTokens: piSettings.reserveTokens,
+				keepRecentTokens: piSettings.keepRecentTokens,
+			});
+		} catch (err: any) {
+			return { ok: false, note: `pi's preparation could not be built: ${String(err?.message ?? err).slice(0, 130)}` };
+		}
+		// Undefined is pi's own "there is nothing to compact" answer (it returns it when the newest entry
+		// is already a compaction). Falling back to `ctx.compact()` here would ask pi to summarise a
+		// session it calls too small, which is the "Nothing to compact" message the operator has seen.
+		if (!preparation) return { ok: false, note: "pi's preparation found nothing to compact" };
+		compactionInFlight = true;
+		let answer: any;
+		try {
+			answer = await handleCompaction(
+				{ reason: "threshold", windowSize: ctx?.model?.contextWindow ?? 0, customInstructions: undefined, signal: undefined },
+				ctx,
+				preparation,
+			);
+		} catch (err: any) {
+			return { ok: false, note: `the summary could not be written: ${String(err?.message ?? err).slice(0, 150)}` };
+		} finally {
+			compactionInFlight = false;
+		}
+		const c: any = answer?.compaction;
+		if (!c?.summary || !c.firstKeptEntryId) {
+			return {
+				ok: false,
+				note: answer?.cancel ? "the compaction was skipped or held, nothing was written" : "the summary came back without a cut point",
+			};
+		}
+		let entryId: string | undefined;
+		try {
+			entryId = sm.appendCompaction(c.summary, c.firstKeptEntryId, c.tokensBefore ?? 0, c.details ?? {}, true, c.usage);
+		} catch (err: any) {
+			return { ok: false, note: `the summary could not be appended: ${String(err?.message ?? err).slice(0, 150)}` };
+		}
+		// The two things pi's `session_compact` event did for us, done here: the watcher must know a
+		// compaction just landed (it refuses to start another one while the size is unmeasured), and the
+		// log must carry the COMPACTION END row with the size that landed.
+		lastCompactionDoneAtMs = Date.now();
+		logLine(cfg, {
+			event: "compaction_landed",
+			reason: "threshold",
+			fromExtension: true,
+			summaryTokens: Math.round((String(c.summary).length * 1.15) / 4),
+			handoff: false,
+			noAbort: true,
+			source: why,
+			entry: String(entryId ?? "").slice(0, 12),
+		});
+		return { ok: true };
+	}
+	// The top-level watcher reaches the nested routine through this single assignment.
+	landNoAbortHook = landCompactionNoAbort;
+
+
+		async function handleCompaction(event: any, ctx: any, preparationOverride?: any) {
 		const cfg = loadConfig();
 		// Who asked for this compaction: the watcher (auto) or the user (manual). A manual run always
 		// clears the pause, successful or not - it is the user proving the trigger works again.
@@ -8987,7 +9165,10 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	} // the compaction switch; elision has its own
 
 		// The arithmetic of this compaction, recorded so a wrong choice can be traced afterwards.
-		const history = historyTokensOnly(event.preparation);
+		// Either pi handed us the preparation (its own threshold or overflow path) or this extension built
+		// one to land a summary without stopping the turn (#43); everything below treats the two alike.
+		const prep = preparationOverride ?? event.preparation;
+		const history = historyTokensOnly(prep);
 		const overhead = fixedRequestTokens(ctx);
 		const fill = realContextTokens(ctx);
 		logLine(cfg, {
@@ -9014,7 +9195,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		ctx.ui?.setStatus?.("compact-plus", `compacting via ${rotationText(cfg, ctx)} ...`);
 		let outcome;
 		try {
-			outcome = await summarizeWithRotation(event.preparation, event.customInstructions, cfg, ctx, event.signal);
+			outcome = await summarizeWithRotation(prep, event.customInstructions, cfg, ctx, event.signal);
 		} finally {
 			ctx.ui?.setStatus?.("compact-plus", undefined);
 		}

@@ -246,6 +246,34 @@ exactly why an alarm set below the line is worth correcting instead of living wi
 **pi's own compaction numbers** row shows both points and says what to change; this extension never
 edits that file.
 
+### Landing a mid-run compaction without stopping the turn (off by default)
+
+Add `"landWithoutAbort": true` at the top level of `pi-compact-plus.json` to try it. When this
+extension's timer fires while a turn is still working, the summary is appended straight to the session
+instead of being started through pi's manual compaction entry point. The difference is what you see:
+
+| Switch | What happens mid-run |
+|---|---|
+| off (default) | pi stops the loop, writes the summary, prints `operation aborted`, and waits for you to send any message. The stamp says `ABORTED`. |
+| on | the summary is appended at the safe point, nothing is aborted, and the loop's very next request already carries the compacted context. No message is needed to continue. |
+
+It works because pi rebuilds the messages of *every* request from the session projection
+(`prepareRequest`, `dist/core/agent-session.js:434`), so a compaction that is merely appended is picked
+up on the next round by itself. The extension builds pi's own preparation object and uses pi's own cut
+point, so the summary covers exactly what pi would have covered.
+
+Why it is off by default, honestly: an extension cannot emit pi's `session_compact` event. The next
+request is fine - that is the whole mechanism - but the on-screen transcript may keep showing the
+pre-compaction conversation until you reload, and pi-stamp-plus writes no `COMPACTION` stamp for that
+landing, because both hang off that event. The compaction itself is real and safely on disk; the log
+row (`COMPACTION END`, with `noAbort: true`) is written by this extension. If you turn it on and the
+transcript bothers you, `/reload` or a new session shows the truth.
+
+Two things never change: at the danger line (within 12,000 tokens of the whole window) the interrupting
+path is used whatever the switch says, because a refused request cannot be compacted at all; and if the
+append path cannot be prepared - an older or moved pi, a session manager without the write method, a
+summary that failed - it says so in the log (the log row `NO-ABORT LANDING FAILED`, naming the reason) and falls back to pi's interrupting path rather than leaving the context to overflow.
+
 A "not yet" is bookkeeping and stays out of the log, but pi prints its own `Auto-compaction cancelled`
 line for it, and pi-stamp-plus stamped the same moment as `Compaction` . `ABORTED`. A hold now leaves
 a one-use note beside the session file (`<session>.jsonl.pcp-held.json`) which pi-stamp-plus consumes,
