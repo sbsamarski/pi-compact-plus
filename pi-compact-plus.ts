@@ -90,29 +90,57 @@ type CharCap = number | "full";
  * use, clamped to absolute min/max, so a mid-session model switch re-derives everything on the next
  * request. Nothing here touches pi's settings.json and nothing needs /reload.
  */
+/**
+ * The two sizes the operator sets, both in TOKENS (2026-10-21, was a percent of the window with
+ * min/max limits). Percentages were unreadable on a 170k model and wrong on any other: the same
+ * 82% meant 139,400 tokens here and 52,480 on a 64k model, and the four limit rows existed only
+ * to catch what the percent did on windows nobody was testing. Two numbers say it outright.
+ */
 type ScalingConfig = {
-	/** keepRecent = this percent of the window, clamped to [keepRecentMin, keepRecentMax]. */
-	keepRecentPercent: number;
-	keepRecentMin: number;
-	keepRecentMax: number;
-	/** reserveTokens = this percent of the window, clamped to [reserveMin, reserveMax]. Drives the
-	 *  compaction trigger line (window - reserve) and every summary size share (aim 0.8 x reserve). */
-	/** The auto-compaction trigger point as a percent of the window (2026-10-02: the old
-	 *  reservePercent inverted - 18 kept free became 82 used). The reserve = window - point,
-	 *  clamped by reserveMin/reserveMax. */
-	startPercent: number;
-	reserveMin: number;
-	reserveMax: number;
+	/** Automatic compaction fires when the context reaches this many tokens. 0 = no explicit target:
+	 *  fire where this model has to compact anyway (see triggerPointFor). */
+	triggerTokens: number;
+	/** How much of the window stays free for the verbatim tail: what compaction keeps word for word
+	 *  and what elision refuses to stub. pi's keepRecentTokens is the same idea. */
+	preserveTokens: number;
 };
 
 const SCALING_DEFAULTS: ScalingConfig = {
-	keepRecentPercent: 20,
-	keepRecentMin: 16_384,
-	keepRecentMax: 100_000,
-	startPercent: 82,
-	reserveMin: 12_288,
-	reserveMax: 80_000,
+	triggerTokens: 0,
+	preserveTokens: 20_000,
 };
+
+/** The window an old percentage config is translated against when no model is loaded yet. */
+const LEGACY_WINDOW = 170_000;
+
+/**
+ * Read the scaling block, translating the old percentages into tokens so a config written before
+ * 2026-10-21 keeps the numbers it was really using. A stored `startPercent: 82` on a 170,000-token
+ * window becomes `triggerTokens: 139400`; the min/max limits are applied during the translation and
+ * then disappear, which is what they were for. A file that already has token counts is read as is.
+ */
+export function migrateScaling(raw: any, base: ScalingConfig, window = LEGACY_WINDOW): ScalingConfig {
+	const sc = raw?.scaling ?? {};
+	const num = (v: any): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined);
+	const trigger = num(sc.triggerTokens);
+	const preserve = num(sc.preserveTokens);
+	// A file with no scaling block at all is a NEW file, not an old one: it gets the defaults below,
+	// not a translation of percentages it never had.
+	const legacyKeys = ["startPercent", "reservePercent", "reserveMin", "reserveMax", "keepRecentPercent", "keepRecentMin", "keepRecentMax"];
+	if (trigger === undefined && preserve === undefined && !legacyKeys.some((k) => sc[k] !== undefined)) return base;
+	if (trigger !== undefined || preserve !== undefined) {
+		return { triggerTokens: trigger ?? base.triggerTokens, preserveTokens: preserve ?? base.preserveTokens };
+	}
+	const win = num(sc.window) && (sc.window as number) > 0 ? Math.round(sc.window) : window;
+	const sp = num(sc.startPercent) ?? (num(sc.reservePercent) !== undefined ? 100 - (num(sc.reservePercent) as number) : 82);
+	const rLo = Math.min(num(sc.reserveMin) ?? 12_288, num(sc.reserveMax) ?? 80_000);
+	const rHi = Math.max(num(sc.reserveMin) ?? 12_288, num(sc.reserveMax) ?? 80_000);
+	const reserve = clamp(Math.round((win * (100 - sp)) / 100), rLo, rHi);
+	const kLo = Math.min(num(sc.keepRecentMin) ?? 16_384, num(sc.keepRecentMax) ?? 100_000);
+	const kHi = Math.max(num(sc.keepRecentMin) ?? 16_384, num(sc.keepRecentMax) ?? 100_000);
+	const keep = clamp(Math.round((win * (num(sc.keepRecentPercent) ?? 20)) / 100), kLo, kHi);
+	return { triggerTokens: Math.max(0, win - reserve), preserveTokens: keep };
+}
 
 type ElisionConfig = {
 	/** false = never stub anything in live requests. */
@@ -1018,21 +1046,9 @@ export function loadConfig(): Config {
 		directRequest: true,
 		shapeGate: typeof raw.shapeGate === "boolean" ? raw.shapeGate : base.shapeGate,
 		chatMaxTokensCap: typeof raw.chatMaxTokensCap === "number" && Number.isFinite(raw.chatMaxTokensCap) && raw.chatMaxTokensCap >= 0 ? Math.round(raw.chatMaxTokensCap) : base.chatMaxTokensCap,
-		scaling: {
-			keepRecentPercent: pctField(raw?.scaling?.keepRecentPercent, base.scaling.keepRecentPercent),
-			keepRecentMin: nonNegField(raw?.scaling?.keepRecentMin, base.scaling.keepRecentMin),
-			keepRecentMax: nonNegField(raw?.scaling?.keepRecentMax, base.scaling.keepRecentMax),
-			// The inversion (2026-10-02): a stored reservePercent migrates to startPercent = 100 - it.
-			startPercent: (() => {
-				const sp = raw?.scaling?.startPercent;
-				if (typeof sp === "number" && Number.isFinite(sp) && sp >= 1 && sp <= 99) return Math.round(sp);
-				const rp = raw?.scaling?.reservePercent;
-				if (typeof rp === "number" && Number.isFinite(rp) && rp >= 1 && rp <= 99) return 100 - Math.round(rp);
-				return base.scaling.startPercent;
-			})(),
-			reserveMin: nonNegField(raw?.scaling?.reserveMin, base.scaling.reserveMin),
-			reserveMax: nonNegField(raw?.scaling?.reserveMax, base.scaling.reserveMax),
-		},
+		// The two sizes are token counts now; migrateScaling translates a file that still holds the old
+		// percentages, so an upgrade changes nothing the operator can see or feel.
+		scaling: migrateScaling(raw, base.scaling),
 		autoCompact: typeof raw.autoCompact === "boolean" ? raw.autoCompact : base.autoCompact,
 		autoCompactPaused: typeof raw.autoCompactPaused === "boolean" || typeof raw.autoCompactPaused === "string" ? raw.autoCompactPaused : base.autoCompactPaused,
 		elision: sanitizeElision(raw?.elision),
@@ -1231,6 +1247,34 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
  *  every *_failed, retry, skip, elision_error, auto_compaction_held. Skip stays because "model X was not in"
  *  the model list" is the answer to a question the operator asks; auto_compaction_held stays because when
  *  pi asks early and nothing happens, that line is the only place saying why. */
+/**
+ * What each log event is CALLED on screen (2026-10-21). Kept next to LOG_CHATTER, which decides
+ * whether a row is shown at all: this decides what a shown row says. The two lists answer different
+ * questions, so an event can be visible with a plain name (compaction_landed -> COMPACTION END) or
+ * hidden with one (auto_compaction_held).
+ */
+const LOG_ROW_NAMES: Record<string, string> = {
+	start: "COMPACTION START",
+	attempt: "COMPACTION TRY",
+	ok: "COMPACTION SUMMARY",
+	done: "COMPACTION DONE",
+	compaction_landed: "COMPACTION END",
+	fail: "COMPACTION TRY FAILED",
+	direct_fail: "COMPACTION TRY FAILED",
+	give_up: "COMPACTION GAVE UP",
+	skip: "MODEL SKIPPED",
+	accepted_with_warnings: "COMPACTED, WITH WARNINGS",
+	compaction_no_op: "NOTHING TO COMPACT",
+	compaction_failed: "COMPACTION FAILED",
+	auto_compaction_failed: "COMPACTION FAILED",
+	auto_compaction_paused: "AUTO-COMPACTION PARKED",
+	auto_compaction_skipped: "PARKED: ASK IGNORED",
+	auto_compaction_parked_warning: "PARKED: ALMOST FULL",
+	elision: "ELISION",
+	elision_error: "ELISION FAILED",
+	auto_compaction_held: "HELD",
+};
+
 const LOG_CHATTER = new Set([
 	// Nothing writes these any more (the automatic continuation was deleted 2026-10-21), but the log file
 	// still holds years of them, and the results-only view must go on hiding them.
@@ -1331,24 +1375,12 @@ function tailLogPretty(lines = 16, verbose = false): string {
 						typeof d.min === "number" && typeof d.max === "number"
 							? `${aim ? aim + " \u00b7 " : ""}accept ${fmt(d.min)}-${fmt(d.max)} tok${typeof d.window === "number" && d.window > 0 ? ` (window ${fmt(d.window)} tok)` : ""}`
 							: aim;
-					const status =
-						d.event === "ok"
-							? "OK"
-							: d.event === "accepted_with_warnings"
-								? "ACCEPTED WITH WARNINGS"
-								: d.event === "fail"
-									? "FAIL"
-								: d.event === "attempt"
-									? "TRY"
-									: d.event === "give_up"
-										? "GIVE UP"
-										: d.event === "done"
-											? "DONE"
-											: d.event === "start"
-												? "START"
-												: d.event === "auto_compaction_held"
-																	? "HELD"
-																: String(d.event ?? "").toUpperCase();
+					// The words a row starts with (2026-10-21, on request). The operator reads this view to see
+					// what the compactor DID, so the internal event names get plain ones: a run begins with
+					// COMPACTION START, each model tried is a COMPACTION TRY, and the moment the new context exists
+					// is COMPACTION END. An event that is not listed shows its own name in capitals, so a new
+					// record type can be unnamed for a while but never silently nameless.
+					const status = LOG_ROW_NAMES[String(d.event ?? "")] ?? String(d.event ?? "").toUpperCase();
 					// An accepted-with-warnings line must say WHAT was not as asked - the warnings array is the
 					// list of rule violations the summary was accepted despite (2026-10-07, on request).
 					const why =
@@ -4220,31 +4252,58 @@ function cycleNoThinkMarker(): void {
 }
 
 /** Live reserveTokens from pi's own compaction settings (falls back to pi's documented default). */
-/** THE UNLINK (2026-10-01): pi's compaction.reserveTokens/keepRecentTokens are absolute token
- *  counts tuned for one window size; the extension no longer reads them. Instead the two anchors
- *  are derived from the ACTIVE model's context window - percent first, then clamped to absolute
- *  min/max - so a 95k local model gets ~today's tuned values, a 200k model 4x that, a 1M model the
- *  clamped maximum. Recomputed at EVERY use: a mid-session model switch changes everything on the
- *  next request, with no /reload and nothing written to pi's settings.json. */
+/**
+ * WHERE AUTOMATIC COMPACTION FIRES, in tokens, for one model window (2026-10-21).
+ *
+ * The operator sets a trigger point in tokens. That number alone is unsafe, because a model with a
+ * smaller window runs out of room long before it: a 139,400 target on a 64,000-token model would
+ * simply never fire. So the point is the EARLIER of two numbers - the target, and the point this
+ * model has to compact at anyway.
+ *
+ * The second number matters for a second reason, and it is the reason for the extra context re-read
+ * the operator reported on 2026-10-21. While pi's own compaction is enabled, pi asks for a summary
+ * once the context passes window minus its reserveTokens, and this extension holds that ask until its
+ * own point. Every turn spent between the two numbers re-uploads the whole uncompacted context. So
+ * this extension never sets its point LATER than pi's ask: min() means the two can only ever agree or
+ * the extension fires first, and a hold needs a genuine drift (pi' reserveTokens changed while pi
+ * was running) rather than being the normal course of every compaction.
+ */
+export function triggerPointFor(o: { window: number; triggerTokens: number; piEnabled: boolean; piReserve: number }): number {
+	const win = Math.floor(o.window || 0);
+	if (!(win > 0)) return 0;
+	// Room that has to stay free at the top of the window: pi's own reserve while pi is the one that
+	// would otherwise compact, otherwise a small internal headroom so a huge target cannot overflow.
+	const headroom = o.piEnabled && o.piReserve > 0 ? Math.floor(o.piReserve) : Math.max(4096, Math.round(win * 0.05));
+	const mustFireAt = Math.max(1024, win - headroom);
+	const wanted = o.triggerTokens > 0 ? Math.floor(o.triggerTokens) : Number.POSITIVE_INFINITY;
+	return Math.max(1024, Math.min(wanted, mustFireAt));
+}
+
+/** The same for the model this session is using right now. */
+export function triggerPoint(ctx: Ctx): number {
+	const window = (ctx as any)?.model?.contextWindow ?? 0;
+	if (!(window > 0)) return 0;
+	const s = loadConfig().scaling;
+	return triggerPointFor({ window, triggerTokens: s.triggerTokens, piEnabled: readPiCompactionEnabled(), piReserve: readPiReserveTokens() });
+}
+
+/**
+ * The room the trigger point leaves free at the top of the window - the summary plus the messages
+ * that follow it. Derived, never set: it is window minus the trigger point, and both settings and
+ * every size share read it. Recomputed on every call, so a model switch moves the line at once.
+ */
 export function extReserve(ctx: Ctx): number {
 	const window = (ctx as any)?.model?.contextWindow ?? 0;
 	if (!(window > 0)) return DEFAULT_RESERVE_TOKENS;
-	const s = loadConfig().scaling;
-	// The reserve is what the trigger point leaves free: window - (startPercent% of window),
-	// clamped by the min/max reserve limits.
-	const lo = Math.min(s.reserveMin, s.reserveMax);
-	const hi = Math.max(s.reserveMin, s.reserveMax);
-	return clamp(Math.round((window * (100 - s.startPercent)) / 100), lo, hi);
+	return Math.max(1024, window - triggerPoint(ctx));
 }
 
-/** The same scheme for the verbatim tail: what compaction keeps and what the elision protects. */
+/** The verbatim tail: what compaction keeps word for word and what elision protects. */
 export function extKeepRecent(ctx: Ctx): number {
 	const window = (ctx as any)?.model?.contextWindow ?? 0;
 	if (!(window > 0)) return DEFAULT_KEEP_RECENT_TOKENS;
-	const s = loadConfig().scaling;
-	const lo = Math.min(s.keepRecentMin, s.keepRecentMax);
-	const hi = Math.max(s.keepRecentMin, s.keepRecentMax);
-	return clamp(Math.round((window * s.keepRecentPercent) / 100), lo, hi);
+	// A tail bigger than the room available is nonsense; the window is the only limit worth having.
+	return clamp(loadConfig().scaling.preserveTokens, 1024, Math.max(1024, window - extReserve(ctx)));
 }
 
 /** Short effective-settings line for a model row. */
@@ -5843,170 +5902,9 @@ async function previewDescription(ctx: Ctx, ref: string): Promise<void> {
 	);
 }
 
-// ------------------------------------------------- TUI: the three settings submenus
 
 /** The auto-compaction submenu: the live trigger point (read-only) and the three settings that
  *  define it. The editor rows exit through the board loop (pi's overlays are safe only there). */
-class AutoCompactionMenu implements Component, Focusable {
-	private list: SettingsList | null = null;
-	private isFocused = false;
-
-	constructor(
-		private tui: TUI,
-		private ctx: Ctx,
-		private onAction: (action: string) => void,
-	) {
-		this.rebuild();
-	}
-
-	private rows(): SettingItem[] {
-		const cfg = loadConfig();
-		const window = this.ctx?.model?.contextWindow ?? 0;
-		const point = window - extReserve(this.ctx);
-		return [
-			{
-				id: "startPct",
-				label: "Start auto-compaction at % of ctx:",
-				currentValue: `${cfg.scaling.startPercent}% (now: ${fmt(point)} tok, based on min/max limits and current ctx window of ${fmt(window)} tok)`,
-				values: ["edit"],
-				description: "The compaction starts when the ctx reaches this percent of the model's window (the value on the right is what that is right now, based on the min/max limits below). Enter opens a free numeric entry (1-99). Default 82.",
-			},
-			{
-				id: "resMin",
-				label: "Min reserve tok before auto-comp.:",
-				currentValue: `${fmt(cfg.scaling.reserveMin)} tok (Overrides the auto-compaction point if the % value is lower than this min limit)`,
-				values: ["edit"],
-				description: "The minimum space kept free at the top of the window. If the % above would leave less room than this, this minimum wins. Enter opens a free numeric entry. Default 12,288.",
-			},
-			{
-				id: "resMax",
-				label: "Max reserve tok before auto-comp.:",
-				currentValue: `${fmt(cfg.scaling.reserveMax)} tok (Overrides the auto-compaction point if the % value is higher than this max limit)`,
-				values: ["edit"],
-				description: "The maximum space kept free at the top of the window. If the % above would leave more room than this, this maximum wins (on a 1M window this is what caps the reserve). Enter opens a free numeric entry. Default 80,000.",
-			},
-		];
-	}
-
-	private rebuild(): void {
-		const items = this.rows();
-		this.list = new SettingsList(
-			items,
-			Math.min(items.length + 2, 8),
-			getSettingsListTheme(),
-			(id: string, value: string) => {
-				if (value === "edit") this.onAction(`__exit:edit-number:${id}`);
-			},
-			() => this.onAction("__close"),
-		);
-	}
-
-	invalidate(): void {
-		this.list?.invalidate();
-	}
-
-	handleInput(data: string): void {
-		this.list?.handleInput(data);
-		this.tui.requestRender();
-	}
-
-	get focused(): boolean {
-		return this.isFocused;
-	}
-
-	set focused(value: boolean) {
-		this.isFocused = value;
-	}
-
-	render(width: number): string[] {
-		const inner = Math.max(40, width);
-		const lines: string[] = ["", "Auto-compaction - when the context crosses the trigger point, compaction starts by itself:", ""];
-		lines.push(...(this.list?.render(inner) ?? []));
-		return lines.map((l) => truncateToWidth(l, inner));
-	}
-}
-
-/** The preserve-recent submenu: the live preserved tail (read-only) and the three settings that
- *  define it. */
-class PreserveMenu implements Component, Focusable {
-	private list: SettingsList | null = null;
-	private isFocused = false;
-
-	constructor(
-		private tui: TUI,
-		private ctx: Ctx,
-		private onAction: (action: string) => void,
-	) {
-		this.rebuild();
-	}
-
-	private rows(): SettingItem[] {
-		const cfg = loadConfig();
-		const window = this.ctx?.model?.contextWindow ?? 0;
-		const keep = extKeepRecent(this.ctx);
-		return [
-			{
-				id: "keepPct",
-				label: "Preserve recent % of ctx window:",
-				currentValue: `${cfg.scaling.keepRecentPercent}% (now: ${fmt(keep)} tok, based on min/max limits and current ctx window of ${fmt(window)} tok)`,
-				values: ["edit"],
-				description: "The preserved tail as a percent of the model's window (the value on the right is what that is right now). Enter opens a free numeric entry (1-99). Default 20.",
-			},
-			{
-				id: "keepMin",
-				label: "Min preserve window limit in tok:",
-				currentValue: `${fmt(cfg.scaling.keepRecentMin)} tok (Overrides the Preserve recent if the above value is lower than this min limit)`,
-				values: ["edit"],
-				description: "If the % above would preserve less than this, this minimum wins. Enter opens a free numeric entry. Default 16,384.",
-			},
-			{
-				id: "keepMax",
-				label: "Max preserve window limit in tok:",
-				currentValue: `${fmt(cfg.scaling.keepRecentMax)} tok (Overrides the Preserve recent if the above value is higher than this max limit)`,
-				values: ["edit"],
-				description: "If the % above would preserve more than this, this maximum wins. Enter opens a free numeric entry. Default 100,000.",
-			},
-		];
-	}
-
-	private rebuild(): void {
-		const items = this.rows();
-		this.list = new SettingsList(
-			items,
-			Math.min(items.length + 2, 8),
-			getSettingsListTheme(),
-			(id: string, value: string) => {
-				if (value === "edit") this.onAction(`__exit:edit-number:${id}`);
-			},
-			() => this.onAction("__close"),
-		);
-	}
-
-	invalidate(): void {
-		this.list?.invalidate();
-	}
-
-	handleInput(data: string): void {
-		this.list?.handleInput(data);
-		this.tui.requestRender();
-	}
-
-	get focused(): boolean {
-		return this.isFocused;
-	}
-
-	set focused(value: boolean) {
-		this.isFocused = value;
-	}
-
-	render(width: number): string[] {
-		const inner = Math.max(40, width);
-		const lines: string[] = ["", "Preserve recent tokens - the most recent part of the ctx that will not be compacted:", ""];
-		lines.push(...(this.list?.render(inner) ?? []));
-		return lines.map((l) => truncateToWidth(l, inner));
-	}
-}
-
 /** The elision submenu: the on/off toggle (in-screen) and the six settings, each edited through
  *  the board loop. */
 class ElisionMenu implements Component, Focusable {
@@ -6184,11 +6082,42 @@ class CompactionMenu implements Component, Focusable {
 				id: "trigger",
 				label: "When auto-compaction fires",
 				currentValue: cfg.enabled
-					? `checked before every model call - fires at ${cfg.scaling.startPercent}% of the window`
+					? `checked before every model call - fires at ${fmt(triggerPoint(this.ctx))} tok`
 					: "nothing fires automatically",
 				values: [],
 				description:
-					"The plugin measures the context before every request to the model - including the requests inside a long tool-calling run - and compacts when the line is passed, so a working session compacts on its own instead of reaching the end of the window. Nothing to switch here: the switch above starts and stops it, and the start point in Auto-compaction settings is the line. The same check runs on a timer while the agent is idle, which covers a model switch: a bigger window moves the line at once.",
+					"The plugin measures the context before every request to the model - including the requests inside a long tool-calling run - and compacts when the line is passed, so a working session compacts on its own instead of reaching the end of the window. Nothing to switch here: the switch above starts and stops it, and the trigger point is the row below. The same check runs on a timer while the agent is idle, which covers a model switch: a bigger window moves the line at once.",
+			},
+			{
+				id: "triggerTok",
+				label: "Auto-compaction trigger point:",
+				currentValue: (() => {
+					const win = (this.ctx as any)?.model?.contextWindow ?? 0;
+					const fire = triggerPoint(this.ctx);
+					const set = cfg.scaling.triggerTokens;
+					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok` : "the model's own threshold";
+					const capped = set > 0 && fire < set;
+					return `${fmt(fire)} tok` + (capped ? ` (you set ${fmt(set)}, but this ${fmt(win)} tok window must compact here)` : set > 0 ? "" : ` (no target set: the window's own point)`);
+				})(),
+				values: [EDIT_NUMBER],
+				description:
+					"Automatic compaction fires when the context reaches this many tokens - a plain token count, " +
+					"not a percent of the window (it was a percent with min and max limits until 2026-10-21). " +
+					"0 means no target: fire where the active model has to compact anyway. A target LATER than the " +
+					"point the model must compact at is never honoured, because deferring past pi's own threshold " +
+					"means every turn in between re-reads the whole context - the row then shows the earlier number " +
+					"and says so. Enter opens a free numeric entry.",
+			},
+			{
+				id: "preserveTok",
+				label: "Preserve tokens (verbatim tail):",
+				currentValue: `${fmt(extKeepRecent(this.ctx))} tok` + (cfg.scaling.preserveTokens !== extKeepRecent(this.ctx) ? ` (you set ${fmt(cfg.scaling.preserveTokens)}, the window allows less)` : ""),
+				values: [EDIT_NUMBER],
+				description:
+					"How much of the window is kept free for the conversation that stays word for word: the tail " +
+					"compaction keeps, and the recent tool results elision refuses to stub. This is the extension's " +
+					"equivalent of pi's keepRecentTokens. Also a token count now, with the old min and max limit rows " +
+					"gone. Enter opens a free numeric entry.",
 			},
 		// pi's own compaction settings are read for information only. This extension never writes
 		// that file: it compacts on its own trigger with its own models, which works whether pi's
@@ -6321,11 +6250,12 @@ class CompactionMenu implements Component, Focusable {
 				})(),
 				values: [],
 				description:
-					"pi's settings.json, read only - this extension never writes it. pi asks when the context passes " +
-					"window minus reserveTokens; this extension is ready at the trigger point shown above. While pi asks " +
-					"EARLIER, each ask is held and the session keeps running on the uncompacted context, which means a " +
-					"pass over the whole of it before any summary is written. Set reserveTokens to the number shown above " +
-					"to make the two agree.",
+				"pi's settings.json, read only - this extension never writes it. pi asks when the context " +
+				"passes window minus reserveTokens. Since 2026-10-21 the trigger point above is never LATER " +
+				"than that ask (the earlier of the two wins), so a held ask - and the full context re-read " +
+				"that comes with it - should not happen on any window size. If pi's reserveTokens change while " +
+				"pi is running, this row is where the mismatch shows up, and /reload is what makes pi read the " +
+				"file again.",
 			},
 			numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."),
 		];
@@ -6353,7 +6283,7 @@ class CompactionMenu implements Component, Focusable {
 					this.onAction(
 						"__exit:notice:" +
 							(on
-								? `COMPACTION IS ON. WHO TIMERS DEPENDS ON PI'S OWN SWITCH: with pi's compaction enabled, pi's threshold fires first and this extension HOLDS the compaction until its own start point is reached; with pi's switched off, this extension's own check is the trigger. Either way THIS EXTENSION WRITES EVERY SUMMARY. Your start point is on the settings board. pi's settings are read, never written.`
+								? `COMPACTION IS ON. WHO TIMERS DEPENDS ON PI'S OWN SWITCH: with pi's compaction enabled, pi's threshold is the doorbell and this extension's trigger point is the gate - the two are computed from the same window so they agree, and a hold only happens if pi's reserveTokens drift out of step; with pi's switched off, this extension's own check is the trigger. Either way THIS EXTENSION WRITES EVERY SUMMARY. Your start point is on the settings board. pi's settings are read, never written.`
 								: "THIS EXTENSION'S COMPACTION IS OFF, and nothing of it touches pi's settings. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS UNTIL ONE OF THE TWO IS ON."),
 					);
 					return;
@@ -6454,8 +6384,6 @@ interface BoardRestore {
 	orderRef?: string;
 	optionKey?: string;
 	catDesc?: { kind: string; level?: string };
-	autoMenu?: boolean;
-	preserveMenu?: boolean;
 	compactionMenu?: boolean;
 	elisionMenu?: boolean;
 	/** Re-open the Summary template submenu (the previews and the template actions live in it, so the
@@ -6534,14 +6462,6 @@ export class CompactionBoard implements Component, Focusable {
 			return;
 		}
 		if (r.catDesc && select("catDesc")) {
-			(this.list as unknown as { activateItem?: () => void }).activateItem?.();
-			return;
-		}
-		if (r.autoMenu && select("autoMenu")) {
-			(this.list as unknown as { activateItem?: () => void }).activateItem?.();
-			return;
-		}
-		if (r.preserveMenu && select("preserveMenu")) {
 			(this.list as unknown as { activateItem?: () => void }).activateItem?.();
 			return;
 		}
@@ -6657,34 +6577,6 @@ export class CompactionBoard implements Component, Focusable {
 				) as unknown as Component,
 			description:
 				"The models that write the summary, first one first. In the list: type to filter, digits 1-9 move a model to that place (0 = the end), Space removes it from the order, Enter opens the options of a model that is IN the order. Unselected models show the default options and cannot be opened.",
-		});
-
-
-		rows.push({
-			id: "autoMenu",
-			label: "Auto-compaction settings",
-			currentValue: "",
-			values: [],
-			submenu: (_current: string, done: (selectedValue?: string) => void) =>
-				new AutoCompactionMenu(this.tui, this.ctx, (action: string) => {
-					if (action === "__close") done();
-					else done(action);
-				}) as unknown as Component,
-			description:
-				"WHEN COMPACTION STARTS BY ITSELF: the trigger point (read-only, computed live from the settings below and the current model's window), the start percent, and the min/max reserve limits. Enter opens the submenu; Enter on a setting opens its editor (over the plain chat, with the position restored afterwards).",
-		});
-		rows.push({
-			id: "preserveMenu",
-			label: "Preserve recent tokens",
-			currentValue: "",
-			values: [],
-			submenu: (_current: string, done: (selectedValue?: string) => void) =>
-				new PreserveMenu(this.tui, this.ctx, (action: string) => {
-					if (action === "__close") done();
-					else done(action);
-				}) as unknown as Component,
-			description:
-				"WHAT STAYS WORD FOR WORD: the newest tail of the conversation kept outside every summary (and protected from elision), so resuming feels continuous. The submenu shows the live preserved window (read-only) and its three settings. Enter opens it; Enter on a setting opens its editor.",
 		});
 		rows.push({
 			id: "elisionMenu",
@@ -7417,8 +7309,7 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			const id = result.action.slice("edit-number:".length);
 			await editNumber(ctx, id);
 			// Return to the submenu the row lives in (the scaling/elision rows moved into submenus).
-			if (id === "startPct" || id === "resMin" || id === "resMax") restore = { autoMenu: true };
-			else if (id === "keepPct" || id === "keepMin" || id === "keepMax") restore = { preserveMenu: true };
+			if (id === "triggerTok" || id === "preserveTok") restore = { compactionMenu: true };
 			else if (id.startsWith("elision")) restore = { elisionMenu: true };
 			else if (id === "retries" || id === "retryWait") restore = { compactionMenu: true };
 			else restore = { rowId: id };
@@ -7656,12 +7547,8 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
  */
 const NUMBER_EDITORS: Record<string, { title: string; lo: number; hi: number; unit: string; def: number; apply: (v: number) => string | undefined }> = {
 	retryWait: { title: "Wait between retries", lo: 0, hi: 300, unit: "seconds", def: 5, apply: (v) => { update((c) => void (c.retryDelaySeconds = v)); return undefined; } },
-	startPct: { title: "Start auto-compaction at % of context window (1-99)", lo: 1, hi: 99, unit: "percent", def: 82, apply: (v) => { update((c) => void (c.scaling.startPercent = v)); return undefined; } },
-	resMin: { title: "Reserve min tokens", lo: 0, hi: 10_000_000, unit: "tokens", def: 12_288, apply: (v) => { update((c) => void (c.scaling.reserveMin = v)); return undefined; } },
-	resMax: { title: "Reserve max tokens", lo: 0, hi: 10_000_000, unit: "tokens", def: 80_000, apply: (v) => { update((c) => void (c.scaling.reserveMax = v)); return undefined; } },
-	keepPct: { title: "Keep recent % of window (1-99)", lo: 1, hi: 99, unit: "percent", def: 20, apply: (v) => { update((c) => void (c.scaling.keepRecentPercent = v)); return undefined; } },
-	keepMin: { title: "Keep recent min tokens", lo: 0, hi: 10_000_000, unit: "tokens", def: 16_384, apply: (v) => { update((c) => void (c.scaling.keepRecentMin = v)); return undefined; } },
-	keepMax: { title: "Keep recent max tokens", lo: 0, hi: 10_000_000, unit: "tokens", def: 100_000, apply: (v) => { update((c) => void (c.scaling.keepRecentMax = v)); return undefined; } },
+	triggerTok: { title: 'Auto-compaction trigger point', lo: 0, hi: 10_000_000, unit: 'tokens (0 = where this model has to compact anyway)', def: 0, apply: (v) => { update((c) => void (c.scaling.triggerTokens = v)); return undefined; } },
+	preserveTok: { title: 'Preserve tokens (the verbatim tail)', lo: 1024, hi: 10_000_000, unit: 'tokens', def: 20_000, apply: (v) => { update((c) => void (c.scaling.preserveTokens = v)); return undefined; } },
 	elisionStart: { title: "Elision start", lo: 1, hi: 99, unit: "percent of window", def: 70, apply: (v) => { update((c) => void (c.elision = { ...c.elision, softPercent: v })); return undefined; } },
 	elisionProtect: { title: "Elision protect (tool results)", lo: 0, hi: 1_000_000, unit: "tokens", def: 20_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, protectRecentTokens: v })); return undefined; } },
 	elisionTail: { title: "Stub tail", lo: 0, hi: 100_000, unit: "chars (0 = none; 'full' is a separate row value)", def: 200, apply: (v) => { update((c) => void (c.elision = { ...c.elision, stubTailChars: v })); return undefined; } },
@@ -7680,12 +7567,8 @@ async function editNumber(ctx: Ctx, id: string): Promise<void> {
 	const cfg = loadConfig();
 	const current =
 		id === "retryWait" ? cfg.retryDelaySeconds
-		: id === "startPct" ? cfg.scaling.startPercent
-		: id === "resMin" ? cfg.scaling.reserveMin
-		: id === "resMax" ? cfg.scaling.reserveMax
-		: id === "keepPct" ? cfg.scaling.keepRecentPercent
-		: id === "keepMin" ? cfg.scaling.keepRecentMin
-		: id === "keepMax" ? cfg.scaling.keepRecentMax
+		: id === 'triggerTok' ? cfg.scaling.triggerTokens
+		: id === 'preserveTok' ? cfg.scaling.preserveTokens
 		: id === "piReserve" ? readPiReserveTokens()
 		: id === "elisionStart" ? cfg.elision.softPercent
 		: id === "elisionProtect" ? cfg.elision.protectRecentTokens
@@ -9087,7 +8970,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			// actually kept by this extension was 9% of a 260,000-token window = 23,400).
 			reserveTokens: extReserve(ctx),
 			keepRecentTokens: extKeepRecent(ctx),
-			keepRecentPercent: cfg.scaling.keepRecentPercent,
+			triggerTokens: cfg.scaling.triggerTokens,
 			models: refs,
 			sessionModel: ctx.model ? refOf(ctx.model) : "?",
 		});
