@@ -1052,6 +1052,16 @@ export function loadConfig(): Config {
 		categorySentences: sanitizeCategorySentences(raw?.categorySentences),
 		categoryUserDefaults: sanitizeCategorySentences(raw?.categoryUserDefaults),
 		templateUserDefaults: typeof raw?.templateUserDefaults === "string" && raw.templateUserDefaults.trim() ? raw.templateUserDefaults : null,
+		// Two settings the loader used to forget (2026-10-21, defect #41). A field that is not copied
+		// here is undefined at runtime AND vanishes from the file on the next write, so the setting
+		// reads as 'I changed it and it would not stick'. activeTemplateName is which library row shows
+		// ACTIVE and what Ctrl+P re-selects after a restart; summaryReceipt is the receipt block that
+		// closes a summary. Both are checked for shape like everything else above.
+		activeTemplateName:
+			typeof raw.activeTemplateName === "string" && raw.activeTemplateName.trim()
+				? raw.activeTemplateName
+				: base.activeTemplateName,
+		summaryReceipt: typeof raw.summaryReceipt === "boolean" ? raw.summaryReceipt : base.summaryReceipt,
 		userTemplates: Array.isArray(raw?.userTemplates)
 			? (raw.userTemplates as any[])
 					.filter((t) => t && typeof t.name === "string" && typeof t.text === "string")
@@ -1092,10 +1102,90 @@ function saveConfig(cfg: Config): void {
 	writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
+/** Which settings in DEFAULT_CONFIG a loaded config does not carry. A field the loader forgets is
+ *  undefined at runtime and disappears from the file on the next write; on 2026-10-21 that was how
+ *  two settings managed to look like they would not persist. Reported once at start-up and repaired. */
+export function missingConfigKeys(cfg: Config): string[] {
+	return Object.keys(DEFAULT_CONFIG).filter((k) => (cfg as Record<string, unknown>)[k] === undefined);
+}
+
+/** Which top-level settings differ between two configs, for the write record. Model options are
+* named per field, because 'models changed' tells a later reader nothing. */
+export function changedSettings(before: Config, after: Config): string[] {
+	const out: string[] = [];
+	for (const key of Object.keys(after) as (keyof Config)[]) {
+		if (JSON.stringify((before as Record<string, unknown>)[key] ?? null) === JSON.stringify((after as Record<string, unknown>)[key] ?? null)) continue;
+		if (key !== "models") {
+			out.push(String(key));
+			continue;
+		}
+		const b = (before.models ?? {}) as Record<string, Record<string, unknown>>;
+		const a = after.models ?? {};
+		for (const ref of new Set([...Object.keys(b), ...Object.keys(a)])) {
+			const x = b[ref] ?? {};
+			const y = a[ref] ?? {};
+			for (const field of new Set([...Object.keys(x), ...Object.keys(y)])) {
+				if (JSON.stringify(x[field] ?? null) !== JSON.stringify(y[field] ?? null)) {
+					out.push(`models.${ref.split("=").pop()}.${field}`);
+				}
+			}
+		}
+	}
+	return out;
+}
+
+/**
+ * One setting change, written and then checked. Added 2026-10-21 after the report that settings
+ * reverted over a restart: a write that fails, or that writes a stale copy of the config, looks
+ * exactly like a setting that was never changed. So every change says what it changed, and the file
+ * is read back to prove the bytes on disk are the bytes that were meant to be there.
+ */
 function update(fn: (cfg: Config) => void): void {
-	const cfg = loadConfig();
+	const before = loadConfig();
+	const cfg = loadConfig(); // re-read, never a copy somebody held on to across a dialog
 	fn(cfg);
-	saveConfig(cfg);
+	const changed = changedSettings(before, cfg);
+	if (!changed.length) return;
+	let error = "";
+	try {
+		saveConfig(cfg);
+	} catch (e: any) {
+		error = String(e?.message ?? e);
+	}
+	// Read it back. The file is small and this happens once per settings change, so the cost is
+	// nothing next to a change the operator believes they made and did not.
+	let verified = writesBlocked(); // a harness may not write, so there is nothing to confirm
+	let reason = "";
+	if (!error && !verified) {
+		const wanted = JSON.stringify(cfg, null, 2) + "\n";
+		let back = "";
+		try {
+			back = readFileSync(CONFIG_PATH, "utf8");
+		} catch (e: any) {
+			reason = String(e?.message ?? e);
+		}
+		if (back === wanted) verified = true;
+		else if (!reason) reason = back ? "the file holds something else" : "the file came back empty";
+	}
+	logLine(cfg, {
+		event: verified ? "config_written" : "config_write_failed",
+		changed: changed.slice(0, 12).join(","),
+		count: changed.length,
+		...(error ? { error } : {}),
+		...(reason ? { reason } : {}),
+	});
+	if (!verified && !writesBlocked()) {
+		// Screen silence is the rule, but a setting that did not persist is the one thing the operator
+		// must not discover a restart later.
+		try {
+			watcherCtx?.ui?.notify?.(
+				`A settings change did not stick (${changed.slice(0, 3).join(", ")}${error ? ": " + error : reason ? ": " + reason : ""}).`,
+				"warning",
+			);
+		} catch {
+			/* no screen to tell - the log line above is the record */
+		}
+	}
 }
 
 
@@ -4923,8 +5013,12 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 	if (kind === "tpl-new") {
 		const n = nextUserTemplateName(cfg.userTemplates);
 		const text = await editText(ctx, header(n), "");
-		cfg.userTemplates = [...cfg.userTemplates, { name: n, text: text ?? "" }];
-		saveConfig(cfg);
+		const stored = text ?? "";
+		// Written onto a FRESH read (defect #41): the editor above can be open for minutes, and an
+		// object loaded before it carries the whole settings screen as it looked then.
+		update((c) => {
+			c.userTemplates = [...c.userTemplates, { name: n, text: stored }];
+		});
 		ctx.ui.notify(text === undefined ? `${n} added to the library EMPTY (Esc in the editor does not delete it).` : `${n} saved to the library. Ctrl+A on its row makes it the active template.`, "info");
 		return back;
 	}
@@ -4945,8 +5039,9 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 			ctx.ui.notify("Cancelled - no copy was made.", "info");
 			return back;
 		}
-		cfg.userTemplates = [...cfg.userTemplates, { name: n, text }];
-		saveConfig(cfg);
+		update((c) => {
+			c.userTemplates = [...c.userTemplates, { name: n, text }];
+		});
 		ctx.ui.notify(`${n} saved as a copy of ${name || "the extension default"}.`, "info");
 		return back;
 	}
@@ -4964,14 +5059,15 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 			ctx.ui.notify(`${name} kept.`, "info");
 			return back;
 		}
-		cfg.userTemplates = cfg.userTemplates.filter((t) => t.name !== name);
 		// 2026-10-20: if the deleted entry was the active one, the choice goes back to the extension default
 		// openly, rather than leaving a name that resolves to nothing and a list that shows no active row.
-		if (cfg.activeTemplateName === name) {
-			cfg.activeTemplateName = null;
-			cfg.templateUserDefaults = null;
-		}
-		saveConfig(cfg);
+		update((c) => {
+			c.userTemplates = c.userTemplates.filter((t) => t.name !== name);
+			if (c.activeTemplateName === name) {
+				c.activeTemplateName = null;
+				c.templateUserDefaults = null;
+			}
+		});
 		ctx.ui.notify(`${name} deleted.`, "info");
 		return back;
 	}
@@ -4994,14 +5090,18 @@ async function templateLibraryAction(ctx: Ctx, action: string): Promise<{ templa
 	}
 	// Was this the active template before this edit - by name, or by the text it still matched (entries
 	// activated before names existed)? Same rule as the library's own editor, 2026-10-20.
-	const wasActive = cfg.activeTemplateName === name || (!!cfg.templateUserDefaults?.trim() && found.text.trim() === cfg.templateUserDefaults.trim());
-	cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { ...t, text } : t));
-	if (wasActive) {
-		cfg.activeTemplateName = name;
-		cfg.templateUserDefaults = text;
-	}
-	if (cfg.activeTemplateName === name) cfg.templateUserDefaults = text;
-	saveConfig(cfg);
+	let wasActive = false;
+	update((c) => {
+		// Asked of the config as it is NOW, not of the copy loaded before the editor opened: the answer
+		// decides whether the row keeps its ACTIVE marker (2026-10-20 report, defect #41 for the stale write).
+		wasActive = c.activeTemplateName === name || (!!c.templateUserDefaults?.trim() && found.text.trim() === c.templateUserDefaults.trim());
+		c.userTemplates = c.userTemplates.map((t) => (t.name === name ? { ...t, text } : t));
+		if (wasActive) {
+			c.activeTemplateName = name;
+			c.templateUserDefaults = text;
+		}
+		if (c.activeTemplateName === name) c.templateUserDefaults = text;
+	});
 	ctx.ui.notify(`${name} saved${wasActive ? " - still the active template" : ""}.`, "info");
 	return back;
 }
@@ -5123,13 +5223,15 @@ class UserTemplateMenu implements Component, Focusable {
 		// name, or - for any library entry activated before names existed - the text it still matches.
 		// Fixing the 2026-10-20 report: editing the active template used to leave the list with nothing
 		// active, because the identity was the text and the edit had just changed it.
-		const wasActive = cfg.activeTemplateName === name || (!!cfg.templateUserDefaults?.trim() && found.text.trim() === cfg.templateUserDefaults.trim());
-		cfg.userTemplates = cfg.userTemplates.map((t) => (t.name === name ? { name, text: saved } : t));
-		if (wasActive) {
-			cfg.activeTemplateName = name;
-			cfg.templateUserDefaults = saved;
-		}
-		saveConfig(cfg);
+		let wasActive = false;
+		update((c) => {
+			wasActive = c.activeTemplateName === name || (!!c.templateUserDefaults?.trim() && found.text.trim() === c.templateUserDefaults.trim());
+			c.userTemplates = c.userTemplates.map((t) => (t.name === name ? { name, text: saved } : t));
+			if (wasActive) {
+				c.activeTemplateName = name;
+				c.templateUserDefaults = saved;
+			}
+		});
 		this.ctx.ui.notify(`${name} saved (${saved.split("\n").length} lines)${wasActive ? " - still the active template" : ". Ctrl+P makes it the active template."}.`, "info");
 		this.rebuild();
 	}
@@ -5145,19 +5247,22 @@ class UserTemplateMenu implements Component, Focusable {
 		// template therefore pins the built-in text - say so, it must not look like nothing happened.
 		const text = name === null ? "" : cfg.userTemplates.find((t) => t.name === name)!.text;
 		if (!text.trim() && name !== null) {
-			cfg.templateUserDefaults = "";
-			cfg.activeTemplateName = name;
-			saveConfig(cfg);
+			update((c) => {
+				c.templateUserDefaults = "";
+				c.activeTemplateName = name;
+			});
 			this.ctx.ui.notify(`${name} is empty, so making it active pins the EXTENSION default (that is what an empty template means). Put text in it, then Ctrl+A again.`, "warning");
 			this.rebuild();
 			return;
 		}
-		cfg.templateUserDefaults = text;
 		// The name is what the list marks ACTIVE and what keeps the choice attached through an edit
 		// (2026-10-20, the operator's design). null means the extension default, which the list shows on its
-		// own row.
-		cfg.activeTemplateName = name;
-		saveConfig(cfg);
+		// own row. Before 2026-10-21 this choice was also silently lost at the next restart, because the
+		// loader did not copy the key back out of the file - see loadConfig.
+		update((c) => {
+			c.templateUserDefaults = text;
+			c.activeTemplateName = name;
+		});
 		this.ctx.ui.notify(name === null ? "The active template is the extension default again." : `${name} is now the ACTIVE template - this is the text the summarizer gets.`, "info");
 		this.rebuild();
 	}
@@ -5169,8 +5274,9 @@ class UserTemplateMenu implements Component, Focusable {
 		const text = name === null ? DEFAULT_TEMPLATE_TEXT : cfg.userTemplates.find((t) => t.name === name)?.text;
 		if (text === undefined) return;
 		const newName = nextUserTemplateName(cfg.userTemplates);
-		cfg.userTemplates = [...cfg.userTemplates, { name: newName, text }];
-		saveConfig(cfg);
+		update((c) => {
+			c.userTemplates = [...c.userTemplates, { name: newName, text }];
+		});
 		this.ctx.ui.notify(`Saved as ${newName}. Enter opens it for editing.`, "info");
 		this.rebuild();
 	}
@@ -5950,6 +6056,18 @@ class CompactionMenu implements Component, Focusable {
 				description:
 					"What the previous compaction summary becomes in the new one: folded into its own turn, attached whole, or dropped.",
 			},
+			{
+				id: "receipt",
+				label: "Receipt line at the end of a summary:",
+				currentValue: cfg.summaryReceipt ? "on" : "off",
+				values: ["on", "off"],
+				description:
+					"One short line closing every summary this extension writes: when the compaction ran, which model " +
+					"wrote it, how big the context was and how much material the summariser was really handed. It rides " +
+					"inside the summary, so a few tokens of context are spent on it, and the next model can read it. " +
+					"Added to the board 2026-10-21: the setting existed all along but had no row, and the loader did not " +
+					"read it back from the file either, so it silently did nothing either way.",
+			},
 			// 2026-10-07: moved here from the main board on request - both are compaction sizing, they
 			// belong next to the compaction switches, not on the top level.
 			{
@@ -6006,6 +6124,20 @@ class CompactionMenu implements Component, Focusable {
 								? `COMPACTION IS ON. WHO TIMERS DEPENDS ON PI'S OWN SWITCH: with pi's compaction enabled, pi's threshold fires first and this extension HOLDS the compaction until its own start point is reached; with pi's switched off, this extension's own check is the trigger. Either way THIS EXTENSION WRITES EVERY SUMMARY. Your start point is on the settings board. pi's settings are read, never written.`
 								: "THIS EXTENSION'S COMPACTION IS OFF, and nothing of it touches pi's settings. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS UNTIL ONE OF THE TWO IS ON."),
 					);
+					return;
+				}
+				// A top-level switch, not a per-model one: the receipt is appended after the summariser has
+				// finished, whatever model did the writing.
+				if (id === "receipt") {
+					const on = value === "on";
+					update((c) => void (c.summaryReceipt = on));
+					this.ctx.ui?.notify?.(
+						on
+							? "Summaries will end with the receipt line: when it ran, which model wrote it, what it was handed."
+							: "Receipt line off. Summaries end with the summary itself, as they have been doing.",
+							"info",
+					);
+					(this as unknown as { rebuild?: () => void }).rebuild?.();
 					return;
 				}
 				// The settings that are one setting for every model: the first model in the try order stands
@@ -8325,6 +8457,17 @@ function ensureWatcherTimer(): void {
 }
 
 export default function piCompactPlusExtension(pi: ExtensionAPI): void {
+	// A setting the loader does not copy is worth saying something about: the operator sees a switch
+	// that appears to work and reverts over a restart. Say it once, in the log, and write the missing
+	// keys back so the file is complete from now on (2026-10-21, defect #41).
+	{
+		const cfg = loadConfig();
+		const missing = missingConfigKeys(cfg);
+		if (missing.length) {
+			logLine(cfg, { event: "config_repaired", missing: missing.join(",") });
+			if (!writesBlocked()) saveConfig(cfg);
+		}
+	}
 	// WHAT PI DID WITH A COMPACTION AFTER THIS EXTENSION'S OWN HOOK WAS DONE (2026-10-14). The hook sees a
 	// compaction it takes part in; these two see every one, including the ones pi raises on its own side -
 	// and until now those were invisible: a refusal for want of anything to summarise appeared on screen as an
