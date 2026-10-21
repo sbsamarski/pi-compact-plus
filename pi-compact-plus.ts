@@ -209,7 +209,7 @@ type Config = {
 	/** Append a "full raw transcript" line (the session file path) to extension-written summaries,
 	 *  so the next model can recover anything the summary dropped by reading the file. */
 	transcriptPointer: boolean;
-	/** Append one receipt line to extension-written summaries saying when the compaction ran, what the
+	/** Put one receipt line at the top of extension-written summaries saying when the compaction ran, what the
 	 *  context held, how much material the summariser actually read (and how much of it was elided
 	 *  first), and how big the summary came out. pi's own on-screen line can only ever show the whole
 	 *  pre-compaction context, which is why "compacted from 163,000 tokens" looks nothing like the
@@ -1914,12 +1914,18 @@ export function appendTranscriptPointer(cfg: Config, ctx: Ctx, summary: string):
 	return summary;
 }
 
-/** One honest line at the end of every extension-written summary, readable by the next model and by a
+/** One honest line at the TOP of every extension-written summary, readable by the next model and by a
  *  person expanding the compaction block (2026-10-18, because the figure pi can show there is only ever
  *  the size of the whole conversation before it was compacted - which looks nothing like the amount the
  *  summariser was really handed once elision and the kept tail are taken out). Deliberately short: it
- *  rides inside the summary, so every token of it is a token of context that stays. */
-export function appendCompactionReceipt(cfg: Config, ctx: Ctx, r: any, summary: string): string {
+ *  rides inside the summary, so every token of it is a token of context that stays.
+ *
+ *  It goes FIRST rather than last (2026-10-19 request, item (c) of the 19:15 report): a summary is the head
+ *  of the next context, a folded chain carries the head forward, and pi shows the first lines when the
+ *  block is collapsed - a receipt at the bottom is the one place it can be cut off or skimmed past.
+ *  The name says 'with', not 'append', for that reason.
+ */
+export function withCompactionReceipt(cfg: Config, ctx: Ctx, r: any, summary: string): string {
 	if (!cfg.summaryReceipt) return summary;
 	try {
 		const d = new Date();
@@ -1938,7 +1944,7 @@ export function appendCompactionReceipt(cfg: Config, ctx: Ctx, r: any, summary: 
 		if (Number.isFinite(wrote) && wrote > 0) bits.push(`wrote ${fmt(wrote)} tok`);
 		if (!bits.length) return summary;
 		const secs = Number(r?.seconds);
-		return `${summary}\n\nCompacted ${when} by ${who}${Number.isFinite(secs) && secs > 0 ? ` in ${fmt(secs)} s` : ""}: ${bits.join(", ")}.`;
+		return `Compacted ${when} by ${who}${Number.isFinite(secs) && secs > 0 ? ` in ${fmt(secs)} s` : ""}: ${bits.join(", ")}.\n\n${summary}`;
 	} catch {
 		/* best effort */
 	}
@@ -3227,6 +3233,55 @@ function effectiveThinking(wanted: Level, model: any): { level: Level; note: str
 type Candidate = { ref: string; model: any; profile: ModelOptions; kind: Kind };
 
 /** The configured references turned into real models, in order; anything unknown is reported back. */
+/** Why a configured summariser is not available right now, in words a person can act on. The whole
+ *  story used to be "not in the model list", which names the place the model was missing from and never
+ *  says what was there instead (2026-10-19: the local entry was correct, pi simply had the other GGUF
+ *  loaded, and the rotation walked on to an online endpoint that then timed out). A local provider is a
+ *  server that answers with the one model it has loaded, so saying which one is the whole answer. */
+export function missingWhy(ref: string, ctx: { modelRegistry: any; model?: any }): string {
+	const pool: any[] = [...(ctx?.modelRegistry?.getAvailable?.() ?? []), ...(ctx?.model ? [ctx.model] : [])].filter(Boolean);
+	const refs = pool.map((m: any) => refOf(m)).filter(Boolean) as string[];
+	// Where a ref stops naming the provider. pi writes "provider/id" and the id itself can hold slashes
+	// (openrouter/deepseek/v4), while a local provider is "llama-server=http://host:port" and holds them
+	// too - so neither "the last slash" (blamed a provider called "openrouter/deepseek") nor "the first
+	// slash" (blamed "llama-server=http:") is right. A URL keeps its scheme and host; anything else cuts
+	// at the first slash.
+	const providerOf = (r: string): string => {
+		const scheme = r.indexOf("://");
+		if (scheme > 0) {
+			const after = r.indexOf("/", scheme + 3);
+			if (after > 0) return r.slice(0, after);
+		}
+		const slash = r.indexOf("/");
+		return slash > 0 ? r.slice(0, slash) : r;
+	};
+	// The provider is taken to be the longest prefix that the models pi DOES have also start with; only
+	// when nothing matches is the plain guess used.
+	const prefixes = Array.from(new Set(refs.map(providerOf))).filter(Boolean);
+	const provider =
+		prefixes.filter((p) => ref === p || ref.startsWith(p + "/")).sort((a, b) => b.length - a.length)[0] ?? providerOf(ref);
+	const offered = refs.filter((r) => r === provider || r.startsWith(provider + "/"));
+	const short = (r: string) => (r.startsWith(provider + "/") ? r.slice(provider.length + 1) : r);
+	const wanted = short(ref);
+	// A local provider is "name=http://host:port" and shortName() would cut that to the port, so drop only
+	// the scheme and let the line read the way the row on the settings board reads.
+	const plabel = provider.replace(/^([\w.-]+=)https?:\/\//, "$1").replace(/\/+$/, "");
+	if (!offered.length) {
+		const others = Array.from(new Set(prefixes)).slice(0, 3);
+		return others.length
+			? `pi has nothing loaded from "${plabel}"; it offers ${others.join(", ")}`
+			: "pi has no models loaded at all right now";
+	}
+	// The interesting case is the near miss: the same model under another id, or the same file under
+	// another quant. Naming it says what the entry ought to read, which is what was missing on 2026-10-19.
+	const tail = (r: string) => r.slice(r.lastIndexOf("/") + 1);
+	const near = offered.find(
+		(r) => r !== ref && (tail(r).toLowerCase() === wanted.toLowerCase() || (wanted.length > 12 && tail(r).toLowerCase().startsWith(wanted.toLowerCase().slice(0, 12)))),
+	);
+	if (near) return `${plabel} is loaded, this exact entry is not; pi calls it "${short(near)}"`;
+	return `${plabel} is loaded, not "${wanted}"; it offers ${offered.slice(0, 2).map(short).join(", ")}${offered.length > 2 ? ` and ${offered.length - 2} more` : ""}`;
+}
+
 function buildRotation(cfg: Config, ctx: { modelRegistry: any; model?: any }): { candidates: Candidate[]; missing: string[] } {
 	const candidates: Candidate[] = [];
 	const missing: string[] = [];
@@ -3264,7 +3319,8 @@ export async function summarizeWithRotation(
 	signal: AbortSignal | undefined,
 ): Promise<{ ok: true; result: Extract<AttemptOutcome, { ok: true }> } | { ok: false; error: string }> {
 	const { candidates, missing } = buildRotation(cfg, ctx);
-	for (const ref of missing) logLine(cfg, { event: "skip", ref, reason: "not in the model list" });
+	// Each skip now says what the provider offered instead of only what it lacked (2026-10-19, item (b)).
+	for (const ref of missing) logLine(cfg, { event: "skip", ref, reason: missingWhy(ref, ctx).slice(0, 140) });
 	if (!candidates.length) {
 		return { ok: false, error: missing.length ? `no model found for ${missing.join(", ")}` : "no models configured" };
 	}
@@ -8887,7 +8943,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		} catch {
 			/* counter is best-effort */
 		}
-		r.compaction.summary = appendCompactionReceipt(cfg, ctx, r, r.compaction.summary);
+		r.compaction.summary = withCompactionReceipt(cfg, ctx, r, r.compaction.summary);
 		r.compaction.summary = appendTranscriptPointer(cfg, ctx, r.compaction.summary);
 		logLine(cfg, {
 				event: "done",
