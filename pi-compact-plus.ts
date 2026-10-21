@@ -104,8 +104,8 @@ type CharCap = number | "full";
  */
 type ScalingConfig = {
 	/** How much of the window stays free above the compaction line: automatic compaction fires once
-	 *  the context passes `window - reserveTokens`. 0 = no number chosen by the operator: fire
-	 *  where this model has to compact anyway (see triggerPointFor). */
+		*  the context passes `window - reserveTokens`. 0 = no number chosen by the operator: keep
+		*  a tenth of the window free, never less than 16,384 tokens (see autoReserveFor). */
 	reserveTokens: number;
 	/** How much of the window stays free for the verbatim tail: what compaction keeps word for word
 	 *  and what elision refuses to stub. pi's keepRecentTokens is the same idea. */
@@ -4275,35 +4275,52 @@ function cycleNoThinkMarker(): void {
  * simply never fire. So the point is the EARLIER of two numbers - the target, and the point this
  * model has to compact at anyway.
  *
- * The second number matters for a second reason, and it is the reason for the extra context re-read
- * the operator reported on 2026-10-21. While pi's own compaction is enabled, pi asks for a summary
- * once the context passes window minus its reserveTokens, and this extension holds that ask until its
- * own point. Every turn spent between the two numbers re-uploads the whole uncompacted context. So
- * this extension never sets its point LATER than pi's ask: min() means the two can only ever agree or
- * the extension fires first, and a hold needs a genuine drift (pi' reserveTokens changed while pi
- * was running) rather than being the normal course of every compaction.
+ *
+	* pi's ask point is NOT part of this arithmetic any more (2026-10-22, the operator's decision). It
+	* used to cap the line, because a pi ask held below this extension's point costs a full pass over
+	* the context on every turn in between. The timer is the trigger now, so there is no ask to hold;
+	* the alarm is set to ring above this line, and the gate in the hook is left for the drift case
+	* (pi's reserveTokens edited while pi runs, a different model loaded), where it says so.
  */
-export function triggerPointFor(o: { window: number; reserveTokens: number; piEnabled: boolean; piReserve: number }): number {
+/** The reserve used when the operator set no number: a tenth of the window, never less than a
+	 * normal summary plus a tail. Derived on every call, so it follows the model in use.
+ */
+export function autoReserveFor(window: number): number {
+	const win = Math.floor(window || 0);
+	if (!(win > 0)) return DEFAULT_RESERVE_TOKENS;
+	return Math.max(16_384, Math.round(win * 0.1));
+}
+
+/**
+	* WHERE automatic compaction fires, for any window: the window minus the reserve the operator set.
+	*
+	* This is the extension's own decision, and since 2026-10-22 the operator's own timer is what acts
+	* on it (option A, their choice): the timer measures the context from the usage figures the server
+	* already reported - which costs nothing to look at - and starts a compaction at this line, at a
+	* safe point, while the session is running. pi's threshold is the ALARM: it lives above this line,
+	* rings only if the timer failed, and this extension still answers it with its own summary.
+	*
+	* pi's own reserveTokens therefore no longer moves this line. It used to: the point was capped at
+	* pi's ask point so that an ask could never be held. The cap was honest arithmetic - a held ask costs
+	* one full pass over the context per turn - but it meant a smaller-context model compacted at pi's
+	* number instead of the one on the board, and the operator rejected that trade (2026-10-22). With
+	* the timer as the trigger there is nothing to hold: the line is the number on the board.
+ */
+export function triggerPointFor(o: { window: number; reserveTokens: number }): number {
 	const win = Math.floor(o.window || 0);
 	if (!(win > 0)) return 0;
-	// The most free room this window may leave at the top: pi's own reserve while pi is the one that
-	// would otherwise compact, otherwise a small internal headroom so a huge reserve cannot push the
-	// line below the floor.
-	const headroom = o.piEnabled && o.piReserve > 0 ? Math.floor(o.piReserve) : Math.max(4096, Math.round(win * 0.05));
-	const mustFireAt = Math.max(1024, win - headroom);
-	// The line the reserve describes, never LATER than the point this model has to compact at: while
-	// pi is the one that would compact, a line behind pi's ask means held asks and a full pass over
-	// the context every turn in between, which is exactly what the operator asked to get rid of.
-	const wanted = o.reserveTokens > 0 ? win - Math.floor(o.reserveTokens) : mustFireAt;
-	return Math.max(1024, Math.min(wanted, mustFireAt));
+	const reserve = o.reserveTokens > 0 ? Math.floor(o.reserveTokens) : autoReserveFor(win);
+	// The only cap is arithmetic: a line with no room above it would fire on every request, so a
+	// reserve smaller than 2% of the window is widened to 2%. Nothing to do with pi's settings.
+	const minReserve = Math.max(2_048, Math.round(win * 0.02));
+	return Math.max(1024, win - Math.max(reserve, minReserve));
 }
 
 /** The same for the model this session is using right now. */
 export function triggerPoint(ctx: Ctx): number {
 	const window = (ctx as any)?.model?.contextWindow ?? 0;
 	if (!(window > 0)) return 0;
-	const s = loadConfig().scaling;
-	return triggerPointFor({ window, reserveTokens: s.reserveTokens, piEnabled: readPiCompactionEnabled(), piReserve: readPiReserveTokens() });
+	return triggerPointFor({ window, reserveTokens: loadConfig().scaling.reserveTokens });
 }
 
 /**
@@ -6096,17 +6113,16 @@ class CompactionMenu implements Component, Focusable {
 				currentValue: (() => {
 					const win = (this.ctx as any)?.model?.contextWindow ?? 0;
 					const set = cfg.scaling.reserveTokens;
-					const free = extReserve(this.ctx);
-					const fire = triggerPoint(this.ctx);
-					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok free` : "the model's own reserve";
-					return (
-						`${fmt(free)} tok free - fires at ${fmt(fire)} of ${fmt(win)} tok` +
-						(set > 0 && free > set
-						? ` (you left ${fmt(set)} free, but pi's own reserveTokens of ${fmt(free)} is larger, so its line is the one in force)`
-						: set > 0
-						? ""
-						: " (no number set: the line is wherever this model has to compact anyway)")
-					);
+					const eff = extReserve(this.ctx);
+					// The number that was typed is the number that is shown. It used to show the reserve IN FORCE
+					// only, which was honest but unreadable as an editor: setting 30,000 while pi's own reserve was
+					// 30,600 printed 30,600 back, and the operator reasonably read that as the edit not taking
+					// (2026-10-22). The line is the setting now, so the two can only differ when no number is set.
+					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok free` : `automatic: ${fmt(eff)} tok free`;
+					const head = `${fmt(eff)} tok free - fires at ${fmt(triggerPoint(this.ctx))} of ${fmt(win)} tok`;
+					return set > 0
+						? head + (eff !== set ? ` (your ${fmt(set)} cannot fit this window; ${fmt(eff)} is used)` : "")
+						: head + ` (no number set: a tenth of the window, floor 16,384)`;
 				})(),
 				values: [EDIT_NUMBER],
 				description:
@@ -6253,19 +6269,21 @@ class CompactionMenu implements Component, Focusable {
 					if (!(win > 0)) return `${fmt(piReserve)} tok reserve`;
 					const ours = win - extReserve(this.ctx);
 					const theirs = Math.max(0, win - piReserve);
-					const agree = Math.abs(theirs - ours) <= Math.max(1_000, Math.round(win * 0.01));
-					return agree
-						? `pi asks at ${fmt(theirs)} = our point ${fmt(ours)} tok (agreed)`
-						: `pi asks at ${fmt(theirs)} tok, we wait for ${fmt(ours)} - set reserveTokens to ${fmt(win - ours)}`;
+					// What is wanted from pi is now the opposite of what it used to be: its alarm should ring
+					// ABOVE our line, that is, with a SMALLER reserve than ours. Equal is fine, earlier is not.
+					const alarmOk = theirs >= ours - Math.max(1_000, Math.round(win * 0.01));
+					return alarmOk
+						? `alarm at ${fmt(theirs)} tok, above our line ${fmt(ours)} - it rings only if our own timer fails`
+						: `alarm at ${fmt(theirs)} tok, BELOW our line ${fmt(ours)} by ${fmt(ours - theirs)} - lower pi's reserveTokens to about ${fmt(Math.max(2_048, Math.round(win * 0.07)))} and /reload, or every held ask re-reads the context`
 				})(),
 				values: [],
 				description:
 				"pi's settings.json, read only - this extension never writes it. pi asks when the context " +
-				"passes window minus reserveTokens. Since 2026-10-21 the trigger point above is never LATER " +
-				"than that ask (the earlier of the two wins), so a held ask - and the full context re-read " +
-				"that comes with it - should not happen on any window size. If pi's reserveTokens change while " +
-				"pi is running, this row is where the mismatch shows up, and /reload is what makes pi read the " +
-				"file again.",
+				"passes window minus reserveTokens, and since 2026-10-22 this extension's own timer is the " +
+				"trigger, so pi is the alarm: its reserveTokens should be SMALLER than the reserve above, " +
+				"which puts the alarm above the line where compaction actually happens. If an alarm still " +
+				"arrives below the line, the gate holds it (the context is not full yet), the hold is logged, " +
+				"and pi reads the file again on /reload.",
 			},
 			numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."),
 		];
@@ -7884,7 +7902,7 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 			`  pi asks at ${fmt(piAsk)} tok; this extension is ready at ${fmt(ours)} tok` +
 			(agree
 				? " - agreed, so no context is re-read waiting for the line."
-				: ` - pi is ${fmt(gap)} tok early; set reserveTokens to ${fmt(win - ours)} to stop the waiting.`),
+				: ` - pi's alarm is ${fmt(gap)} tok BELOW our line, so it would be held and the context re-read; lower pi's reserveTokens (its settings.json) and /reload.`),
 	);
 }
 	const refs = Object.keys(cfg.models);
@@ -7977,9 +7995,6 @@ export function holdUntilOurLine(args: {
 	 *  figures and this extension counts its own way, so the two differ by a little; a hold is not free
 	 *  (see above), so a hair's-breadth miss must not cause one. Callers pass about 1% of the window. */
 	slack?: number;
-	/** The reserveTokens value that would put pi's ask point on this line, so the log and the notice can
-	 *  name the number that ends the waiting instead of leaving the operator to derive it. */
-	matchReserve?: number;
 }): string | null {
 	// Only pi's threshold is a candidate. "manual" is the operator's own /compact, and an overflow is pi
 	// asking because a request was already refused for room - holding either would be a refusal.
@@ -7989,10 +8004,9 @@ export function holdUntilOurLine(args: {
 	if (args.fill >= args.line - (args.slack ?? 0)) return null;
 	// One line of the log view, no more: the view truncates. It must still name both numbers, and it
 	// ends with the setting that stops this happening on the next request.
-	const fix =
-		typeof args.matchReserve === "number" && args.matchReserve > 0
-			? `; reserveTokens ${fmt(args.matchReserve)} would end the wait`
-			: "";
+		// The advice is the same every time now that this extension owns the trigger: an ask arrives
+		// below our line only when pi's alarm is set too low, and pi's settings.json is where that is fixed.
+		const fix = "; lower pi's reserveTokens to end the wait";
 	return `pi asked at ${fmt(args.fill)}/${fmt(args.window)} tok, our point is ${fmt(args.line)} tok - held, nothing written${fix}`;
 }
 
@@ -8394,31 +8408,19 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 		// drops even that is the danger line, MIDRUN_DANGER_TOKENS under the whole window, where a refusal is the
 		// alternative and a refused session cannot be compacted at all.
 		const urgent = wireTokens > 0 && wireTokens >= window - MIDRUN_DANGER_TOKENS;
-		// ONE TRIGGER, NOT TWO (2026-10-21, the operator's design, after pi's compaction.enabled was set to
-		// true). pi's threshold in its settings.json is the trigger now: pi measures the same context, fires
-		// session_before_compact, and this extension answers with its own summary. Starting our own
-		// compaction a moment earlier would only race it - two schedulers, two opinions about the safe point,
-		// and the second compaction of a turn nobody asked for. So the watcher reports and stands back.
-		// The exception is the danger line, kept on purpose: at MIDRUN_DANGER_TOKENS under the window the next
-		// request is refused for room, a refused session cannot be compacted at all, and there is no pi
-		// request left to wait for. Then the watcher still acts.
-		if (!urgent && readPiCompactionEnabled()) {
-			// Once an hour at most. This line exists only to prove, afterwards, that the timer really was
-			// asleep while pi held the trigger. The event worth having is the gate's own hold, which the hook
-			// writes every time pi actually asks.
-			if (Date.now() - lastWatchLogMs > 3_600_000) {
-				lastWatchLogMs = Date.now();
-				logLine(cfg, {
-					event: "auto_trigger",
-					estimate: tokens,
-					wire: wireTokens,
-					line,
-					window,
-					note: "standing back: pi's own threshold (settings.json compaction.enabled) is the trigger; this extension answers it",
-				});
-			}
-			return;
-		}
+	// THE TRIGGER IS OUR OWN TIMER (2026-10-22, option A, the operator's choice: "if you can have your
+	// own trigger and we don't need pi's trigger then great"). Until today this block stood the timer
+	// down whenever pi's compaction.enabled was on, because pi's threshold was made the trigger and a
+	// second scheduler would have raced it. The race was the wrong thing to fear: what the stand-down
+	// bought was a line that belonged to pi's reserveTokens, so a smaller-context model compacted at
+	// pi's number. Now the timer decides WHEN, from a measurement that costs nothing (the usage
+	// figures the server already wrote into the session), and pi's threshold - with its reserveTokens
+	// set far smaller than our reserve - is the alarm that rings only if this timer failed. The hook
+	// still answers pi's ask with our own summary, and pi's own summariser is still the last resort.
+	// What has NOT changed: the safe point below (no compaction in the middle of a write-up or a
+	// pending tool call, exactly like pi waiting for the current step), the once-a-minute floor, the
+	// refusal to fire twice on an unmeasured guess, and `urgent`, which drops the safe point when the
+	// request already in flight is within MIDRUN_DANGER_TOKENS of the whole window.
 		const sp = compactSafePoint(ctx, source === "context", urgent);
 		if (!sp.ok) {
 			const nowMs = Date.now();
@@ -8904,8 +8906,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				// usage figures and this extension measures its own way; refusing a compaction over that
 				// difference would cost a full pass over the context for nothing.
 				slack: Math.max(1_000, Math.round(win * 0.01)),
-				// The reserveTokens that would place pi's ask point exactly on this line, for the message.
-				matchReserve: extReserve(ctx),
 			});
 			if (note !== null) {
 				const nowMs = Date.now();

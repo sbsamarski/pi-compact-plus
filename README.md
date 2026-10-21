@@ -40,9 +40,14 @@ file on first use and reads it live, so every change in its menus applies immedi
 1. **Old tool results collapse (elision).** Before each request, the oldest tool results are
    replaced with short stubs — **only on the wire**; your session file and your screen keep the
    originals. There is a whole section about this below, because it is the workhorse.
-2. **A watcher triggers compaction early.** While pi is idle, the context is checked every few
-   seconds; near the danger line the extension compacts on its own, before providers start
-   rejecting. Plain `/compact` goes through this extension too.
+2. **The extension's own timer fires the compaction.** Every few seconds the context is measured -
+   from the token counts the model server already reported, which costs nothing to look at, never by
+   asking a model - and when it passes *window minus your reserve* the summary is written. Mid-run it
+   waits for a safe point (the pause between a tool call and its next step, the end of a write-up),
+   exactly like pi does, and it will not cut into pending tool calls; if the request already in flight
+   is within 12,000 tokens of the whole window it acts anyway, because the alternative is a refusal.
+   Plain `/compact` goes through this extension too. pi's own threshold stays switched on as an
+   **alarm**: set smaller than your reserve, so it rings only if this timer failed.
 3. **The summarizer gets a prepared region, not a dump.** Every user turn numbered in sequence,
    replies and thinking separated, tool calls written out, old results as stubs, and the previous
    summary included so numbering and history continue.
@@ -221,22 +226,25 @@ so nothing moves on the board by itself.)
 
 | Setting | Default | What it controls |
 |---|---|---|
-| Reserve tokens before compaction | 0 = pi's own reserve | how much of the window is left free above the line: compaction fires at *window minus this number*. |
+| Reserve tokens before compaction | 0 = a tenth of the window, floor 16,384 | how much of the window is left free above the line: compaction fires at *window minus this number*. |
 | Preserve tokens | 20,000 | the newest tail kept word for word outside every summary (and protected from elision). |
 
-Each row shows what is IN FORCE for the active model: the reserve row prints both the free room and
-the resulting line (*"30,600 tok free - fires at 139,400 of 170,000 tok"*), and says so when pi's own
-`reserveTokens` is the larger of the two and therefore the line you actually get. The preserve figure
-is cut down when a small window cannot carry that much verbatim tail. Switch models mid-session and both
+The reserve row prints the number you set together with the line it produces (*"30,000 tok free -
+fires at 140,000 of 170,000 tok"*), and says so when a reserve is too big to fit the window in play.
+The preserve figure is cut down when a small window cannot carry that much verbatim tail. Switch models mid-session and both
 recompute instantly, no reload. If the window is unknown, pi's classic 16,384 / 20,000 figures are
 used as safe fallbacks.
 
-The other half of the pair lives in pi's own `settings.json`: pi is the one that notices the context
-filling, so it asks at *window minus `compaction.reserveTokens`*, and this extension either writes the
-summary or answers "not yet". The trigger point is never later than that ask, so on a small-context
-model the earlier ask wins and nothing is ever held waiting for a line that is above the window. The
-read-only **pi's own reserve** row shows both points and says what `reserveTokens` would make them
-agree; this extension never edits that file.
+The alarm lives in pi's own `settings.json`, and what it wants is the opposite of what it used to
+want: its `compaction.reserveTokens` should be **smaller** than your reserve, which puts pi's ask
+ABOVE the line where this extension already compacts - on a 170,000-token window with a 30,000
+reserve, pi would ring at 158,000 while we compact at 140,000. So pi never asks first in normal
+operation. If it ever does (its number edited mid-session, a different model loaded), the extension
+answers "not yet", because the context is not near enough full yet, logs the hold and names the
+setting to move. A hold is not free: every turn spent waiting re-uploads the whole context, which is
+exactly why an alarm set below the line is worth correcting instead of living with. The read-only
+**pi's own compaction numbers** row shows both points and says what to change; this extension never
+edits that file.
 
 A "not yet" is bookkeeping and stays out of the log, but pi prints its own `Auto-compaction cancelled`
 line for it, and pi-stamp-plus stamped the same moment as `Compaction` . `ABORTED`. A hold now leaves
