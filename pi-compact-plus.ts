@@ -91,22 +91,29 @@ type CharCap = number | "full";
  * request. Nothing here touches pi's settings.json and nothing needs /reload.
  */
 /**
+/**
  * The two sizes the operator sets, both in TOKENS (2026-10-21, was a percent of the window with
  * min/max limits). Percentages were unreadable on a 170k model and wrong on any other: the same
  * 82% meant 139,400 tokens here and 52,480 on a 64k model, and the four limit rows existed only
- * to catch what the percent did on windows nobody was testing. Two numbers say it outright.
+ * to catch what the percent did on windows nobody was testing.
+ *
+ * Both are amounts of the window left FREE, which is how pi words its own compaction settings
+ * too, and it is the form that survives a model change: 'leave 30,600 tokens free' says the same
+ * thing on a 170k model and on a 64k one, while 'fire at 139,400' means something on this model
+ * only. The compaction line is the window minus the reserve.
  */
 type ScalingConfig = {
-	/** Automatic compaction fires when the context reaches this many tokens. 0 = no explicit target:
-	 *  fire where this model has to compact anyway (see triggerPointFor). */
-	triggerTokens: number;
+	/** How much of the window stays free above the compaction line: automatic compaction fires once
+	 *  the context passes `window - reserveTokens`. 0 = no number chosen by the operator: fire
+	 *  where this model has to compact anyway (see triggerPointFor). */
+	reserveTokens: number;
 	/** How much of the window stays free for the verbatim tail: what compaction keeps word for word
 	 *  and what elision refuses to stub. pi's keepRecentTokens is the same idea. */
 	preserveTokens: number;
 };
 
 const SCALING_DEFAULTS: ScalingConfig = {
-	triggerTokens: 0,
+	reserveTokens: 0,
 	preserveTokens: 20_000,
 };
 
@@ -114,32 +121,40 @@ const SCALING_DEFAULTS: ScalingConfig = {
 const LEGACY_WINDOW = 170_000;
 
 /**
- * Read the scaling block, translating the old percentages into tokens so a config written before
- * 2026-10-21 keeps the numbers it was really using. A stored `startPercent: 82` on a 170,000-token
- * window becomes `triggerTokens: 139400`; the min/max limits are applied during the translation and
- * then disappear, which is what they were for. A file that already has token counts is read as is.
+/**
+ * Read the scaling block, translating the older shapes into token counts so a config written
+ * before 2026-10-21 keeps the line it was really using - a number that moves when the file is
+ * merely read again would compact a live session early. A stored `startPercent: 82` on a
+ * 170,000-token window is a 30,600-token reserve, which is what the board shows; the min/max
+ * limits that used to surround the percentages are applied during that translation and then
+ * disappear, which is all they were ever for. A file with token counts in it is read as it is.
  */
 export function migrateScaling(raw: any, base: ScalingConfig, window = LEGACY_WINDOW): ScalingConfig {
 	const sc = raw?.scaling ?? {};
 	const num = (v: any): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined);
-	const trigger = num(sc.triggerTokens);
+	const reserve = num(sc.reserveTokens);
 	const preserve = num(sc.preserveTokens);
 	// A file with no scaling block at all is a NEW file, not an old one: it gets the defaults below,
 	// not a translation of percentages it never had.
 	const legacyKeys = ["startPercent", "reservePercent", "reserveMin", "reserveMax", "keepRecentPercent", "keepRecentMin", "keepRecentMax"];
-	if (trigger === undefined && preserve === undefined && !legacyKeys.some((k) => sc[k] !== undefined)) return base;
-	if (trigger !== undefined || preserve !== undefined) {
-		return { triggerTokens: trigger ?? base.triggerTokens, preserveTokens: preserve ?? base.preserveTokens };
-	}
+	if (reserve === undefined && preserve === undefined && !legacyKeys.some((k) => sc[k] !== undefined)) return base;
 	const win = num(sc.window) && (sc.window as number) > 0 ? Math.round(sc.window) : window;
+	// The one shape written on 2026-10-21 morning: a trigger POINT instead of a reserve. Same line,
+	// other direction, and it has to come out at the same line or a session would compact early.
+	const point = num(sc.triggerTokens);
+	const free = reserve ?? (point !== undefined && point > 0 ? Math.max(0, win - point) : undefined);
+	if (free !== undefined || preserve !== undefined) {
+		return { reserveTokens: free ?? base.reserveTokens, preserveTokens: preserve ?? base.preserveTokens };
+	}
 	const sp = num(sc.startPercent) ?? (num(sc.reservePercent) !== undefined ? 100 - (num(sc.reservePercent) as number) : 82);
 	const rLo = Math.min(num(sc.reserveMin) ?? 12_288, num(sc.reserveMax) ?? 80_000);
 	const rHi = Math.max(num(sc.reserveMin) ?? 12_288, num(sc.reserveMax) ?? 80_000);
-	const reserve = clamp(Math.round((win * (100 - sp)) / 100), rLo, rHi);
-	const kLo = Math.min(num(sc.keepRecentMin) ?? 16_384, num(sc.keepRecentMax) ?? 100_000);
-	const kHi = Math.max(num(sc.keepRecentMin) ?? 16_384, num(sc.keepRecentMax) ?? 100_000);
-	const keep = clamp(Math.round((win * (num(sc.keepRecentPercent) ?? 20)) / 100), kLo, kHi);
-	return { triggerTokens: Math.max(0, win - reserve), preserveTokens: keep };
+	const keepLo = Math.min(num(sc.keepRecentMin) ?? 16_384, num(sc.keepRecentMax) ?? 100_000);
+	const keepHi = Math.max(num(sc.keepRecentMin) ?? 16_384, num(sc.keepRecentMax) ?? 100_000);
+	return {
+		reserveTokens: clamp(Math.round((win * (100 - sp)) / 100), rLo, rHi),
+		preserveTokens: clamp(Math.round((win * (num(sc.keepRecentPercent) ?? 20)) / 100), keepLo, keepHi),
+	};
 }
 
 type ElisionConfig = {
@@ -4268,14 +4283,18 @@ function cycleNoThinkMarker(): void {
  * the extension fires first, and a hold needs a genuine drift (pi' reserveTokens changed while pi
  * was running) rather than being the normal course of every compaction.
  */
-export function triggerPointFor(o: { window: number; triggerTokens: number; piEnabled: boolean; piReserve: number }): number {
+export function triggerPointFor(o: { window: number; reserveTokens: number; piEnabled: boolean; piReserve: number }): number {
 	const win = Math.floor(o.window || 0);
 	if (!(win > 0)) return 0;
-	// Room that has to stay free at the top of the window: pi's own reserve while pi is the one that
-	// would otherwise compact, otherwise a small internal headroom so a huge target cannot overflow.
+	// The most free room this window may leave at the top: pi's own reserve while pi is the one that
+	// would otherwise compact, otherwise a small internal headroom so a huge reserve cannot push the
+	// line below the floor.
 	const headroom = o.piEnabled && o.piReserve > 0 ? Math.floor(o.piReserve) : Math.max(4096, Math.round(win * 0.05));
 	const mustFireAt = Math.max(1024, win - headroom);
-	const wanted = o.triggerTokens > 0 ? Math.floor(o.triggerTokens) : Number.POSITIVE_INFINITY;
+	// The line the reserve describes, never LATER than the point this model has to compact at: while
+	// pi is the one that would compact, a line behind pi's ask means held asks and a full pass over
+	// the context every turn in between, which is exactly what the operator asked to get rid of.
+	const wanted = o.reserveTokens > 0 ? win - Math.floor(o.reserveTokens) : mustFireAt;
 	return Math.max(1024, Math.min(wanted, mustFireAt));
 }
 
@@ -4284,7 +4303,7 @@ export function triggerPoint(ctx: Ctx): number {
 	const window = (ctx as any)?.model?.contextWindow ?? 0;
 	if (!(window > 0)) return 0;
 	const s = loadConfig().scaling;
-	return triggerPointFor({ window, triggerTokens: s.triggerTokens, piEnabled: readPiCompactionEnabled(), piReserve: readPiReserveTokens() });
+	return triggerPointFor({ window, reserveTokens: s.reserveTokens, piEnabled: readPiCompactionEnabled(), piReserve: readPiReserveTokens() });
 }
 
 /**
@@ -6072,41 +6091,32 @@ class CompactionMenu implements Component, Focusable {
 					"ON = the plugin writes the summary with the first model in the Compaction models list that answers, and the size check runs on its own (see 'When auto-compaction fires' below). OFF = this extension never compacts, and nothing of it touches pi's settings.",
 			},
 			{
-				// Read-only, on purpose (2026-10-07). The old "Who pulls the auto-compaction trigger" row
-				// offered three modes - pi's check, this extension's idle-only watcher, nothing - and all
-				// three were the same thing now: the plugin's own check before every model call. The idle
-				// watcher was the reason the row existed (a long tool-calling run used to overflow, because
-				// the watcher stands down mid-run and pi's own compaction was switched off to keep its
-				// summarizer quiet); with the check on the request path the run is covered, so the row, its
-				// handler and the settings.json trigger line all go away. Nothing automatic = the switch above.
-				id: "trigger",
-				label: "When auto-compaction fires",
-				currentValue: cfg.enabled
-					? `checked before every model call - fires at ${fmt(triggerPoint(this.ctx))} tok`
-					: "nothing fires automatically",
-				values: [],
-				description:
-					"The plugin measures the context before every request to the model - including the requests inside a long tool-calling run - and compacts when the line is passed, so a working session compacts on its own instead of reaching the end of the window. Nothing to switch here: the switch above starts and stops it, and the trigger point is the row below. The same check runs on a timer while the agent is idle, which covers a model switch: a bigger window moves the line at once.",
-			},
-			{
-				id: "triggerTok",
-				label: "Auto-compaction trigger point:",
+				id: "reserveTok",
+				label: "Reserve tokens before compaction:",
 				currentValue: (() => {
 					const win = (this.ctx as any)?.model?.contextWindow ?? 0;
+					const set = cfg.scaling.reserveTokens;
+					const free = extReserve(this.ctx);
 					const fire = triggerPoint(this.ctx);
-					const set = cfg.scaling.triggerTokens;
-					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok` : "the model's own threshold";
-					const capped = set > 0 && fire < set;
-					return `${fmt(fire)} tok` + (capped ? ` (you set ${fmt(set)}, but this ${fmt(win)} tok window must compact here)` : set > 0 ? "" : ` (no target set: the window's own point)`);
+					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok free` : "the model's own reserve";
+					return (
+						`${fmt(free)} tok free - fires at ${fmt(fire)} of ${fmt(win)} tok` +
+						(set > 0 && free > set
+						? ` (you left ${fmt(set)} free, but pi's own reserveTokens of ${fmt(free)} is larger, so its line is the one in force)`
+						: set > 0
+						? ""
+						: " (no number set: the line is wherever this model has to compact anyway)")
+					);
 				})(),
 				values: [EDIT_NUMBER],
 				description:
-					"Automatic compaction fires when the context reaches this many tokens - a plain token count, " +
-					"not a percent of the window (it was a percent with min and max limits until 2026-10-21). " +
-					"0 means no target: fire where the active model has to compact anyway. A target LATER than the " +
-					"point the model must compact at is never honoured, because deferring past pi's own threshold " +
-					"means every turn in between re-reads the whole context - the row then shows the earlier number " +
-					"and says so. Enter opens a free numeric entry.",
+					"Automatic compaction fires once the context is this close to the top of the window: the line " +
+						"is the model's context window minus this number, so one value means the same on every model. " +
+						"0 leaves the choice to pi's own reserveTokens. This is the mirror of that pi setting and the " +
+						"two do interact: if pi's reserveTokens is LARGER than this, pi asks to compact first and this " +
+						"extension holds the ask until its own line, which costs a full pass over the context each turn " +
+						"until then - the pi's own reserveTokens row below shows both points. The line moves the moment " +
+						"this number is saved, so set it while the context is small rather than in the middle of a run.",
 			},
 			{
 				id: "preserveTok",
@@ -7309,7 +7319,7 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			const id = result.action.slice("edit-number:".length);
 			await editNumber(ctx, id);
 			// Return to the submenu the row lives in (the scaling/elision rows moved into submenus).
-			if (id === "triggerTok" || id === "preserveTok") restore = { compactionMenu: true };
+			if (id === "reserveTok" || id === "preserveTok") restore = { compactionMenu: true };
 			else if (id.startsWith("elision")) restore = { elisionMenu: true };
 			else if (id === "retries" || id === "retryWait") restore = { compactionMenu: true };
 			else restore = { rowId: id };
@@ -7547,7 +7557,7 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
  */
 const NUMBER_EDITORS: Record<string, { title: string; lo: number; hi: number; unit: string; def: number; apply: (v: number) => string | undefined }> = {
 	retryWait: { title: "Wait between retries", lo: 0, hi: 300, unit: "seconds", def: 5, apply: (v) => { update((c) => void (c.retryDelaySeconds = v)); return undefined; } },
-	triggerTok: { title: 'Auto-compaction trigger point', lo: 0, hi: 10_000_000, unit: 'tokens (0 = where this model has to compact anyway)', def: 0, apply: (v) => { update((c) => void (c.scaling.triggerTokens = v)); return undefined; } },
+	reserveTok: { title: "Reserve tokens before compaction", lo: 0, hi: 10_000_000, unit: "tokens left free above the line (0 = pi's own reserve)", def: 0, apply: (v) => { update((c) => void (c.scaling.reserveTokens = v)); return undefined; } },
 	preserveTok: { title: 'Preserve tokens (the verbatim tail)', lo: 1024, hi: 10_000_000, unit: 'tokens', def: 20_000, apply: (v) => { update((c) => void (c.scaling.preserveTokens = v)); return undefined; } },
 	elisionStart: { title: "Elision start", lo: 1, hi: 99, unit: "percent of window", def: 70, apply: (v) => { update((c) => void (c.elision = { ...c.elision, softPercent: v })); return undefined; } },
 	elisionProtect: { title: "Elision protect (tool results)", lo: 0, hi: 1_000_000, unit: "tokens", def: 20_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, protectRecentTokens: v })); return undefined; } },
@@ -7567,7 +7577,7 @@ async function editNumber(ctx: Ctx, id: string): Promise<void> {
 	const cfg = loadConfig();
 	const current =
 		id === "retryWait" ? cfg.retryDelaySeconds
-		: id === 'triggerTok' ? cfg.scaling.triggerTokens
+		: id === "reserveTok" ? cfg.scaling.reserveTokens
 		: id === 'preserveTok' ? cfg.scaling.preserveTokens
 		: id === "piReserve" ? readPiReserveTokens()
 		: id === "elisionStart" ? cfg.elision.softPercent
@@ -8993,7 +9003,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			// actually kept by this extension was 9% of a 260,000-token window = 23,400).
 			reserveTokens: extReserve(ctx),
 			keepRecentTokens: extKeepRecent(ctx),
-			triggerTokens: cfg.scaling.triggerTokens,
+			// The number the operator set, kept under its OWN name: it used to be written as a second
+			// `reserveTokens` key, and a repeated key in an object literal is legal JavaScript that simply
+			// discards the first one - the log would then have reported the setting as if it were the
+			// reserve in force, which on a small window is a different number.
+			setReserveTokens: cfg.scaling.reserveTokens,
 			models: refs,
 			sessionModel: ctx.model ? refOf(ctx.model) : "?",
 		});

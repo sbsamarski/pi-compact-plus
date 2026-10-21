@@ -221,12 +221,13 @@ so nothing moves on the board by itself.)
 
 | Setting | Default | What it controls |
 |---|---|---|
-| Auto-compaction trigger point | 0 = wherever this model has to compact | the context size, in tokens, at which the summary is written. |
+| Reserve tokens before compaction | 0 = pi's own reserve | how much of the window is left free above the line: compaction fires at *window minus this number*. |
 | Preserve tokens | 20,000 | the newest tail kept word for word outside every summary (and protected from elision). |
 
-Each row shows the value IN FORCE for the active model, in tokens: the trigger point shown is the
-EARLIER of your number and the point this model has to compact at anyway, and the preserve figure is
-cut down when a small window cannot carry that much verbatim tail. Switch models mid-session and both
+Each row shows what is IN FORCE for the active model: the reserve row prints both the free room and
+the resulting line (*"30,600 tok free - fires at 139,400 of 170,000 tok"*), and says so when pi's own
+`reserveTokens` is the larger of the two and therefore the line you actually get. The preserve figure
+is cut down when a small window cannot carry that much verbatim tail. Switch models mid-session and both
 recompute instantly, no reload. If the window is unknown, pi's classic 16,384 / 20,000 figures are
 used as safe fallbacks.
 
