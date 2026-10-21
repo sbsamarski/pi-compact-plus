@@ -8623,14 +8623,39 @@ function announceCompaction(ctx: any, out: string[], kind: "info" | "warning" | 
 
 /** The same for a compaction that produced no summary: the rotation's failure list is one string per
  *  model joined with ' | ', which becomes one row per model, plus what happens next. */
+/** A short, readable name for a model out of its reference alone - the failure rows have the reference
+ *  and not the model object. `http://127.0.0.1:9931/qwen3.8-flash…` becomes the file it is serving, and
+ *  `openrouter/z-ai/glm-5.3-flash` keeps its family, because dropping `z-ai` would make it ambiguous. */
+export function failureRowLabel(ref: string): string {
+	const bare = String(ref).replace(/^https?:\/\//, "").replace(/\.gguf$/i, "");
+	const parts = bare.split("/").filter(Boolean);
+	if (parts.length <= 1) return bare || String(ref);
+	const host = /^(\d{1,3}\.){3}\d{1,3}/i.test(parts[0]) || /^localhost/i.test(parts[0]);
+	return host ? parts[parts.length - 1] : parts.slice(-2).join("/");
+}
+
+/** The same report for a compaction that produced no summary. The rotation's failure list is one string
+ *  per model joined with ' | ', and in the ordinary case - the model wrote far too few or far too many
+ *  tokens - each of those strings already carries the number that was measured and the limit it broke,
+ *  which is exactly the information that used to be buried in the log. So: a header, one row per model,
+ *  then what the trigger does next. */
 export function compactionFailureNoticeLines(error: string, note: string): string[] {
-	const out = [`COMPACTION FAILED · ${String(error).slice(0, 200)}`];
-	const parts = String(error).split(" | ").filter((p) => p.includes(": "));
-	for (const p of parts.slice(0, 6)) out.push(`COMPACTION FAILED · ${p.slice(0, 150)}`);
+	const parts = String(error).split(" | ").map((p) => p.trim()).filter(Boolean);
+	const named = parts.filter((p) => p.includes(": "));
+	const out: string[] = [];
+	out.push(
+		named.length
+			? `COMPACTION FAILED · no summary written · ${named.length} model${named.length > 1 ? "s" : ""} tried`
+			: `COMPACTION FAILED · ${String(error).slice(0, 180) || "unknown reason"}`,
+	);
+	for (const p of named.slice(0, 6)) {
+		const i = p.indexOf(": ");
+		out.push(`COMPACTION FAILED · ${failureRowLabel(p.slice(0, i))} · ${p.slice(i + 2).slice(0, 140)}`);
+	}
+	if (named.length > 6) out.push(`COMPACTION FAILED · …and ${named.length - 6} more, in the compaction log`);
 	if (note) out.push(`COMPACTION FAILED · ${note}`);
 	return out;
 }
-
 let lastCompactionDoneAtMs = 0;
 /** The no-abort landing of #43, which lives inside install() because `handleCompaction` does. The
  *  watcher is a top-level function and cannot see into that closure, so the landing hands itself to the
