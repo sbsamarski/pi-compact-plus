@@ -1247,12 +1247,37 @@ const LOG_CHATTER = new Set([
 	"info",
 	"trim",
 	"user_prompts",
-	"elision",
+	// The elision DECISIONS stay hidden (a switch thrown, a batch deferred); the elision BATCH itself
+	// comes back into the view, because it is the entry that carries the numbers - what was stubbed and
+	// how many tokens it saved (2026-10-21: "i want to see only compaction and elision entries there with
+	// their data").
 	"elision_off",
 	"elision_hold",
+	"elision_wait",
 	"two_compactors",
 	"safe_point_held",
-	"compaction_landed",
+	// The record that pi accepted the summary is part of the compaction, not bookkeeping about it:
+	// it carries the size of the summary that actually landed (2026-10-21).
+	// (compaction_landed left this list.)
+	// WHEN the trigger fires is arithmetic, not a result: the two clocks, the hold while pi asks early,
+	// the retry slot, the park being re-armed. All of it stays in the file for a later diagnosis and out
+	// of the view (2026-10-21: "you can stop inserting any unnecessary log entries ... filter them out in
+	// the log display").
+	"auto_compaction_held",
+	"auto_compaction_cancelled",
+	"auto_compaction_resumed",
+	"auto_trigger_retry",
+	"safe_point_released",
+	"trigger_clock",
+	"trigger_clock_released",
+	"ctx_dbg",
+	"watcher",
+	"heartbeat",
+	// Settings writes: the screen already says when a write failed, and a per-keystroke board row in a
+	// results view is noise.
+	"config_written",
+	"config_write_failed",
+	"enable_refused",
 	// auto_trigger is the watcher's own arithmetic: the estimate, the line, the window, and - while
 	// pi's threshold holds the trigger, a standing-back note repeated on a throttle. What the operator opens
 	// the log for is the compaction, and `start` already carries the reason it happened, so this is
@@ -1344,7 +1369,11 @@ function tailLogPretty(lines = 16, verbose = false): string {
 							: "";
 					// The elision events carry their own figures.
 					const elision = d.event === "elision" ? [`${fmt(d.applied ?? 0)} result${d.applied === 1 ? "" : "s"} elided`, `${fmt(d.resultsTokens ?? 0)} tok -> ${fmt(d.stubTokens ?? 0)} tok`, `saved ${fmt(d.savedTokens ?? 0)} tok`, `ctx ~${fmt(d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`].join(" · ") : "";
-					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, note].filter(Boolean).join(" · ");
+					// A landed summary is a result with a size, and the size is the figure worth keeping
+					// in view next to the aim it was asked for (2026-10-21: "only compaction and elision entries
+					// there with their data').
+					const summary = typeof d.summaryTokens === "number" ? `summary ${fmt(d.summaryTokens)} tok` : "";
+					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, summary, note].filter(Boolean).join(" · ");
 				} catch {
 					return l.slice(0, 160);
 				}
@@ -4125,7 +4154,9 @@ function otherCompactorDetected(): string | null {
 /** THE GATE used by every path that would switch this extension's compaction ON: the menu row, the
  *  settings screen, the fallback board and the /compact-plus on command. Returns the name of the other
  *  manager when the switch must be refused (and says so on screen + in the log), null when it may go on. */
-function enableBlockedByOtherCompactor(): string | null {
+// Exported for the safety-net rig (TMP/pcp_nets.mts): these paths have saved the session twice and
+// have never once been seen running, which is worth more than a comment saying they look right.
+export function enableBlockedByOtherCompactor(): string | null {
 	if (loadConfig().enabled) return null; // already on: nothing is being enabled here
 	const other = otherCompactorDetected();
 	if (!other) return null;
@@ -4144,7 +4175,7 @@ function enableBlockedByOtherCompactor(): string | null {
  *  (a hand edit, a config copied from another machine, the other manager installed afterwards). Warn
  *  once per session and say what to switch off; do NOT write anybody's settings behind the user's back. */
 let otherCompactorWarned = false;
-function warnOnceAboutTwoCompactors(ctx: any): void {
+export function warnOnceAboutTwoCompactors(ctx: any): void {   // exported for the safety-net rig
 	if (otherCompactorWarned) return;
 	otherCompactorWarned = true;
 	try {
@@ -8542,6 +8573,8 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
  *  each attempt uploading the whole context. Now: a user cancel stops the auto-compactor at once; a
  *  failure is retried ONCE after 3 minutes and, if it fails again, the auto-compactor is switched off
  *  and says so on screen in capitals. It stays off until the user runs a manual compaction. */
+// Exported so the rig can arrive at the moment AFTER a failure without a rig having to fail twice for
+// three minutes; the code reads and writes the same object it always did.
 const autoFailure = { fails: 0, retryAtMs: 0, pausedAtMs: 0 };
 /** "auto" while the watcher's own compaction is in flight, "manual" for a user-run one. */
 let lastCompactionTrigger = "manual";
@@ -8744,7 +8777,8 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			fromExtension: Boolean((event as any)?.fromExtension),
 			summaryTokens: Math.round((((entry?.summary ?? '') as string).length * 1.15) / 4),
 			handoff: true,
-			note: "the trigger will not start another one on an unmeasured context for the next 45 s",
+			// No note: the 45-second floor this used to repeat is the trigger's own arithmetic, and this row
+			// is a result the operator reads for one number - the size of the summary that landed.
 		});
 		return undefined;
 	});
@@ -8831,7 +8865,17 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				/* the trigger must never block a live request */
 			}
 		}
-		if (!cfgForHookElision()) return undefined; // elision has its own switch; off means the request is untouched
+		if (!cfgForHookElision()) {
+			// Returning straight here used to skip the stubber entirely, which quietly lost two
+			// things: the record that the switch was ever thrown, and the clearing of the applied-
+			// stub state. That state remembers WHICH results are already stubbed on the wire and
+			// where the prompt-cache break point sits, so stubs left in it after a switch-on saw
+			// raw originals as already stubbed (they are not - an off request goes out untouched)
+			// and it placed the break point where nothing had been changed. applyElision has its
+			// own off branch for exactly this bookkeeping and returns undefined, so the request
+			// is still handed on exactly as it arrived.
+			return applyElision(event?.messages, ctx);
+		}
 		if (elisionFailure.off) return undefined;
 		if (elisionFailure.retryAtMs > 0) {
 			if (Date.now() < elisionFailure.retryAtMs) return undefined; // waiting out the one retry
@@ -8984,7 +9028,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			? "manual"
 			: reason.includes("threshold") || reason.includes("overflow")
 				? "auto"
-				: lastCompactionTrigger;
+				// A reason pi does not name today is still not a manual run: only /compact, a button or the
+				// settings menu arrive as "manual". The old fallback here was the label the LAST trigger had
+				// left behind, so an unnamed reason inherited whatever that happened to be - and the label is
+				// what decides whether a refusal gets the one allowed retry, a park, or just a log line.
+			: "auto";
 		if (trigger === "auto") {
 			// An automatic trigger is answered HERE while the breaker is cooling down or parked, and it is
 			// cancelled: falling through at any point below would let pi write a summary with the session
@@ -9003,7 +9051,12 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				return { cancel: true };
 			}
 		}
-		lastCompactionTrigger = "manual";
+		// Remember WHO asked, for the failure handlers below: the nothing-to-summarise park, the one
+		// allowed retry and the two-refusals-stop-it park all key off this label. It used to be written
+		// as "manual" here whatever had actually asked, which is how an automatic compaction that pi
+		// refused got logged as a manual one - reported on screen, never retried, never parked, and the
+		// park the operator had put in place was cleared by an automatic ask that looked manual.
+		lastCompactionTrigger = trigger;
 		if (trigger === "manual" && parkedThisSession(cfg, ctx)) {
 			update((c) => void (c.autoCompactPaused = false));
 			logLine(cfg, { event: "auto_compaction_resumed", session: String(ctx?.sessionManager?.getSessionId?.() ?? "session").slice(-8), note: "a manual compaction ran in this session - the proactive trigger is armed again, for this session" });
