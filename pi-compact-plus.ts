@@ -434,7 +434,10 @@ const DEFAULT_CONFIG: Config = {
 	retryDelaySeconds: 5,
 	log: true,
 	transcriptPointer: true,
-	summaryReceipt: true,
+	// Off since 2026-10-22 at the operator's request: the same facts are printed on screen when the
+	// compaction finishes, so the line at the top of the summary was read only by the next model. Turn
+	// it on again from the settings menu if you want the summary to carry the receipt for itself.
+	summaryReceipt: false,
 	landWithoutAbort: false,
 	directRequest: true,
 	shapeGate: true,
@@ -3547,6 +3550,10 @@ export async function summarizeWithRotation(
 	}
 
 	const prevTurn = readPrevTurnInfo(ctx, preparation);
+	// The report on screen wants to name the models that were tried and lost, and `failures` is a local
+	// of this function. Pointing a module-level name at the same array costs one line and no plumbing: the
+	// pushes below land in it, and handleCompaction reads it when the compaction ends.
+	lastRotationFailures = failures;
 	const failures: string[] = [];
 
 	// The session model's window decides how big the summary may be; see postCompactionHeadroom.
@@ -3944,7 +3951,7 @@ export async function summarizeWithRotation(
 			});
 			return {
 				ok: true,
-				result: { ok: true, compaction: { ...compaction, summary }, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds, material: realInput - SUMMARISER_FRAMING_TOKENS, elided: elidedTokens(pre, realInput - SUMMARISER_FRAMING_TOKENS) },
+				result: { ok: true, compaction: { ...compaction, summary }, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, input: u.input, output: u.output, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds, material: realInput - SUMMARISER_FRAMING_TOKENS, elided: elidedTokens(pre, realInput - SUMMARISER_FRAMING_TOKENS) },
 			};
 		} catch (err: any) {
 			const seconds = Math.round(((Date.now() - started) / 1000) * 10) / 10;
@@ -8533,7 +8540,7 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 			void landNoAbortHook(ctx, source)
 				.then((r) => {
 					if (r.ok) {
-						ctx.ui?.notify?.("Compaction landed without interrupting the turn - the next request already carries the summary.", "info");
+						ctx.ui?.notify?.("COMPACTION · landed without stopping the turn - the next request carries the summary", "info");
 						return;
 					}
 					const note = String(r.note ?? "").slice(0, 160);
@@ -8571,6 +8578,59 @@ let lastCompactionTrigger = "manual";
  *  measured (the server has not answered since), so the watcher refuses to start a compaction on a guess:
  *  2026-10-14, a session triggered again 0.9 s after a summary had landed, on the size of the whole
  *  on-disk history, and pi answered it with "Nothing to compact (session too small)". */
+/** The models tried and lost by the compaction now in flight (see `summarizeWithRotation`). Read when
+ *  the report is printed; empty when the first candidate worked. */
+let lastRotationFailures: string[] = [];
+
+/** ONE GLANCE AT THE SCREEN (2026-10-22, the operator's request): what a finished compaction cost, who
+ *  wrote it, and how full the session was - printed as rows, because reading those facts meant opening
+ *  the settings and the log before. pi prints one row per notice, so the lines go out one at a time.
+ *  A pure builder, so a rig can read exactly what the screen would have said. */
+export function compactionNoticeLines(
+	r: any,
+	opts: { before: number; window: number; keepRecent: number; failures: string[]; trigger: string },
+): string[] {
+	const out: string[] = [];
+	const pct = opts.window > 0 ? Math.round((opts.before / opts.window) * 100) : 0;
+	out.push(
+		`COMPACTION · ${opts.trigger === "manual" ? "you asked for it" : "automatic"} · summary by ${slotLabel(r.ref, r.model)}` +
+			(r.via === "direct" ? " (direct request)" : "") +
+			(typeof r.seconds === "number" ? ` · ${r.seconds}s` : ""),
+	);
+	out.push(
+		`COMPACTION · read ${fmt(r.input ?? r.material ?? 0)} tok -> wrote ${fmt(r.measured)} tok` +
+			(typeof r.words === "number" ? ` · ${fmt(r.words)} words` : "") +
+			` (accepted ${fmt(r.min)}-${fmt(r.max)})`,
+	);
+	out.push(
+		`COMPACTION · context was ${fmt(opts.before)} of ${fmt(opts.window)} tok (${pct}% full) · newest ${fmt(opts.keepRecent)} tok kept word for word`,
+	);
+	for (const f of opts.failures) out.push(`COMPACTION · tried and lost: ${String(f).slice(0, 150)}`);
+	return out;
+}
+
+/** Every line on its own row. A screen is not worth losing a compaction over, so a UI that refuses a
+ *  line is ignored rather than allowed to throw between the summary and the session file. */
+function announceCompaction(ctx: any, out: string[], kind: "info" | "warning" | "error" = "info"): void {
+	for (const line of out) {
+		try {
+			ctx?.ui?.notify?.(line, kind);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** The same for a compaction that produced no summary: the rotation's failure list is one string per
+ *  model joined with ' | ', which becomes one row per model, plus what happens next. */
+export function compactionFailureNoticeLines(error: string, note: string): string[] {
+	const out = [`COMPACTION FAILED · ${String(error).slice(0, 200)}`];
+	const parts = String(error).split(" | ").filter((p) => p.includes(": "));
+	for (const p of parts.slice(0, 6)) out.push(`COMPACTION FAILED · ${p.slice(0, 150)}`);
+	if (note) out.push(`COMPACTION FAILED · ${note}`);
+	return out;
+}
+
 let lastCompactionDoneAtMs = 0;
 /** The no-abort landing of #43, which lives inside install() because `handleCompaction` does. The
  *  watcher is a top-level function and cannot see into that closure, so the landing hands itself to the
@@ -9214,13 +9274,24 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				// First failure: keep the trigger armed but wait 3 minutes for the single retry.
 				autoFailure.retryAtMs = Date.now() + 180_000;
 				logLine(cfg, { event: "auto_compaction_failed", error: outcome.error, trigger, failure: autoFailure.fails, retryInMs: 180_000, note: "one retry allowed, 3 minutes from now" });
-				ctx.ui?.notify?.(`COMPACTION FAILED (1 of 2): ${String(outcome.error).slice(0, 160)} - IT WAITS 3 MINUTES AND TRIES ONCE MORE. PI'S OWN SUMMARIZER IS NOT USED.`, "warning");
+			announceCompaction(
+				ctx,
+				compactionFailureNoticeLines(
+					outcome.error,
+					"first failure: the trigger stays armed, one retry in 3 minutes, pi's own summarizer is not used",
+				),
+				"warning",
+			);
 				return { cancel: true };
 			}
 			pauseAutoCompaction(ctx, "compaction failed twice", outcome.error);
 			logLine(cfg, { event: "give_up", error: outcome.error, trigger, note: "automatic attempts rest for 30 minutes; pi's stock summarizer was NOT allowed to run" });
-			ctx.ui?.notify?.(
-				`Compaction models all failed (${String(outcome.error).slice(0, 200)}). AUTOMATIC COMPACTION RESTS FOR 30 MINUTES AND PI'S OWN SUMMARIZER WILL NOT BE SUBSTITUTED - fix the model list, or ask for a manual compaction, which is allowed right away.`,
+			announceCompaction(
+				ctx,
+				compactionFailureNoticeLines(
+					outcome.error,
+					"every candidate failed: automatic compaction rests for 30 minutes and pi's own summarizer will NOT be substituted. Fix the model list, or run a manual compaction, which is allowed right away.",
+				),
 				"error",
 			);
 			// And that is the whole rule (2026-10-17, after a session lost two hours of work this way): failing
@@ -9262,9 +9333,15 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				window: (ctx as any)?.model?.contextWindow ?? 0,
 				reason: event.reason,
 			});
-		ctx.ui?.notify?.(
-			`Summary written by ${slotLabel(r.ref, r.model)} in ${r.seconds}s — ${fmt(r.measured)} tok (accepted ${fmt(r.min)}–${fmt(r.max)}).`,
-			"info",
+		announceCompaction(
+			ctx,
+			compactionNoticeLines(r, {
+				before: realContextTokens(ctx),
+				window: ctx?.model?.contextWindow ?? 0,
+				keepRecent: extKeepRecent(ctx),
+				failures: lastRotationFailures,
+				trigger,
+			}),
 		);
 		return { compaction: r.compaction };
 	}
