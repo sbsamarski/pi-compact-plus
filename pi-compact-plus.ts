@@ -3667,7 +3667,18 @@ export async function summarizeWithRotation(
 		// cut a request that is still producing.
 		const backstop = backstopMsFor(c.kind, realSizes.target, profile.timeoutMs, c.ref);
 		logLine(cfg, {
+			// ONE OPENING ROW, NOT TWO (2026-10-23): this is the row that says a compaction is happening,
+			// which model is about to write it, and how full the session was when it started. The separate
+			// COMPACTION START row is gone - on the crash loop of 2026-10-22 it was the only row written at
+			// all, and it named no model, which is why the operator could not see what was happening.
 			event: "attempt",
+			trigger: lastCompactionTrigger,
+			contextFill: realContextTokens(ctx),
+			sessionWindow: ctx?.model?.contextWindow ?? 0,
+			reserveTokens: extReserve(ctx),
+			keepRecentTokens: extKeepRecent(ctx),
+			setReserveTokens: cfg.scaling.reserveTokens,
+			sessionModel: ctx.model ? refOf(ctx.model) : "?",
 			// Which ceiling on the model's own thinking actually went out with this request (2026-10-20). The
 			// settings value and the number the engine honoured are different claims, and only one of them is
 			// in this line; that difference is what last night's forensics had to reconstruct by arithmetic.
@@ -6166,7 +6177,7 @@ class CompactionMenu implements Component, Focusable {
 					// 30,600 printed 30,600 back, and the operator reasonably read that as the edit not taking
 					// (2026-10-22). The line is the setting now, so the two can only differ when no number is set.
 					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok before a full window` : `automatic: ${fmt(eff)} tok before a full window`;
-					const head = `${fmt(eff)} tok before the full ${fmt(win)} tok window (fires at ${fmt(triggerPoint(this.ctx))} tok)`;
+					const head = `${fmt(eff)} tok before the ${fmt(win)} tok window (fires at ${fmt(triggerPoint(this.ctx))} tok)`;
 					return set > 0
 						? head + (eff !== set ? ` (your ${fmt(set)} cannot fit this window; ${fmt(eff)} is used)` : "")
 						: head + ` (no number set: a tenth of the window, floor 16,384)`;
@@ -6184,7 +6195,7 @@ class CompactionMenu implements Component, Focusable {
 			{
 				id: "preserveTok",
 				label: "Preserve tail context:",
-				currentValue: `${fmt(extKeepRecent(this.ctx))} tok of the tail kept verbatim` + (cfg.scaling.preserveTokens !== extKeepRecent(this.ctx) ? ` (you set ${fmt(cfg.scaling.preserveTokens)}, this window keeps ${fmt(extKeepRecent(this.ctx))})` : ""),
+				currentValue: `${fmt(extKeepRecent(this.ctx))} tok of the context tail kept verbatim` + (cfg.scaling.preserveTokens !== extKeepRecent(this.ctx) ? ` (you set ${fmt(cfg.scaling.preserveTokens)}, this window keeps ${fmt(extKeepRecent(this.ctx))})` : ""),
 				values: [EDIT_NUMBER],
 				description:
 					"How much of the window is kept free for the conversation that stays word for word: the tail " +
@@ -8548,6 +8559,11 @@ let lastCompactionTrigger = "manual";
  *  the report is printed; empty when the first candidate worked. */
 let lastRotationFailures: string[] = [];
 
+/** What the winning attempt knew, kept for the one closing row. The `done` record used to be a row of
+ *  its own, one second before COMPACTED; the operator asked for a single line at the end (2026-10-23), so
+ *  these fields ride on that row instead. */
+let lastLandingInfo: Record<string, any> = {};
+
 /** ONE GLANCE AT THE SCREEN (2026-10-22, the operator's request): what a finished compaction cost, who
  *  wrote it, and how full the session was - printed as rows, because reading those facts meant opening
  *  the settings and the log before. pi prints one row per notice, so the lines go out one at a time.
@@ -8604,28 +8620,6 @@ export function failureRowLabel(ref: string): string {
  *  per model joined with ' | ', and in the ordinary case - the model wrote far too few or far too many
  *  tokens - each of those strings already carries the number that was measured and the limit it broke,
  *  which is exactly the information that used to be buried in the log. So: a header, one row per model,
-/** The row set shown when a compaction STARTS: enough to know what is running and how full the
- *  session is, without waiting for the result. Built as a pure function so a rig can read it. */
-export function compactionStartLines(cfg: any, ctx: any, reason: string): string[] {
-	const win = Number(ctx?.model?.contextWindow ?? 0);
-	const fill = realContextTokens(ctx);
-	const keep = Number(cfg?.scaling?.preserveTokens ?? 0);
-	const kind = reason === "manual" ? "manual" : `automatic (${reason})`;
-	const out = [
-		`COMPACTION START · ${kind} · context ${fmt(fill)} of ${fmt(win)} tok` +
-			(win > 0 ? ` (${Math.round((fill / win) * 100)}% full)` : "") +
-			(keep > 0 ? ` · newest ${fmt(keep)} tok will be kept word for word` : ""),
-	];
-	try {
-		const { candidates } = buildRotation(cfg, ctx as any);
-		const names = candidates.map((c: any) => failureRowLabel(String(c.ref)));
-		if (names.length) out.push(`COMPACTION START · models in order: ${names.slice(0, 4).join(", ")}${names.length > 4 ? ` +${names.length - 4} more` : ""}`);
-	} catch {
-		/* the list is a courtesy; the compaction does not depend on it */
-	}
-	return out;
-}
-
 /** A failed compaction names the models that refused and says why, then what the trigger does next. */
 export function compactionFailureNoticeLines(error: string, note: string): string[] {
 	const parts = String(error).split(" | ").map((p) => p.trim()).filter(Boolean);
@@ -8846,6 +8840,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			handoff: true,
 			// No note: the 45-second floor this used to repeat is the trigger's own arithmetic, and this row
 			// is a result the operator reads for one number - the size of the summary that landed.
+			...lastLandingInfo,
 		});
 		return undefined;
 	});
@@ -9186,6 +9181,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			noAbort: true,
 			source: why,
 			entry: String(entryId ?? "").slice(0, 12),
+			...lastLandingInfo,
 		});
 		return { ok: true };
 	}
@@ -9253,31 +9249,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		const history = historyTokensOnly(prep);
 		const overhead = fixedRequestTokens(ctx);
 		const fill = realContextTokens(ctx);
-		logLine(cfg, {
-			event: "start",
-			reason: event.reason,
-			historyTokens: history,
-			overheadTokens: overhead,
-			contextFill: fill,
-			sessionWindow: ctx.model?.contextWindow ?? 0,
-			// THE EXTENSION'S OWN NUMBERS, computed from the scaling settings below. pi's own reserveTokens /
-			// keepRecentTokens used to be printed here, which was misleading: pi's compaction is switched off,
-			// so its numbers meant nothing (2026-10-05: the log showed keepRecentTokens 20,000 while the tail
-			// actually kept by this extension was 9% of a 260,000-token window = 23,400).
-			reserveTokens: extReserve(ctx),
-			keepRecentTokens: extKeepRecent(ctx),
-			// The number the operator set, kept under its OWN name: it used to be written as a second
-			// `reserveTokens` key, and a repeated key in an object literal is legal JavaScript that simply
-			// discards the first one - the log would then have reported the setting as if it were the
-			// reserve in force, which on a small window is a different number.
-			setReserveTokens: cfg.scaling.reserveTokens,
-			models: refs,
-			sessionModel: ctx.model ? refOf(ctx.model) : "?",
-		});
-		// The same information the log gets, on the screen, BEFORE the summariser starts: which trigger
-		// fired, how full the context is, and which models are about to be tried. A compaction takes
-		// minutes, and with nothing on screen it reads as a hang (2026-10-22).
-		announceCompaction(ctx, compactionStartLines(cfg, ctx, String(event.reason ?? "manual")), "info");
 		ctx.ui?.setStatus?.("compact-plus", `compacting via ${rotationText(cfg, ctx)} ...`);
 		let outcome;
 		try {
@@ -9299,7 +9270,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				// parked it as well, and the operator watched an automatic run arrive after saying "not now").
 				if (trigger === "manual") {
 					logLine(cfg, { event: "compaction_cancelled", trigger, note: "a manual compaction was stopped; the automatic trigger is untouched" });
-					ctx.ui?.notify?.("COMPACTION CANCELLED - the manual compaction was stopped. The automatic trigger is untouched.", "info");
+					ctx.ui?.notify?.("COMPACTION CANCELLED - the manual compaction was stopped.", "info");
 					return { cancel: true };
 				}
 				pauseAutoCompaction(ctx, "you stopped the automatic compaction", outcome.error);
@@ -9350,24 +9321,13 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			/* counter is best-effort */
 		}
 		r.compaction.summary = appendTranscriptPointer(cfg, ctx, r.compaction.summary);
-		logLine(cfg, {
-				event: "done",
-				ref: r.ref,
-				status: "ok",
-				trigger,
-				session: String(ctx?.sessionManager?.getSessionId?.() ?? "session").slice(-8),
-				seconds: r.seconds,
-				measured: r.measured,
-				min: r.min,
-				target: (r as any).target,
-				max: r.max,
-				words: r.words,
-				via: (r as any).via,
-				before: realContextTokens(ctx),
-				line: (ctx as any)?.compaction?.reserveTokens ?? 0,
-				window: (ctx as any)?.model?.contextWindow ?? 0,
-				reason: event.reason,
-			});
+		lastLandingInfo = {
+			ref: r.ref, trigger, seconds: r.seconds, measured: r.measured, min: r.min, target: (r as any).target,
+			max: r.max, words: r.words, via: (r as any).via, before: realContextTokens(ctx),
+			window: (ctx as any)?.model?.contextWindow ?? 0, reason: event.reason,
+			// Every candidate that was tried and lost, on the row that says the compaction landed.
+			failures: lastRotationFailures,
+		};
 		announceCompaction(
 			ctx,
 			compactionNoticeLines(r, {
