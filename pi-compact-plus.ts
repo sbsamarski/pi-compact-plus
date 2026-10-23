@@ -258,7 +258,6 @@ type Config = {
 	 *  first), and how big the summary came out. pi's own on-screen line can only ever show the whole
 	 *  pre-compaction context, which is why "compacted from 163,000 tokens" looks nothing like the
 	 *  49,000 tokens the summariser was given. */
-	summaryReceipt: boolean;
 	/** ON = a compaction this extension starts while a turn is running is landed by appending the summary
 	 *  straight to the session, instead of going through pi's manual compaction entry point - which stops
 	 *  the turn, prints 'operation aborted' and waits for the operator to type a message. OFF until it has
@@ -437,7 +436,6 @@ const DEFAULT_CONFIG: Config = {
 	// Off since 2026-10-22 at the operator's request: the same facts are printed on screen when the
 	// compaction finishes, so the line at the top of the summary was read only by the next model. Turn
 	// it on again from the settings menu if you want the summary to carry the receipt for itself.
-	summaryReceipt: false,
 	landWithoutAbort: false,
 	directRequest: true,
 	shapeGate: true,
@@ -502,8 +500,31 @@ let piCompactionMod: Promise<any> | undefined;
 function piCompactionModLoad(): Promise<any> {
 	if (!piCompactionMod) {
 		piCompactionMod = (async () => {
-			const root = import.meta.resolve("@earendil-works/pi-coding-agent");
-			return import(new URL("./core/compaction/compaction.js", root).href);
+			// pi loads extensions from its own bundle, where the bare package name does not necessarily
+			// resolve from this file's folder (2026-10-22: "Cannot find module"). Try the specifier first,
+			// because that is the correct answer when it works, then the install folder the running pi was
+			// started from, then the npm global folder on Windows. One of them is always right, and if none
+			// is, the caller falls back to pi's own path with a message instead of failing.
+			const file = "core/compaction/compaction.js";
+			const tried: string[] = [];
+			try {
+				tried.push(new URL("./" + file, import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+			} catch {
+				/* the specifier is not resolvable from here; the paths below are the fallback */
+			}
+			const appdata = process.env.APPDATA ?? process.env.LOCALAPPDATA ?? "";
+			const bs = String.fromCharCode(92);
+			const fwd = (s: string) => s.split(bs).join("/");
+			if (appdata) tried.push("file:///" + fwd(join(appdata, "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", file)));
+			let lastErr: any;
+			for (const href of tried) {
+				try {
+					return await import(href);
+				} catch (err) {
+					lastErr = err;
+				}
+			}
+			throw lastErr ?? new Error("pi's compaction module was not found in " + tried.length + " places");
 		})().catch((err) => {
 			// A failed lookup must not be remembered as a permanent answer: pi can be upgraded under us.
 			piCompactionMod = undefined;
@@ -1133,13 +1154,12 @@ export function loadConfig(): Config {
 		// Two settings the loader used to forget (2026-10-21, defect #41). A field that is not copied
 		// here is undefined at runtime AND vanishes from the file on the next write, so the setting
 		// reads as 'I changed it and it would not stick'. activeTemplateName is which library row shows
-		// ACTIVE and what Ctrl+P re-selects after a restart; summaryReceipt is the receipt block that
+		// ACTIVE and what Ctrl+P re-selects after a restart. The receipt block that used to ride inside
 		// closes a summary. Both are checked for shape like everything else above.
 		activeTemplateName:
 			typeof raw.activeTemplateName === "string" && raw.activeTemplateName.trim()
 				? raw.activeTemplateName
 				: base.activeTemplateName,
-		summaryReceipt: typeof raw.summaryReceipt === "boolean" ? raw.summaryReceipt : base.summaryReceipt,
 		// Read it or the operator can never switch it on: `missingConfigKeys` fails a setting the loader
 		// does not carry, which is how this field would have stayed permanently off while looking settable.
 		landWithoutAbort: typeof raw.landWithoutAbort === "boolean" ? raw.landWithoutAbort : base.landWithoutAbort,
@@ -1314,7 +1334,7 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
 /**
  * What each log event is CALLED on screen (2026-10-21). Kept next to LOG_CHATTER, which decides
  * whether a row is shown at all: this decides what a shown row says. The two lists answer different
- * questions, so an event can be visible with a plain name (compaction_landed -> COMPACTION END) or
+ * questions, so an event can be visible with a plain name (compaction_landed -> COMPACTED) or
  * hidden with one (auto_compaction_held).
  */
 const LOG_ROW_NAMES: Record<string, string> = {
@@ -1322,7 +1342,7 @@ const LOG_ROW_NAMES: Record<string, string> = {
 	attempt: "COMPACTION TRY",
 	ok: "COMPACTION SUMMARY",
 	done: "COMPACTION DONE",
-	compaction_landed: "COMPACTION END",
+	compaction_landed: "COMPACTED",
 	// The append path of #43 explaining itself is worth a row: it is the difference between "nothing
 	// happened" and "it fell back to the interrupting route, and here is why".
 	no_abort_landing_failed: "NO-ABORT LANDING FAILED",
@@ -1330,7 +1350,7 @@ const LOG_ROW_NAMES: Record<string, string> = {
 	direct_fail: "COMPACTION TRY FAILED",
 	give_up: "COMPACTION GAVE UP",
 	skip: "MODEL SKIPPED",
-	accepted_with_warnings: "COMPACTED, WITH WARNINGS",
+	accepted_with_warnings: "COMPACTION NOTES",
 	compaction_no_op: "NOTHING TO COMPACT",
 	compaction_failed: "COMPACTION FAILED",
 	auto_compaction_failed: "COMPACTION FAILED",
@@ -1343,6 +1363,12 @@ const LOG_ROW_NAMES: Record<string, string> = {
 };
 
 const LOG_CHATTER = new Set([
+	// Two rows that repeat what a neighbour says (2026-10-22): `done` is written the moment a finished
+	// summary is handed over and COMPACTED follows it in the same second; the notes row fires for about
+	// four summaries in ten, because a model-written summary is rarely exactly the shape asked for. Both
+	// stay in the file - if COMPACTED is ever missing, `done` proves the summary existed.
+	"done",
+	"accepted_with_warnings",
 	// Nothing writes these any more (the automatic continuation was deleted 2026-10-21), but the log file
 	// still holds years of them, and the results-only view must go on hiding them.
 	"auto_resume_waiting",
@@ -1445,7 +1471,7 @@ function tailLogPretty(lines = 16, verbose = false): string {
 					// The words a row starts with (2026-10-21, on request). The operator reads this view to see
 					// what the compactor DID, so the internal event names get plain ones: a run begins with
 					// COMPACTION START, each model tried is a COMPACTION TRY, and the moment the new context exists
-					// is COMPACTION END. An event that is not listed shows its own name in capitals, so a new
+					// is COMPACTED. An event that is not listed shows its own name in capitals, so a new
 					// record type can be unnamed for a while but never silently nameless.
 					const status = LOG_ROW_NAMES[String(d.event ?? "")] ?? String(d.event ?? "").toUpperCase();
 					// An accepted-with-warnings line must say WHAT was not as asked - the warnings array is the
@@ -2043,42 +2069,6 @@ export function appendTranscriptPointer(cfg: Config, ctx: Ctx, summary: string):
 	return summary;
 }
 
-/** One honest line at the TOP of every extension-written summary, readable by the next model and by a
- *  person expanding the compaction block (2026-10-18, because the figure pi can show there is only ever
- *  the size of the whole conversation before it was compacted - which looks nothing like the amount the
- *  summariser was really handed once elision and the kept tail are taken out). Deliberately short: it
- *  rides inside the summary, so every token of it is a token of context that stays.
- *
- *  It goes FIRST rather than last (2026-10-19 request, item (c) of the 19:15 report): a summary is the head
- *  of the next context, a folded chain carries the head forward, and pi shows the first lines when the
- *  block is collapsed - a receipt at the bottom is the one place it can be cut off or skimmed past.
- *  The name says 'with', not 'append', for that reason.
- */
-export function withCompactionReceipt(cfg: Config, ctx: Ctx, r: any, summary: string): string {
-	if (!cfg.summaryReceipt) return summary;
-	try {
-		const d = new Date();
-		const p = (n: number) => String(n).padStart(2, "0");
-		const off = -d.getTimezoneOffset();
-		const zone = off === 0 ? " UTC" : ` UTC${off > 0 ? "+" : "-"}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`;
-		const when = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}${zone}`;
-		const who = String(r?.ref ?? "").split(/[/\\]/).filter(Boolean).pop()?.replace(/-\d{5}-of-\d{5}\.gguf$/i, "").replace(/\.gguf$/i, "").slice(-48) || "the summariser";
-		const before = Number(r?.compaction?.tokensBefore);
-		const material = Number(r?.material);
-		const elided = Number(r?.elided);
-		const wrote = Number(r?.measured);
-		const bits: string[] = [];
-		if (Number.isFinite(before) && before > 0) bits.push(`the context held ${fmt(before)} tok`);
-		if (Number.isFinite(material) && material > 0) bits.push(`the summariser was handed ${fmt(material)} tok of material${Number.isFinite(elided) && elided > 0 ? ` (${fmt(elided)} tok elided out of the older part before it was sent)` : ""}`);
-		if (Number.isFinite(wrote) && wrote > 0) bits.push(`wrote ${fmt(wrote)} tok`);
-		if (!bits.length) return summary;
-		const secs = Number(r?.seconds);
-		return `Compacted ${when} by ${who}${Number.isFinite(secs) && secs > 0 ? ` in ${fmt(secs)} s` : ""}: ${bits.join(", ")}.\n\n${summary}`;
-	} catch {
-		/* best effort */
-	}
-	return summary;
-}
 function countWords(text: string): number {
 	return String(text).trim().split(/\s+/).filter(Boolean).length;
 }
@@ -3550,11 +3540,12 @@ export async function summarizeWithRotation(
 	}
 
 	const prevTurn = readPrevTurnInfo(ctx, preparation);
-	// The report on screen wants to name the models that were tried and lost, and `failures` is a local
-	// of this function. Pointing a module-level name at the same array costs one line and no plumbing: the
-	// pushes below land in it, and handleCompaction reads it when the compaction ends.
-	lastRotationFailures = failures;
 	const failures: string[] = [];
+	// The report on screen wants to name the models that were tried and lost, and `failures` is a local of
+	// this function. Pointing a module-level name at the same array costs one line and no plumbing. It MUST
+	// sit below the declaration: assigned above it, the read of `failures` is a temporal-dead-zone error,
+	// which threw out of the compaction handler on 2026-10-22 and let pi write its own short summary.
+	lastRotationFailures = failures;
 
 	// The session model's window decides how big the summary may be; see postCompactionHeadroom.
 	// A 29,000 token summary on 2026-09-16 pushed the next request past the window and killed the
@@ -6165,7 +6156,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "reserveTok",
-				label: "Reserve tokens before compaction:",
+				label: "Autocompaction trigger point:",
 				currentValue: (() => {
 					const win = (this.ctx as any)?.model?.contextWindow ?? 0;
 					const set = cfg.scaling.reserveTokens;
@@ -6174,8 +6165,8 @@ class CompactionMenu implements Component, Focusable {
 					// only, which was honest but unreadable as an editor: setting 30,000 while pi's own reserve was
 					// 30,600 printed 30,600 back, and the operator reasonably read that as the edit not taking
 					// (2026-10-22). The line is the setting now, so the two can only differ when no number is set.
-					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok free` : `automatic: ${fmt(eff)} tok free`;
-					const head = `${fmt(eff)} tok free - fires at ${fmt(triggerPoint(this.ctx))} of ${fmt(win)} tok`;
+					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok before a full window` : `automatic: ${fmt(eff)} tok before a full window`;
+					const head = `${fmt(eff)} tok before the full ${fmt(win)} tok window (fires at ${fmt(triggerPoint(this.ctx))} tok)`;
 					return set > 0
 						? head + (eff !== set ? ` (your ${fmt(set)} cannot fit this window; ${fmt(eff)} is used)` : "")
 						: head + ` (no number set: a tenth of the window, floor 16,384)`;
@@ -6192,8 +6183,8 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "preserveTok",
-				label: "Preserve tokens (verbatim tail):",
-				currentValue: `${fmt(extKeepRecent(this.ctx))} tok` + (cfg.scaling.preserveTokens !== extKeepRecent(this.ctx) ? ` (you set ${fmt(cfg.scaling.preserveTokens)}, the window allows less)` : ""),
+				label: "Preserve tail context:",
+				currentValue: `${fmt(extKeepRecent(this.ctx))} tok of the tail kept verbatim` + (cfg.scaling.preserveTokens !== extKeepRecent(this.ctx) ? ` (you set ${fmt(cfg.scaling.preserveTokens)}, this window keeps ${fmt(extKeepRecent(this.ctx))})` : ""),
 				values: [EDIT_NUMBER],
 				description:
 					"How much of the window is kept free for the conversation that stays word for word: the tail " +
@@ -6299,18 +6290,6 @@ class CompactionMenu implements Component, Focusable {
 				description:
 					"What the previous compaction summary becomes in the new one: folded into its own turn, attached whole, or dropped.",
 			},
-			{
-				id: "receipt",
-				label: "Receipt line at the end of a summary:",
-				currentValue: cfg.summaryReceipt ? "on" : "off",
-				values: ["on", "off"],
-				description:
-					"One short line closing every summary this extension writes: when the compaction ran, which model " +
-					"wrote it, how big the context was and how much material the summariser was really handed. It rides " +
-					"inside the summary, so a few tokens of context are spent on it, and the next model can read it. " +
-					"Added to the board 2026-10-21: the setting existed all along but had no row, and the loader did not " +
-					"read it back from the file either, so it silently did nothing either way.",
-			},
 			// 2026-10-07: moved here from the main board on request - both are compaction sizing, they
 			// belong next to the compaction switches, not on the top level.
 			{
@@ -6370,20 +6349,6 @@ class CompactionMenu implements Component, Focusable {
 								? `COMPACTION IS ON. WHO TIMERS DEPENDS ON PI'S OWN SWITCH: with pi's compaction enabled, pi's threshold is the doorbell and this extension's trigger point is the gate - the two are computed from the same window so they agree, and a hold only happens if pi's reserveTokens drift out of step; with pi's switched off, this extension's own check is the trigger. Either way THIS EXTENSION WRITES EVERY SUMMARY. Your start point is on the settings board. pi's settings are read, never written.`
 								: "THIS EXTENSION'S COMPACTION IS OFF, and nothing of it touches pi's settings. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS UNTIL ONE OF THE TWO IS ON."),
 					);
-					return;
-				}
-				// A top-level switch, not a per-model one: the receipt is appended after the summariser has
-				// finished, whatever model did the writing.
-				if (id === "receipt") {
-					const on = value === "on";
-					update((c) => void (c.summaryReceipt = on));
-					this.ctx.ui?.notify?.(
-						on
-							? "Summaries will end with the receipt line: when it ran, which model wrote it, what it was handed."
-							: "Receipt line off. Summaries end with the summary itself, as they have been doing.",
-							"info",
-					);
-					(this as unknown as { rebuild?: () => void }).rebuild?.();
 					return;
 				}
 				// The settings that are one setting for every model: the first model in the try order stands
@@ -7631,8 +7596,8 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
  */
 const NUMBER_EDITORS: Record<string, { title: string; lo: number; hi: number; unit: string; def: number; apply: (v: number) => string | undefined }> = {
 	retryWait: { title: "Wait between retries", lo: 0, hi: 300, unit: "seconds", def: 5, apply: (v) => { update((c) => void (c.retryDelaySeconds = v)); return undefined; } },
-	reserveTok: { title: "Reserve tokens before compaction", lo: 0, hi: 10_000_000, unit: "tokens left free above the line (0 = pi's own reserve)", def: 0, apply: (v) => { update((c) => void (c.scaling.reserveTokens = v)); return undefined; } },
-	preserveTok: { title: 'Preserve tokens (the verbatim tail)', lo: 1024, hi: 10_000_000, unit: 'tokens', def: 20_000, apply: (v) => { update((c) => void (c.scaling.preserveTokens = v)); return undefined; } },
+	reserveTok: { title: "Autocompaction trigger point", lo: 0, hi: 10_000_000, unit: "tokens before the full context window size (0 = pi's own reserve)", def: 0, apply: (v) => { update((c) => void (c.scaling.reserveTokens = v)); return undefined; } },
+	preserveTok: { title: 'Preserve tail context', lo: 1024, hi: 10_000_000, unit: 'tokens of the context tail preserved verbatim', def: 20_000, apply: (v) => { update((c) => void (c.scaling.preserveTokens = v)); return undefined; } },
 	elisionStart: { title: "Elision start", lo: 1, hi: 99, unit: "percent of window", def: 70, apply: (v) => { update((c) => void (c.elision = { ...c.elision, softPercent: v })); return undefined; } },
 	elisionProtect: { title: "Elision protect (tool results)", lo: 0, hi: 1_000_000, unit: "tokens", def: 20_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, protectRecentTokens: v })); return undefined; } },
 	elisionTail: { title: "Stub tail", lo: 0, hi: 100_000, unit: "chars (0 = none; 'full' is a separate row value)", def: 200, apply: (v) => { update((c) => void (c.elision = { ...c.elision, stubTailChars: v })); return undefined; } },
@@ -8149,8 +8114,9 @@ const agentLoop = {
 	lastSettledAtMs: 0,
 	lastAbortAtMs: 0,
 };
-/** The pause is at most half an hour in this build (see auto_compaction_resumed); three refusals in a
- *  quarter of an hour mean the trigger is firing somewhere it cannot possibly find work, so park it. */
+/** A park has no clock (2026-10-17): only a manual compaction re-arms the trigger, which is what logs
+ *  `auto_compaction_resumed`. Three no-op strikes inside a quarter of an hour mean the trigger is
+ *  firing somewhere it cannot possibly find work, so park it. */
 const noOpStrikes = { n: 0, windowStartMs: 0 };
 let settleCheckTimer: ReturnType<typeof setTimeout> | undefined;
 /** "Over the line but not at a safe point" is written down at most once a minute. */
@@ -8638,7 +8604,29 @@ export function failureRowLabel(ref: string): string {
  *  per model joined with ' | ', and in the ordinary case - the model wrote far too few or far too many
  *  tokens - each of those strings already carries the number that was measured and the limit it broke,
  *  which is exactly the information that used to be buried in the log. So: a header, one row per model,
- *  then what the trigger does next. */
+/** The row set shown when a compaction STARTS: enough to know what is running and how full the
+ *  session is, without waiting for the result. Built as a pure function so a rig can read it. */
+export function compactionStartLines(cfg: any, ctx: any, reason: string): string[] {
+	const win = Number(ctx?.model?.contextWindow ?? 0);
+	const fill = realContextTokens(ctx);
+	const keep = Number(cfg?.scaling?.preserveTokens ?? 0);
+	const kind = reason === "manual" ? "manual" : `automatic (${reason})`;
+	const out = [
+		`COMPACTION START · ${kind} · context ${fmt(fill)} of ${fmt(win)} tok` +
+			(win > 0 ? ` (${Math.round((fill / win) * 100)}% full)` : "") +
+			(keep > 0 ? ` · newest ${fmt(keep)} tok will be kept word for word` : ""),
+	];
+	try {
+		const { candidates } = buildRotation(cfg, ctx as any);
+		const names = candidates.map((c: any) => failureRowLabel(String(c.ref)));
+		if (names.length) out.push(`COMPACTION START · models in order: ${names.slice(0, 4).join(", ")}${names.length > 4 ? ` +${names.length - 4} more` : ""}`);
+	} catch {
+		/* the list is a courtesy; the compaction does not depend on it */
+	}
+	return out;
+}
+
+/** A failed compaction names the models that refused and says why, then what the trigger does next. */
 export function compactionFailureNoticeLines(error: string, note: string): string[] {
 	const parts = String(error).split(" | ").map((p) => p.trim()).filter(Boolean);
 	const named = parts.filter((p) => p.includes(": "));
@@ -9092,6 +9080,15 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		compactionInFlight = true;
 		try {
 			return await handleCompaction(event, ctx);
+		} catch (err: any) {
+			// A crash inside our own compaction must never turn into "pi writes a summary instead". On
+			// 2026-10-22 a plain coding error escaped from here, pi fell back to its own summariser, and it
+			// produced ~7k-token summaries while the operator was trying to stop the whole thing. Cancel,
+			// say so on screen, and leave the session's context alone.
+			const why = String(err?.stack ?? err?.message ?? err).split("\n").slice(0, 3).join(" | ").slice(0, 300);
+			logLine(loadConfig(), { event: "compaction_failed", error: why, note: "the extension's own compaction threw; pi's summarizer was NOT allowed to substitute", trigger: lastCompactionTrigger });
+			ctx?.ui?.notify?.(`COMPACTION FAILED · the extension's own compaction hit an internal error and was cancelled; pi's summarizer was not substituted: ${why.slice(0, 140)}`, "error");
+			return { cancel: true };
 		} finally {
 			compactionInFlight = false;
 		}
@@ -9178,7 +9175,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		}
 		// The two things pi's `session_compact` event did for us, done here: the watcher must know a
 		// compaction just landed (it refuses to start another one while the size is unmeasured), and the
-		// log must carry the COMPACTION END row with the size that landed.
+		// log must carry the COMPACTED row with the size that landed.
 		lastCompactionDoneAtMs = Date.now();
 		logLine(cfg, {
 			event: "compaction_landed",
@@ -9277,6 +9274,10 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			models: refs,
 			sessionModel: ctx.model ? refOf(ctx.model) : "?",
 		});
+		// The same information the log gets, on the screen, BEFORE the summariser starts: which trigger
+		// fired, how full the context is, and which models are about to be tried. A compaction takes
+		// minutes, and with nothing on screen it reads as a hang (2026-10-22).
+		announceCompaction(ctx, compactionStartLines(cfg, ctx, String(event.reason ?? "manual")), "info");
 		ctx.ui?.setStatus?.("compact-plus", `compacting via ${rotationText(cfg, ctx)} ...`);
 		let outcome;
 		try {
@@ -9291,7 +9292,17 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				// The automatic trigger here is this extension's own: it measures the live context and starts
 				// the compaction itself, so with pi's flag off automatic compaction still works - and pi never
 				// writes a summary of its own. The coupling that armed pi's flag is deleted for good.
-				pauseAutoCompaction(ctx, "you stopped the compaction", outcome.error);
+				// A STOP MEANS STOP, BUT ONLY IN THE SESSION AND THE MODE IT HAPPENED IN. Stopping a compaction you
+				// started yourself (/compact, the menu) says nothing about the automatic trigger - you were testing, or
+				// you changed your mind about that one run. Stopping one the extension started on its own is a stop to
+				// the automation, and parks it until a manual compaction re-arms it (2026-10-22: the manual case
+				// parked it as well, and the operator watched an automatic run arrive after saying "not now").
+				if (trigger === "manual") {
+					logLine(cfg, { event: "compaction_cancelled", trigger, note: "a manual compaction was stopped; the automatic trigger is untouched" });
+					ctx.ui?.notify?.("COMPACTION CANCELLED - the manual compaction was stopped. The automatic trigger is untouched.", "info");
+					return { cancel: true };
+				}
+				pauseAutoCompaction(ctx, "you stopped the automatic compaction", outcome.error);
 				return { cancel: true };
 			}
 			autoFailure.fails += 1;
@@ -9310,12 +9321,12 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				return { cancel: true };
 			}
 			pauseAutoCompaction(ctx, "compaction failed twice", outcome.error);
-			logLine(cfg, { event: "give_up", error: outcome.error, trigger, note: "automatic attempts rest for 30 minutes; pi's stock summarizer was NOT allowed to run" });
+			logLine(cfg, { event: "give_up", error: outcome.error, trigger, note: "the automatic trigger is parked for this session until a manual compaction re-arms it; pi's stock summarizer was NOT allowed to run" });
 			announceCompaction(
 				ctx,
 				compactionFailureNoticeLines(
 					outcome.error,
-					"every candidate failed: automatic compaction rests for 30 minutes and pi's own summarizer will NOT be substituted. Fix the model list, or run a manual compaction, which is allowed right away.",
+					"every candidate failed: the automatic trigger is now PARKED for this session and will not try again by itself. pi's own summarizer is deliberately never substituted. Run /compact - it works right away and re-arms the automatic trigger.",
 				),
 				"error",
 			);
@@ -9338,7 +9349,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		} catch {
 			/* counter is best-effort */
 		}
-		r.compaction.summary = withCompactionReceipt(cfg, ctx, r, r.compaction.summary);
 		r.compaction.summary = appendTranscriptPointer(cfg, ctx, r.compaction.summary);
 		logLine(cfg, {
 				event: "done",
