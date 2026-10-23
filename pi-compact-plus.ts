@@ -2011,11 +2011,43 @@ export function withBudget(preparation: any, genCap: number): any {
  * estimated slightly above pi's chars/4, because bullet summaries with numbers and paths tokenize
  * denser than prose.
  */
-export function measuredTokens(summary: string, usage: any): { tokens: number; by: "usage" | "estimate" } {
+/** The engine is the only counter that matters (the operator's rule, 2026-10-21). Where the server
+ *  tells us how many tokens it wrote, that number is the answer. Where it tells us nothing, the word
+ *  count is the next best thing: counting words is free, and one number per word beats one number per
+ *  character, because the ratio between words and tokens is stable for a given tokenizer. So the ratio
+ *  is LEARNED per model from the pairs we do get - every time an engine reports tokens for a text whose
+ *  words we counted, that model's tokens-per-word is remembered for the next time it stays silent. */
+const tokPerWord = new Map<string, number>();
+const TOK_PER_WORD_DEFAULT = 1.35;
+
+function tokPerWordFor(ref: string): number {
+	return tokPerWord.get(String(ref ?? "")) ?? TOK_PER_WORD_DEFAULT;
+}
+
+/** Only trust a measurement over a real stretch of text, and only inside sane bounds: a 40-word answer
+ *  or a ratio of six tokens per word says more about that one reply than about the tokenizer. */
+function learnTokPerWord(ref: string, tokens: number, words: number): void {
+	if (!ref || words < 200 || tokens <= 0) return;
+	const r = tokens / words;
+	if (r < 0.6 || r > 3) return;
+	tokPerWord.set(String(ref), Math.round(r * 1000) / 1000);
+}
+
+export function measuredTokens(
+	summary: string,
+	usage: any,
+	ref = "",
+): { tokens: number; by: "usage" | "words" | "chars" } {
+	const words = countWords(summary);
 	if (usage && typeof usage.output === "number" && usage.output > 0) {
 		const reasoning = typeof usage.reasoning === "number" ? usage.reasoning : 0;
-		return { tokens: Math.max(0, usage.output - reasoning), by: "usage" };
+		const tokens = Math.max(0, usage.output - reasoning);
+		learnTokPerWord(ref, tokens, words);
+		return { tokens, by: "usage" };
 	}
+	if (words > 0) return { tokens: Math.ceil(words * tokPerWordFor(ref)), by: "words" };
+	// No words at all - a summary of nothing but symbols, or an empty reply. The character ruler is the
+	// last thing left standing, and it is a last resort, not a habit.
 	return { tokens: Math.ceil((summary.length * 1.15) / 4), by: "estimate" };
 }
 
@@ -3744,8 +3776,10 @@ export async function summarizeWithRotation(
 				const summary: string = cleaned.summary;
 				const words = countWords(summary);
 				const u: any = raw.usage ?? {};
-				let measured = measuredTokens(summary, u);
-			if (th.level !== "off") measured = { tokens: Math.ceil((summary.length * 1.15) / 4), by: "estimate" };
+				let measured = measuredTokens(summary, u, c.ref);
+				// Thinking on means the engine's output figure includes the hidden part, so the count comes
+				// from the words instead - the same ruler as everywhere else, not a character guess.
+				if (th.level !== "off") measured = measuredTokens(summary, null, c.ref);
 				if (cleaned.strippedChars > 0 && measured.by === "usage") {
 					measured = { tokens: Math.max(0, measured.tokens - Math.ceil((cleaned.strippedChars * 1.15) / 4)), by: "usage" };
 				}
@@ -3890,8 +3924,10 @@ export async function summarizeWithRotation(
 			const summary: string = cleaned.summary;
 			const words = countWords(summary);
 			const u: any = compaction?.usage ?? {};
-			let measured = measuredTokens(summary, u);
-			if (th.level !== "off") measured = { tokens: Math.ceil((summary.length * 1.15) / 4), by: "estimate" };
+			let measured = measuredTokens(summary, u, c.ref);
+			// Thinking on means the engine's output figure includes the hidden part, so the count comes
+			// from the words instead - the same ruler as everywhere else, not a character guess.
+			if (th.level !== "off") measured = measuredTokens(summary, null, c.ref);
 			// That rough work rode inside the provider's output count; take its estimate back out so the
 			// acceptance window measures only the summary that will be stored.
 			if (cleaned.strippedChars > 0 && measured.by === "usage") {
