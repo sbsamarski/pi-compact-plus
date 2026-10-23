@@ -1362,7 +1362,7 @@ const LOG_ROW_NAMES: Record<string, string> = {
 	auto_compaction_held: "HELD",
 };
 
-const LOG_CHATTER = new Set([
+const LOG_CHATTER = new Set(["user_prompts", // one per candidate that passed its checks; COMPACTED carries the figures
 	// Two rows that repeat what a neighbour says (2026-10-22): `done` is written the moment a finished
 	// summary is handed over and COMPACTED follows it in the same second; the notes row fires for about
 	// four summaries in ten, because a model-written summary is rarely exactly the shape asked for. Both
@@ -1497,7 +1497,7 @@ function tailLogPretty(lines = 16, verbose = false): string {
 					// A landed summary is a result with a size, and the size is the figure worth keeping
 					// in view next to the aim it was asked for (2026-10-21: "only compaction and elision entries
 					// there with their data').
-					const summary = typeof d.summaryTokens === "number" ? `summary ${fmt(d.summaryTokens)} tok` : "";
+					const summary = typeof d.summaryTokens === "number" ? `summary ${fmt(d.summaryTokens)} tok` + (typeof d.measured === "number" && typeof d.min === "number" ? ` (asked ${fmt(d.min)}-${fmt(d.max)} tok, ${fmt(d.words ?? 0)} words written)` : "") + (typeof d.quoted === "number" && typeof d.given === "number" ? `, user prompts quoted ${d.quoted} of ${d.given}` : "") + (Array.isArray(d.failures) && d.failures.length ? `, after ${d.failures.length} candidate(s) tried and lost` : "") : "";
 					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, summary, note].filter(Boolean).join(" · ");
 				} catch {
 					return l.slice(0, 400);
@@ -2031,6 +2031,14 @@ function learnTokPerWord(ref: string, tokens: number, words: number): void {
 	const r = tokens / words;
 	if (r < 0.6 || r > 3) return;
 	tokPerWord.set(String(ref), Math.round(r * 1000) / 1000);
+}
+
+/** The size shown on the COMPACTED row: the engine's own count of what the winning model wrote when we
+ *  have it, the word ruler when we do not. A character guess is never allowed to sit beside the
+ *  engine's number as a second answer to the same question. */
+function landedSummarySize(info: any, text: string): number {
+	if (info && typeof info.measured === "number" && info.measured > 0) return info.measured;
+	return measuredTokens(text, null, info?.ref ?? "").tokens;
 }
 
 export function measuredTokens(
@@ -8924,7 +8932,10 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			event: "compaction_landed",
 			reason: (event as any)?.reason,
 			fromExtension: Boolean((event as any)?.fromExtension),
-			summaryTokens: Math.round((((entry?.summary ?? '') as string).length * 1.15) / 4),
+			// One figure, not two: when the engine told us what the summary cost, that is the size on the row.
+			// The old character estimate of the stored text sat beside it as a second, different number
+			// (13,090 against an engine count of 12,355) and both looked authoritative.
+			summaryTokens: landedSummarySize(lastLandingInfo, String(entry?.summary ?? c?.summary ?? "")),
 			handoff: true,
 			// No note: the 45-second floor this used to repeat is the trigger's own arithmetic, and this row
 			// is a result the operator reads for one number - the size of the summary that landed.
@@ -9264,13 +9275,28 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			event: "compaction_landed",
 			reason: "threshold",
 			fromExtension: true,
-			summaryTokens: Math.round((String(c.summary).length * 1.15) / 4),
+			// One figure, not two: when the engine told us what the summary cost, that is the size on the row.
+			// The old character estimate of the stored text sat beside it as a second, different number
+			// (13,090 against an engine count of 12,355) and both looked authoritative.
+			summaryTokens: landedSummarySize(lastLandingInfo, String(entry?.summary ?? c?.summary ?? "")),
 			handoff: false,
 			noAbort: true,
 			source: why,
 			entry: String(entryId ?? "").slice(0, 12),
 			...lastLandingInfo,
 		});
+// The closing block on screen, the same one the interrupting route prints. Both routes announce the
+		// opening row; until now only that one route announced the end, so a compaction that landed
+		// without an interrupt left the operator reading a start row and then silence (2026-10-23).
+		announceCompaction(
+			ctx,
+			compactionNoticeLines({ ...lastLandingInfo, summary: c.summary, firstKeptEntryId: c.firstKeptEntryId }, {
+				before: realContextTokens(ctx),
+				window: ctx?.model?.contextWindow ?? 0,
+				keepRecent: extKeepRecent(ctx),
+				failures: lastRotationFailures,
+				trigger: lastLandingInfo?.trigger ?? "auto",
+			}),);
 		return { ok: true };
 	}
 	// The top-level watcher reaches the nested routine through this single assignment.
@@ -9430,7 +9456,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			max: r.max, words: r.words, via: (r as any).via, before: realContextTokens(ctx),
 			window: (ctx as any)?.model?.contextWindow ?? 0, reason: event.reason,
 			// Every candidate that was tried and lost, on the row that says the compaction landed.
-			failures: lastRotationFailures,
+			failures: lastRotationFailures, quoted: lastSummaryQuote.quoted, given: lastSummaryQuote.given,
 		};
 		announceCompaction(
 			ctx,
