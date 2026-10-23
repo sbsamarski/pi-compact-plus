@@ -8843,16 +8843,20 @@ export function shortModelName(ref: string): string {
 
 /** A run length the way a person reads it: 12.4s, 11m 38.1s, 1h 04m 03s. The log file keeps plain
  *  seconds so the numbers stay machine-readable; everywhere a human reads the figure, this is the
- *  shape it takes (2026-10-24, on request: "698.1 s should be completed in 11m 38.1s"). */
+ *  shape it takes (2026-10-24, on request). Whole seconds only - no decimals. */
 export function fmtDuration(seconds: any): string {
 	const s = Number(seconds);
 	if (seconds === null || seconds === undefined || !Number.isFinite(s) || s < 0) return "";
-	if (s < 60) return `${s.toFixed(1)}s`;
-	const h = Math.floor(s / 3600);
-	const m = Math.floor((s % 3600) / 60);
-	const rest = s % 60;
-	if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${rest.toFixed(0).padStart(2, "0")}s`;
-	return `${m}m ${rest.toFixed(1)}s`;
+	// Whole seconds everywhere a person reads a duration (2026-10-24: "no need to show the decimal").
+	// The total is rounded FIRST, so a run of 59.7 seconds cannot be printed as 0m 60s.
+	const t = Math.round(s);
+	if (t === 0) return s > 0 ? "<1s" : "0s";
+	const h = Math.floor(t / 3600);
+	const m = Math.floor((t % 3600) / 60);
+	const rest = t % 60;
+	if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(rest).padStart(2, "0")}s`;
+	if (m > 0) return `${m}m ${String(rest).padStart(2, "0")}s`;
+	return `${t}s`;
 }
 
 
