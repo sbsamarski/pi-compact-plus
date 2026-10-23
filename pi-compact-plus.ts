@@ -1449,7 +1449,7 @@ function tailLogPretty(lines = 16, verbose = false): string {
 					const when = String(d.ts ?? "");
 					const stamp = `${when.slice(0, 10)} ${when.slice(11, 19)}`;
 					const ref = d.ref ? String(d.ref).split("/").pop()?.slice(0, 34) : "";
-					const seconds = typeof d.seconds === "number" ? `${d.seconds}s` : "";
+					const seconds = typeof d.seconds === "number" ? fmtDuration(d.seconds) : "";
 					// Transfer figures: pi's own provider counts when present, otherwise the estimate.
 					const tokIn = typeof d.input === "number" ? d.input : undefined;
 					const tokOut = typeof d.output === "number" ? d.output : typeof d.measured === "number" ? d.measured : undefined;
@@ -7327,38 +7327,34 @@ function stampOfLocal(ts: any): string {
  *  check the wording without opening a terminal. `run` is the record of the summariser's request and is
  *  passed only when it belongs to the same run. */
 export function compactionSummaryHeader(entry: any, landed: any, run: any, window: number): string {
+	// One paragraph, broken by the terminal's own width. Hard line breaks in the middle of a sentence
+	// are what cut the row off before (2026-10-24: "some lines are cut at an earlier point").
+	const cols = Math.max(60, Math.min(200, Number((globalThis as any)?.process?.stdout?.columns ?? 100) - 2));
+	const BR = String.fromCharCode(10); // the line break, named, so this block stays readable
 	const sameRun = !landed || !run || !landed.ref || landed.ref === run.ref;
 	const win = Number(window ?? 0);
-	return [
-		`LAST COMPACTION · ${stampOfLocal(landed?.ts ?? entry?.timestamp)}` +
-			(landed
-				? ` · started by ${landed.reason === "manual" ? "you" : "the automatic trigger"}` +
-					(landed.noAbort ? ", landed without stopping the turn" : ", landed by stopping the turn")
-				: " · how it started is not in the log"),
-		`${landed?.ref ?? run?.ref ?? "model not recorded"}` +
-			(landed?.seconds ? ` · wrote it in ${landed.seconds} s` : "") +
-			(landed?.via ? ` (via ${landed.via})` : ""),
-		(sameRun && run?.input
-			? `tokens · the summariser read ${fmt(run.input)} tok and wrote ${fmt(landed?.measured ?? run.measured ?? 0)} tok`
-			: `tokens · wrote ${fmt(landed?.measured ?? 0)} tok` + (landed?.measuredBy ? ` (${landed.measuredBy})` : "")) +
-			(landed?.words ? `, ${fmt(landed.words)} words` : "") +
-			(typeof landed?.min === "number" ? `, asked for ${fmt(landed.min)}-${fmt(landed.max)} tok` : ""),
-		`context · ${fmt(landed?.before ?? entry?.tokensBefore ?? 0)} tok` +
+	const parts: string[] = [];
+	parts.push(
+		`LAST COMPACTION · ${stampOfLocal(landed?.ts ?? entry?.timestamp)} ·` +
+			(landed ? (landed.reason === "manual" ? " manual compaction" : " autocompaction") : " compaction"),
+	);
+	const who = landed?.ref ?? run?.ref;
+	parts.push((who ? shortModelName(who) : "model not recorded") + (landed?.seconds ? ` · completed in ${fmtDuration(landed.seconds)}` : ""));
+	parts.push(
+		sameRun && run?.input
+			? `read ${fmt(run.input)} tok, wrote ${fmt(landed?.measured ?? run.measured ?? 0)} tok`
+			: `wrote ${fmt(landed?.measured ?? 0)} tok` + (landed?.measuredBy ? ` (${landed.measuredBy})` : ""),
+	);
+	if (landed?.words) parts.push(`${fmt(landed.words)} words`);
+	if (typeof landed?.min === "number") parts.push(`asked for ${fmt(landed.min)}-${fmt(landed.max)} tok`);
+	parts.push(
+		`context ${fmt(landed?.before ?? entry?.tokensBefore ?? 0)} tok` +
 			(win ? ` of a ${fmt(win)} tok window` : "") +
-			`, summary as stored ${fmt(String(entry?.summary ?? "").length)} characters, entry ${String(entry?.id ?? "").slice(0, 8)}` +
-			`, tail kept word for word from entry ${String(entry?.firstKeptEntryId ?? "").slice(0, 8)}`,
-		(landed && typeof landed.quoted === "number" && typeof landed.given === "number"
-			? `user prompts · ${landed.quoted} of ${landed.given} quoted`
-			: "user prompts · not recorded") +
-			(Array.isArray(landed?.failures) && landed.failures.length
-				? ` · after ${landed.failures.length} candidate(s) tried and lost`
-				: landed
-					? " · the first candidate wrote it"
-					: ""),
-		"",
-		"THE SUMMARY, exactly as the session now holds it:",
-		"",
-	].join("\n");
+			` · summary as stored ${fmt(String(entry?.summary ?? "").length)} characters`,
+	);
+	const paragraph = parts.join(" · ");
+	const rule = "-".repeat(cols);
+	return wrapToWidth(paragraph, cols).join(BR) + BR + BR + "THE SUMMARY, exactly as the session now holds it:" + BR + rule + BR + BR;
 }
 
 
@@ -8806,7 +8802,7 @@ export function compactionNoticeLines(
 	out.push(
 		`COMPACTION · ${opts.trigger === "manual" ? "you asked for it" : "automatic"} · summary by ${slotLabel(r.ref, r.model)}` +
 			(r.via === "direct" ? " (direct request)" : "") +
-			(typeof r.seconds === "number" ? ` · ${r.seconds}s` : ""),
+			(typeof r.seconds === "number" ? ` · ${fmtDuration(r.seconds)}` : ""),
 	);
 	out.push(
 		`COMPACTION · read ${fmt(r.input ?? r.material ?? 0)} tok -> wrote ${fmt(r.measured)} tok` +
@@ -8837,6 +8833,29 @@ function announceCompaction(ctx: any, out: string[], kind: "info" | "warning" | 
 /** A short, readable name for a model out of its reference alone - the failure rows have the reference
  *  and not the model object. `http://127.0.0.1:9931/qwen3.8-flash…` becomes the file it is serving, and
  *  `openrouter/z-ai/glm-5.3-flash` keeps its family, because dropping `z-ai` would make it ambiguous. */
+/** Just the model's own name, the way pi's status line shows it: the last piece of a reference, with the
+ *  server address, the provider prefix and any query string stripped off. `llama-server=http://127.0.0.1:
+ *  9931/qwen3.8-flash…` becomes `qwen3.8-flash…`; `openrouter/z-ai/glm-5.3-flash` becomes `glm-5.3-flash`. */
+export function shortModelName(ref: string): string {
+	const parts = String(ref ?? "").split("?")[0].split("/").filter(Boolean);
+	return parts[parts.length - 1] || String(ref ?? "");
+}
+
+/** A run length the way a person reads it: 12.4s, 11m 38.1s, 1h 04m 03s. The log file keeps plain
+ *  seconds so the numbers stay machine-readable; everywhere a human reads the figure, this is the
+ *  shape it takes (2026-10-24, on request: "698.1 s should be completed in 11m 38.1s"). */
+export function fmtDuration(seconds: any): string {
+	const s = Number(seconds);
+	if (seconds === null || seconds === undefined || !Number.isFinite(s) || s < 0) return "";
+	if (s < 60) return `${s.toFixed(1)}s`;
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	const rest = s % 60;
+	if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${rest.toFixed(0).padStart(2, "0")}s`;
+	return `${m}m ${rest.toFixed(1)}s`;
+}
+
+
 export function failureRowLabel(ref: string): string {
 	const bare = String(ref).replace(/^https?:\/\//, "").replace(/\.gguf$/i, "");
 	const parts = bare.split("/").filter(Boolean);
