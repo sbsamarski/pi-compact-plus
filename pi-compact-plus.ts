@@ -3751,8 +3751,13 @@ export async function summarizeWithRotation(
 				}
 				const split = { output: u.output, reasoning: u.reasoning };
 				const dFail = (reason: string): Error => {
-					logLine(cfg, { event: "fail", ref: c.ref, via: "direct", seconds: dSeconds, measured: measured.tokens, min: realSizes.min, max: realSizes.max, words, reason, ...split });
-					return new Error(reason);
+					logLine(cfg, { event: "fail", note: "moving to the next candidate; pi's compact() runs only after every candidate failed", ref: c.ref, via: "direct", seconds: dSeconds, measured: measured.tokens, min: realSizes.min, max: realSizes.max, words, reason, ...split });
+					// ONE ROW PER FAILED CANDIDATE (2026-10-23). The rich row written just above IS the record
+					// of this failure; the catch below used to write a second, thinner one for the same thing,
+					// and the log filled up with pairs of nearly identical lines.
+					const dErrLogged: any = new Error(reason);
+					dErrLogged.alreadyLogged = true;
+					return dErrLogged;
 				};
 				if (timedOut)
 				throw dFail(
@@ -3854,7 +3859,7 @@ export async function summarizeWithRotation(
 					// error "aborted": the library swallows the reason our own clock gave, so the two numbers that
 					// distinguish a dead request (a clock fired, nothing arriving) from a slow one (the ceiling
 					// fired while characters were still coming) are recorded here instead of in its message.
-					logLine(cfg, { event: "direct_fail", ref: c.ref, clock: timedOut || undefined, chars: dChars || undefined, error: String(dErr?.message ?? dErr).slice(0, 220), stop: dErr?.stopReason, inTok: dErr?.usage?.input, outTok: dErr?.usage?.output, reasonTok: dErr?.usage?.reasoning, note: "moving to the next candidate; pi's compact() runs only after every candidate failed" });
+				if (!dErr?.alreadyLogged) logLine(cfg, { event: "direct_fail", ref: c.ref, clock: timedOut || undefined, chars: dChars || undefined, error: String(dErr?.message ?? dErr).slice(0, 220), stop: dErr?.stopReason, inTok: dErr?.usage?.input, outTok: dErr?.usage?.output, reasonTok: dErr?.usage?.reasoning, note: "moving to the next candidate; pi's compact() runs only after every candidate failed" });
 				failures.push(`${c.ref}: direct: ${String(dErr?.message ?? dErr).split("\n")[0].slice(0, 100)}`);
 				combined.dispose();
 				continue;
@@ -9296,6 +9301,22 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		const history = historyTokensOnly(prep);
 		const overhead = fixedRequestTokens(ctx);
 		const fill = realContextTokens(ctx);
+		// THE SAME OPENING ROW ON SCREEN FOR BOTH ROUTES (2026-10-23): a compaction you started and one the
+		// trigger started tell you the same thing at the same moment - who asked, how full the session is,
+		// how much of the tail survives. The result block at the end already read the same.
+		{
+			const win0 = ctx?.model?.contextWindow ?? 0;
+			const at0 = realContextTokens(ctx);
+			announceCompaction(
+				ctx,
+				[
+					`COMPACTION START · ${lastCompactionTrigger === "manual" ? "manual" : "automatic"} · context ${fmt(at0)} of ${fmt(win0)} tok` +
+						(win0 > 0 ? ` (${Math.round((at0 / win0) * 100)}% full)` : "") +
+						` · newest ${fmt(extKeepRecent(ctx))} tok kept word for word`,
+				],
+				"info",
+			);
+		}
 		ctx.ui?.setStatus?.("compact-plus", `compacting via ${rotationText(cfg, ctx)} ...`);
 		let outcome;
 		try {
