@@ -3882,6 +3882,8 @@ export async function summarizeWithRotation(
 				// What this model just proved about its own speed, in the units the backstop thinks in.
 				if (dSeconds > 0 && measured.tokens > 0) observedRate.set(c.ref, measured.tokens / dSeconds);
 				logLine(cfg, { event: "ok", ref: c.ref, via: "direct", kind: c.kind, tokPerSec: dSeconds > 0 ? Math.round((measured.tokens / dSeconds) * 10) / 10 : undefined, seconds: dSeconds, measured: measured.tokens, measuredBy: measured.by, segmentBy: raw.segmentBy, fromReasoning: raw.fromReasoning || undefined, roughWorkStripped: cleaned.strippedChars || undefined, min: realSizes.min, target: realSizes.target, max: realSizes.max, words, stubsIn: inStubs || undefined, stubsCopied: gotStubs || undefined, input: u.input, output: u.output, reasoning: u.reasoning });
+				lastSummaryQuote.quoted = Number(upc.linesAnywhere) || 0;
+				lastSummaryQuote.given = Number(given) || 0;
 				logLine(cfg, { event: "user_prompts", ref: c.ref, quoted: upc.linesAnywhere, given, ledgerTurns: upc.turns, ledgerQuoted: upc.withPrompt });
 				const compaction = {
 					summary: summary + fileOpsAppendix(preparation.fileOps),
@@ -6701,40 +6703,23 @@ export class CompactionBoard implements Component, Focusable {
 				"Old tool results are replaced by short stubs in the requests the model receives, so the context stays much lower for much longer; your screen and the session file always keep the originals. The submenu holds the on/off toggle and all six settings. Enter opens it; Enter on a setting opens its editor (over the plain chat, with the position restored afterwards).",
 		});
 		rows.push({
-			id: "elisionNow",
-			label: "Run elision now",
-			currentValue: "Run the elision now",
-			values: ["Run the elision now"],
+			id: "runNow",
+			label: "Run now",
+			currentValue: "",
+			values: [],
+			submenu: (_current: string, done: (selectedValue?: string) => void) =>
+				new SettingsList(
+					this.runNowItems(),
+					Math.min(this.runNowItems().length + 2, 8),
+					getSettingsListTheme(),
+					(id: string, value: string) => this.onChange(id, value),
+					() => done(),
+					{ enableSearch: false },
+				) as unknown as Component,
 			description:
-			"Runs an elision sweep RIGHT NOW, regardless of the start percentage and the batch thresholds: every tool result outside the preserved tail becomes a stub (the board closes, the stubs persist in the session state, and the next request carries them). Use it when you can see the context climbing and do not want to wait for the sweep to accumulate candidates.",
-		});
-		rows.push({
-			id: "compactNow",
-			label: "Run compaction now",
-			currentValue: "Run the compaction now",
-			values: ["Run the compaction now"],
-			description:
-				"Starts a compaction RIGHT NOW: pi prepares the session and the Compaction models rotation answers it (the board closes so you can watch the progress). The automatic starter lives in the Auto-compaction submenu's trigger point - when the ctx crosses it while pi is idle, the same compaction starts by itself.",
-		});
-		rows.push({
-			id: "compactNowResume",
-			label: "Run compaction now and resume the session",
-			currentValue: "Run the compaction, keep the turn going",
-			values: ["Run the compaction, keep the turn going"],
-			description:
-				"Same rotation as the row above, but the summary is written at a safe point WITHOUT stopping the " +
-				"turn: the session goes on by itself on the short history, so you can leave the machine and come " +
-				"back to a running session. Use this when you want the room cleared and the work to continue; use " +
-				"the row above when you want the session to stop and wait for you. If no safe point can be used it " +
-				"says so and writes nothing - the ordinary row is right above it.",
-		});
-		rows.push({
-			id: "compactStock",
-			label: "Run pi's built-in compaction now",
-			currentValue: `Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
-			values: [`Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`],
-			description:
-				"Runs pi's OWN compaction once, bypassing the rotation: pi prepares the session and summarizes with the active model, aiming at 0.8 x its reserveTokens (the number on the right). Use it to compare pi's stock summary with the extension's. Everything else (the rotation, the gates) stays in place for the next compaction.",
+				"Four actions that ignore the schedules and run this second: an elision sweep, a compaction" +
+				" (the extension's rotation), the same compaction WITHOUT stopping the session, and pi's own" +
+				" built-in compaction once. The board closes so you can watch the result.",
 		});
 		rows.push({
 			id: "lastSummary",
@@ -6792,6 +6777,49 @@ export class CompactionBoard implements Component, Focusable {
 			description: `One line per try: status, model, time, tok in and out, and why something failed. File: ${LOG_PATH}`,
 		});
 		return rows;
+	}
+
+	/** The four 'do it this second' actions, in a submenu of their own (2026-10-24, on request). They
+	 *  still finish the board when pressed, because you want to watch what happens, not read a menu. */
+	private runNowItems(): SettingItem[] {
+		const items: SettingItem[] = [];
+		items.push({
+			id: "elisionNow",
+			label: "Run elision now",
+			currentValue: "Run the elision now",
+			values: ["Run the elision now"],
+			description:
+			"Runs an elision sweep RIGHT NOW, regardless of the start percentage and the batch thresholds: every tool result outside the preserved tail becomes a stub (the board closes, the stubs persist in the session state, and the next request carries them). Use it when you can see the context climbing and do not want to wait for the sweep to accumulate candidates.",
+		});
+		items.push({
+			id: "compactNow",
+			label: "Run compaction now",
+			currentValue: "Run the compaction now",
+			values: ["Run the compaction now"],
+			description:
+				"Starts a compaction RIGHT NOW: pi prepares the session and the Compaction models rotation answers it (the board closes so you can watch the progress). The automatic starter lives in the Auto-compaction submenu's trigger point - when the ctx crosses it while pi is idle, the same compaction starts by itself.",
+		});
+		items.push({
+			id: "compactNowResume",
+			label: "Run compaction now and resume the session",
+			currentValue: "Run the compaction, keep the turn going",
+			values: ["Run the compaction, keep the turn going"],
+			description:
+				"Same rotation as the row above, but the summary is written at a safe point WITHOUT stopping the " +
+				"turn: the session goes on by itself on the short history, so you can leave the machine and come " +
+				"back to a running session. Use this when you want the room cleared and the work to continue; use " +
+				"the row above when you want the session to stop and wait for you. If no safe point can be used it " +
+				"says so and writes nothing - the ordinary row is right above it.",
+		});
+		items.push({
+			id: "compactStock",
+			label: "Run pi's built-in compaction now",
+			currentValue: `Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
+			values: [`Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`],
+			description:
+				"Runs pi's OWN compaction once, bypassing the rotation: pi prepares the session and summarizes with the active model, aiming at 0.8 x its reserveTokens (the number on the right). Use it to compare pi's stock summary with the extension's. Everything else (the rotation, the gates) stays in place for the next compaction.",
+		});
+		return items;
 	}
 
 	private build(): void {
@@ -7346,11 +7374,12 @@ export function compactionSummaryHeader(entry: any, landed: any, run: any, windo
 			: `wrote ${fmt(landed?.measured ?? 0)} tok` + (landed?.measuredBy ? ` (${landed.measuredBy})` : ""),
 	);
 	if (landed?.words) parts.push(`${fmt(landed.words)} words`);
+	// The stored size sits with the other sizes, not trailing at the end of the row (2026-10-24).
+	parts.push(`${fmt(String(entry?.summary ?? "").length)} characters`);
 	if (typeof landed?.min === "number") parts.push(`asked for ${fmt(landed.min)}-${fmt(landed.max)} tok`);
 	parts.push(
 		`context ${fmt(landed?.before ?? entry?.tokensBefore ?? 0)} tok` +
-			(win ? ` of a ${fmt(win)} tok window` : "") +
-			` · summary as stored ${fmt(String(entry?.summary ?? "").length)} characters`,
+			(win ? ` of a ${fmt(win)} tok window` : "") ,
 	);
 	const paragraph = parts.join(" · ");
 	const rule = "-".repeat(cols);
@@ -8783,6 +8812,11 @@ let lastCompactionTrigger = "manual";
 /** The models tried and lost by the compaction now in flight (see `summarizeWithRotation`). Read when
  *  the report is printed; empty when the first candidate worked. */
 let lastRotationFailures: string[] = [];
+// The prompt-quoting figures of the candidate that was just accepted (2026-10-24). They are recorded when
+// a candidate passes its checks and read when the summary lands, one scope apart - which is exactly how the
+// crash of 2026-10-24 happened: the read was written against a name that did not exist, every compaction
+// threw on the way out, and the trigger fired again on the next request. Declared here, defensively read there.
+const lastSummaryQuote: { quoted: number; given: number } = { quoted: 0, given: 0 };
 
 /** What the winning attempt knew, kept for the one closing row. The `done` record used to be a row of
  *  its own, one second before COMPACTED; the operator asked for a single line at the end (2026-10-23), so
@@ -9338,6 +9372,17 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			const why = String(err?.stack ?? err?.message ?? err).split("\n").slice(0, 3).join(" | ").slice(0, 300);
 			logLine(loadConfig(), { event: "compaction_failed", error: why, note: "the extension's own compaction threw; pi's summarizer was NOT allowed to substitute", trigger: lastCompactionTrigger });
 			ctx?.ui?.notify?.(`COMPACTION FAILED · the extension's own compaction hit an internal error and was cancelled; pi's summarizer was not substituted: ${why.slice(0, 140)}`, "error");
+			// And an internal error in an AUTOMATIC run parks the trigger (2026-10-24: a crash on the way out
+			// of every compaction meant the context stayed over the line, so pi asked again on the next request,
+			// and again - a loop that burned a full summary each time and could not be stopped by being stopped).
+			if (lastCompactionTrigger === "auto") {
+				try {
+					pauseAutoCompaction(ctx, "the extension's own compaction crashed", why);
+					logLine(loadConfig(), { event: "give_up", error: why, trigger: lastCompactionTrigger, note: "the automatic trigger is PARKED after an internal error; pi's own summarizer is not substituted; /compact re-arms it" });
+				} catch {
+					/* parking is best-effort; the cancellation above already holds */
+				}
+			}
 			return { cancel: true };
 		} finally {
 			compactionInFlight = false;
@@ -9406,6 +9451,21 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				preparation,
 			);
 		} catch (err: any) {
+			// An internal error here is the worst kind: the summary may already have been written, and the
+			// answer is only "not landed". On 2026-10-24 a broken name on the way out of handleCompaction
+			// landed here every time, and because the context stayed over the line the trigger asked again
+			// immediately - the same eleven-minute summary written four times, unstopppable. An internal error
+			// now parks the automatic trigger and says so, instead of retrying forever.
+			const whyErr = String(err?.stack ?? err?.message ?? err).split("\n").slice(0, 3).join(" | ").slice(0, 300);
+			logLine(loadConfig(), { event: "compaction_failed", error: whyErr, source: "no-abort", note: "the extension's own compaction threw on the no-interrupt route; pi's summarizer was not substituted" });
+			if (lastCompactionTrigger === "auto") {
+				try {
+					pauseAutoCompaction(ctx, "the extension's own compaction crashed", whyErr);
+					logLine(loadConfig(), { event: "give_up", error: whyErr, trigger: lastCompactionTrigger, source: "no-abort", note: "the automatic trigger is PARKED after an internal error; pi's own summarizer is not substituted; /compact re-arms it" });
+				} catch {
+					/* parking is best-effort */
+				}
+			}
 			return { ok: false, note: `the summary could not be written: ${String(err?.message ?? err).slice(0, 150)}` };
 		} finally {
 			compactionInFlight = false;
@@ -9607,13 +9667,26 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			/* counter is best-effort */
 		}
 		r.compaction.summary = appendTranscriptPointer(cfg, ctx, r.compaction.summary);
+		// Reporting only, so that a mistake here cannot undo a compaction that already succeeded.
+		try {
 		lastLandingInfo = {
 			ref: r.ref, trigger, seconds: r.seconds, measured: r.measured, min: r.min, target: (r as any).target,
 			max: r.max, words: r.words, via: (r as any).via, before: realContextTokens(ctx),
 			window: (ctx as any)?.model?.contextWindow ?? 0, reason: event.reason,
 			// Every candidate that was tried and lost, on the row that says the compaction landed.
-			failures: lastRotationFailures, quoted: lastSummaryQuote.quoted, given: lastSummaryQuote.given,
+			failures: lastRotationFailures, quoted: Number((lastSummaryQuote as any)?.quoted ?? 0), given: Number((lastSummaryQuote as any)?.given ?? 0),
 		};
+		} catch (figErr: any) {
+			// The summary is already written. A lost figure must cost a figure, not the compaction: on
+			// 2026-10-24 a name that did not exist was read here, the error escaped, the compaction was
+			// cancelled AFTER the summary had been written, pi asked again on the next request, and the
+			// same eleven-minute summary was written again, and again, and could not be stopped.
+			logLine(loadConfig(), {
+				event: "accepted_with_warnings",
+				note: `the summary stands; only the landing figures failed: ${String(figErr?.message ?? figErr).slice(0, 160)}`,
+			});
+		}
+		try {
 		announceCompaction(
 			ctx,
 			compactionNoticeLines(r, {
@@ -9624,6 +9697,9 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				trigger,
 			}),
 		);
+		} catch (noteErr: any) {
+			ctx?.ui?.notify?.(`COMPACTED · the summary stands · the report line could not be built: ${String(noteErr?.message ?? noteErr).slice(0, 120)}`, "warning");
+		}
 		return { compaction: r.compaction };
 	}
 
