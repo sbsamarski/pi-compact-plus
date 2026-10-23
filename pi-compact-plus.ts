@@ -6737,6 +6737,18 @@ export class CompactionBoard implements Component, Focusable {
 				"Runs pi's OWN compaction once, bypassing the rotation: pi prepares the session and summarizes with the active model, aiming at 0.8 x its reserveTokens (the number on the right). Use it to compare pi's stock summary with the extension's. Everything else (the rotation, the gates) stays in place for the next compaction.",
 		});
 		rows.push({
+			id: "lastSummary",
+			label: "View the last compaction summary",
+			currentValue: "Read the summary that is now the session's memory",
+			values: ["Read the summary that is now the session's memory"],
+			description:
+				"Opens the summary the last compaction wrote, exactly as it stands in the session file, with the " +
+				"facts of that run above it: the exact time, which model wrote it, how long it took, the tokens the " +
+				"summariser read and wrote, the size it was asked for, how full the context was and which entry the " +
+				"word-for-word tail starts at. Read-only - editing it changes nothing. This is the row to use after an " +
+				"automatic compaction, when the screen still shows the older context.",
+		});
+		rows.push({
 			id: "instruction",
 			label: "Summary template settings",
 			currentValue: "",
@@ -6873,6 +6885,10 @@ export class CompactionBoard implements Component, Focusable {
 				onComplete: () => c.ui?.notify?.("pi's built-in compaction finished.", "info"),
 				onError: (err: any) => c.ui?.notify?.(`pi's built-in compaction failed: ${String(err?.message ?? err).slice(0, 160)}`, "error"),
 			});
+			return;
+		} else if (id === "lastSummary") {
+			// Reading is harmless, but the board has to close before the text can be shown.
+			this.finish({ action: "last-summary" });
 			return;
 		} else if (id === "elisionStart") {
 			update((c) => void (c.elision = { ...c.elision, softPercent: Number(String(value).replace("%", "")) }));
@@ -7262,6 +7278,119 @@ async function previewRequest(ctx: Ctx, ref: string, full = false): Promise<void
 }
 
 /** One of the stored templates, as stored. */
+/** The two records the log holds about the compaction that just happened: the run that produced the
+ *  accepted summary (`ok`) and the moment it landed (`compaction_landed`). Read back from the file rather
+ *  than remembered in memory, so the row is still right after a reload or a restart. */
+function lastCompactionFacts(): { landed?: any; ok?: any } {
+	const out: { landed?: any; ok?: any } = {};
+	try {
+		const raw = readFileSync(LOG_PATH, "utf8");
+		const lines = raw.split("\n");
+		for (let i = lines.length - 1; i >= 0 && !(out.landed && out.ok); i--) {
+			let d: any;
+			try {
+				d = JSON.parse(lines[i]);
+			} catch {
+				continue;
+			}
+			if (!d || typeof d !== "object") continue;
+			if (!out.landed && d.event === "compaction_landed") out.landed = d;
+			if (!out.ok && d.event === "ok") out.ok = d;
+		}
+	} catch {
+		/* no log yet - the header says what it can without it */
+	}
+	return out;
+}
+
+/** "2026-10-23T22:26:40.616" -> "2026-10-23 22:26:40" (the log writes local time). */
+function stampOfLocal(ts: any): string {
+	const s = String(ts ?? "");
+	if (!s) return "time not recorded";
+	// Only a plain local stamp may be copied straight through. The session file stamps in UTC (a trailing
+	// Z), and printing that as if it were local would put the compaction eight hours in the past.
+	const m = /Z|[+-]\d{2}:?\d{2}$/.test(s) ? null : s.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+	if (m) return `${m[1]} ${m[2]}`;
+	const d = new Date(s);
+	if (Number.isNaN(d.getTime())) return s;
+	// The same shape as the log's own stamp, not whatever format the operating system prefers:
+	// 2026-10-23 22:26:40.
+	const p = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** THE LAST COMPACTION SUMMARY ON SCREEN (2026-10-24, on request). The text is taken from the session
+ *  file itself - the same text the model will be handed from now on - and the facts of the run come from
+ *  the log, because the screen does not keep them and a reload wipes what it does keep. */
+/** The block above the summary text (2026-10-24): who wrote it, when, what it cost, how full the
+ *  session was, and where the word-for-word tail starts. Split out of the screen routine so a rig can
+ *  check the wording without opening a terminal. `run` is the record of the summariser's request and is
+ *  passed only when it belongs to the same run. */
+export function compactionSummaryHeader(entry: any, landed: any, run: any, window: number): string {
+	const sameRun = !landed || !run || !landed.ref || landed.ref === run.ref;
+	const win = Number(window ?? 0);
+	return [
+		`LAST COMPACTION · ${stampOfLocal(landed?.ts ?? entry?.timestamp)}` +
+			(landed
+				? ` · started by ${landed.reason === "manual" ? "you" : "the automatic trigger"}` +
+					(landed.noAbort ? ", landed without stopping the turn" : ", landed by stopping the turn")
+				: " · how it started is not in the log"),
+		`${landed?.ref ?? run?.ref ?? "model not recorded"}` +
+			(landed?.seconds ? ` · wrote it in ${landed.seconds} s` : "") +
+			(landed?.via ? ` (via ${landed.via})` : ""),
+		(sameRun && run?.input
+			? `tokens · the summariser read ${fmt(run.input)} tok and wrote ${fmt(landed?.measured ?? run.measured ?? 0)} tok`
+			: `tokens · wrote ${fmt(landed?.measured ?? 0)} tok` + (landed?.measuredBy ? ` (${landed.measuredBy})` : "")) +
+			(landed?.words ? `, ${fmt(landed.words)} words` : "") +
+			(typeof landed?.min === "number" ? `, asked for ${fmt(landed.min)}-${fmt(landed.max)} tok` : ""),
+		`context · ${fmt(landed?.before ?? entry?.tokensBefore ?? 0)} tok` +
+			(win ? ` of a ${fmt(win)} tok window` : "") +
+			`, summary as stored ${fmt(String(entry?.summary ?? "").length)} characters, entry ${String(entry?.id ?? "").slice(0, 8)}` +
+			`, tail kept word for word from entry ${String(entry?.firstKeptEntryId ?? "").slice(0, 8)}`,
+		(landed && typeof landed.quoted === "number" && typeof landed.given === "number"
+			? `user prompts · ${landed.quoted} of ${landed.given} quoted`
+			: "user prompts · not recorded") +
+			(Array.isArray(landed?.failures) && landed.failures.length
+				? ` · after ${landed.failures.length} candidate(s) tried and lost`
+				: landed
+					? " · the first candidate wrote it"
+					: ""),
+		"",
+		"THE SUMMARY, exactly as the session now holds it:",
+		"",
+	].join("\n");
+}
+
+
+async function lastSummaryScreen(ctx: Ctx): Promise<void> {
+	const sm: any = (ctx as any)?.sessionManager;
+	let entry: any = null;
+	try {
+		const all: any[] = typeof sm?.getBranch === "function" ? sm.getBranch() : (sm?.getEntries?.() ?? []);
+		for (const e of all) if (e?.type === "compaction") entry = e; // the last one on the branch wins
+	} catch {
+		/* an unreadable session is reported below, not as a stack trace */
+	}
+	if (!entry?.summary) {
+		ctx?.ui?.notify?.(
+			"NO COMPACTION SUMMARY · this session has not been compacted yet, or its summary could not be read.",
+			"warning",
+		);
+		return;
+	}
+	const { landed, ok: run } = lastCompactionFacts();
+	// The two records describe the same run when they name the same model; a compaction that failed
+	// after this one landed would otherwise paste the wrong figures onto the header.
+	const sameRun = !landed || !run || !landed.ref || landed.ref === run.ref;
+	const win = Number((ctx as any)?.model?.contextWindow ?? 0);
+	const head = compactionSummaryHeader(entry, landed, sameRun ? run : undefined, win);
+	await uiPreview(
+		ctx,
+		"READ-ONLY - the summary written by the last compaction, as it stands in the session file. Editing here changes nothing.",
+		head + String(entry.summary),
+	);
+}
+
 async function previewTemplate(ctx: Ctx, which: string): Promise<void> {
 	const cfg = loadConfig();
 	const ext = DEFAULT_TEMPLATE_TEXT;
@@ -7416,6 +7545,10 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			await previewRequest(ctx, decodeURIComponent(result.action.slice("preview-request:".length)));
 			restore = { templateMenu: true };
 			continue;
+		}
+		if (result.action === "last-summary") {
+			await lastSummaryScreen(ctx);
+			return;
 		}
 		if (result.action?.startsWith("preview-template:")) {
 			await previewTemplate(ctx, result.action.slice("preview-template:".length));
