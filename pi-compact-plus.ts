@@ -1490,7 +1490,7 @@ function tailLogPretty(lines = 16, verbose = false): string {
 					// here only ever adds words where the operator asked to be told.
 					const note =
 						typeof d.note === "string" && !LOG_CHATTER.has(String(d.event ?? ""))
-							? d.note.replace(/\s+/g, " ").slice(0, 160)
+							? d.note.replace(/\s+/g, " ").slice(0, 400)
 							: "";
 					// The elision events carry their own figures.
 					const elision = d.event === "elision" ? [`${fmt(d.applied ?? 0)} result${d.applied === 1 ? "" : "s"} elided`, `${fmt(d.resultsTokens ?? 0)} tok -> ${fmt(d.stubTokens ?? 0)} tok`, `saved ${fmt(d.savedTokens ?? 0)} tok`, `ctx ~${fmt(d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`].join(" · ") : "";
@@ -1500,7 +1500,7 @@ function tailLogPretty(lines = 16, verbose = false): string {
 					const summary = typeof d.summaryTokens === "number" ? `summary ${fmt(d.summaryTokens)} tok` : "";
 					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, summary, note].filter(Boolean).join(" · ");
 				} catch {
-					return l.slice(0, 160);
+					return l.slice(0, 400);
 				}
 			})
 			.join("\n");
@@ -6668,6 +6668,18 @@ export class CompactionBoard implements Component, Focusable {
 				"Starts a compaction RIGHT NOW: pi prepares the session and the Compaction models rotation answers it (the board closes so you can watch the progress). The automatic starter lives in the Auto-compaction submenu's trigger point - when the ctx crosses it while pi is idle, the same compaction starts by itself.",
 		});
 		rows.push({
+			id: "compactNowResume",
+			label: "Run compaction now and resume the session",
+			currentValue: "Run the compaction, keep the turn going",
+			values: ["Run the compaction, keep the turn going"],
+			description:
+				"Same rotation as the row above, but the summary is written at a safe point WITHOUT stopping the " +
+				"turn: the session goes on by itself on the short history, so you can leave the machine and come " +
+				"back to a running session. Use this when you want the room cleared and the work to continue; use " +
+				"the row above when you want the session to stop and wait for you. If no safe point can be used it " +
+				"says so and writes nothing - the ordinary row is right above it.",
+		});
+		rows.push({
 			id: "compactStock",
 			label: "Run pi's built-in compaction now",
 			currentValue: `Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
@@ -6785,6 +6797,23 @@ export class CompactionBoard implements Component, Focusable {
 				onError: (err: any) => ctx?.ui?.notify?.(`Manual compaction failed: ${String(err?.message ?? err).slice(0, 160)}`, "error"),
 			});
 			return;
+		} else if (id === "compactNowResume") {
+			// Manual compaction that does NOT stop the session: the summary lands at a safe point and the
+			// running loop reads the short history on its next round. Pressing this row is the instruction, so
+			// it runs whatever the landWithoutAbort setting happens to say.
+			const ctx2 = this.ctx;
+			lastCompactionTrigger = "manual";
+			this.finish({ action: "compact-resume-now" });
+			if (!landNoAbortHook) {
+				ctx2?.ui?.notify?.("Compaction with resume is not available with this version of pi - use 'Run compaction now'.", "warning");
+			} else {
+				void landNoAbortHook(ctx2, "menu")
+					.then((r) => {
+						if (!r?.ok) ctx2?.ui?.notify?.(`COMPACTION NOT LANDED · the summary could not be written without stopping the turn${r?.note ? ` (${String(r.note).slice(0, 140)})` : ""}. Nothing was written - use 'Run compaction now'.`, "warning");
+					})
+					.catch((err: any) => ctx2?.ui?.notify?.(`COMPACTION NOT LANDED · ${String(err?.message ?? err).slice(0, 160)}. Nothing was written.`, "error"));
+			}
+			return;
 		} else if (id === "compactStock") {
 			// A one-shot stock run: the rotation sees the flag and steps aside, so pi's own
 			// compaction (0.8 x its reserveTokens aim) handles this one.
@@ -6833,18 +6862,21 @@ export class LogView implements Component {
 		else if (k === "v") { this.verbose = !this.verbose; this.offset = -1; this.tui?.requestRender?.(); }
 		else if (k === "up") { this.offset = Math.max(0, this.offset - 1); this.tui?.requestRender?.(); }
 		else if (k === "down") { this.offset += 1; this.tui?.requestRender?.(); }
-		else if (k === "pgup") { this.offset = Math.max(0, this.offset - 30); this.tui?.requestRender?.(); }
-		else if (k === "pgdn") { this.offset += 30; this.tui?.requestRender?.(); }
+		else if (k === "pgup") { this.offset = Math.max(0, this.offset - this.perPage); this.tui?.requestRender?.(); }
+		else if (k === "pgdn") { this.offset += this.perPage; this.tui?.requestRender?.(); }
 	}
 	private offset = -1; // -1 = start at the newest page
 	/** false = the result lines only; true = every line, bookkeeping included (v toggles it) */
 	private verbose = false;
+	/** Rows wrap now, so one result is often two or three screen rows: fourteen results is about a full
+	 *  screen of text (2026-10-23, on request - the rows were being cut at the right edge). */
+	private perPage = 14;
 
 	invalidate(): void {}
 
 	render(width: number): string[] {
 		const all = tailLogPretty(200, this.verbose).split("\n");
-		const perPage = 30;
+		const perPage = this.perPage;
 		const maxOffset = Math.max(0, all.length - perPage);
 		if (this.offset < 0) this.offset = maxOffset; // the first open shows the NEWEST entries
 		this.offset = Math.min(this.offset, maxOffset);
@@ -6854,7 +6886,17 @@ export class LogView implements Component {
 			"",
 			...shown,
 		];
-		return lines.map((l) => truncateToWidth(l, Math.max(60, width)));
+		// WRAP, DO NOT CUT (2026-10-23): every row of this log is a result the operator has to read in full
+		// - which model, how many tokens in and out, what failed - and a row longer than the terminal simply
+		// stopped existing past the right edge. Continuation rows are indented, so a wrapped entry still
+		// reads as one entry.
+		const out: string[] = [];
+		for (const l of lines) {
+			const parts = wrapToWidth(l, Math.max(60, width));
+			out.push(parts[0]);
+			for (const p of parts.slice(1)) out.push(`  ${p}`);
+		}
+		return out;
 	}
 }
 
@@ -7346,6 +7388,11 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		}
 		if (result.action === "compact-now") {
 			// The board started it before finishing; the board must stay closed so the progress is visible.
+			return;
+		}
+		if (result.action === "compact-resume-now") {
+			// The row started it itself, without stopping the turn. The board stays closed so the session is
+			// visible while the summariser works, and there is nothing to resume afterwards.
 			return;
 		}
 		if (result.action === "compact-stock-now") {
