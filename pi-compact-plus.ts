@@ -1195,7 +1195,20 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
 		// question twice: once when an old build's writes were mistaken for the new one's, and once when a
 		// harness's own events had to be told apart from a real compaction's.
 		if (writesBlocked()) return;
-		appendFileSync(LOG_PATH, JSON.stringify({ ts: localStamp(), pid: process.pid, ...record }) + "\n", "utf8");
+		const written = { ts: localStamp(), pid: process.pid, ...record };
+		appendFileSync(LOG_PATH, JSON.stringify(written) + "\n", "utf8");
+		// WHAT GOES INTO THE FILE ALSO GOES ON THE SCREEN, in the same words, the same second (asked for on
+		// 2026-10-24: "the moment you write the compaction try or compacted line in the log, write it on the
+		// screen as well - the exact same lines"). Bookkeeping rows are the exception, and they are exactly the
+		// ones the log view hides, so the rule is one list: the rows you would see in the log are the rows you
+		// see on screen. The time of day is kept because a TRY and its COMPACTED can be twenty minutes apart.
+		if (!LOG_CHATTER.has(String(record.event ?? ""))) {
+			try {
+				watcherCtx?.ui?.notify?.(logRowText(written, String(written.ts ?? "").slice(11, 19)), "info");
+			} catch {
+				/* a screen that will not take a line never cancels a compaction */
+			}
+		}
 	} catch {
 		/* logging must never break compaction */
 	}
@@ -1289,6 +1302,62 @@ const LOG_CHATTER = new Set(["user_prompts", // one per candidate that passed it
 ]);
 
 /**
+ * One log row, rendered as text - the ONLY place a row is turned into words. The log view uses it and the
+ * screen mirror in `logLine` uses it, so what arrives on screen is the line that is in the file: same
+ * words, same figures, same order. On 2026-10-24 the operator asked for this directly: compaction info had
+ * been going only into the log, and reading a compaction meant opening a file. `stamp` is the date and time
+ * prefix; the screen passes a short one, the file view the full one.
+ */
+function logRowText(d: any, stamp = ""): string {
+	const ref = d.ref ? String(d.ref).split("/").pop()?.slice(0, 34) : "";
+	const seconds = typeof d.seconds === "number" ? fmtDuration(d.seconds) : "";
+	// Transfer figures: pi's own provider counts when present, otherwise the estimate.
+	const tokIn = typeof d.input === "number" ? d.input : undefined;
+	const tokOut = typeof d.output === "number" ? d.output : typeof d.measured === "number" ? d.measured : undefined;
+	const transfer =
+		tokIn !== undefined || tokOut !== undefined
+			? `${tokIn !== undefined ? `${fmt(tokIn)} tok in` : ""}${tokIn !== undefined && tokOut !== undefined ? ", " : ""}${tokOut !== undefined ? `${fmt(tokOut)} tok out` : ""}${typeof d.reasoning === "number" && d.reasoning > 0 ? ` (thinking ${fmt(d.reasoning)})` : ""}`
+			: "";
+	// The acceptance bounds are ABSOLUTE TOKENS, and the AIM (the size the summary was asked for) is printed
+	// with them: "accept 4,096-30,000 tok" alone said nothing about what the run was aiming at (2026-10-07).
+	const aim = typeof d.target === "number" && d.target > 0 ? `aim ${fmt(d.target)} tok` : "";
+	const window =
+		typeof d.min === "number" && typeof d.max === "number"
+			? `${aim ? aim + " \u00b7 " : ""}accept ${fmt(d.min)}-${fmt(d.max)} tok${typeof d.window === "number" && d.window > 0 ? ` (window ${fmt(d.window)} tok)` : ""}`
+			: aim;
+	// Plain words for the internal event names: a run begins with COMPACTION START, each model tried is a
+	// COMPACTION TRY, the moment the new context exists is COMPACTED. An unlisted event shows its own name
+	// in capitals, so a new record type can be unnamed for a while but never silently nameless.
+	const status = LOG_ROW_NAMES[String(d.event ?? "")] ?? String(d.event ?? "").toUpperCase();
+	// An accepted-with-warnings line must say WHAT was not as asked.
+	const why =
+		d.reason ??
+		(Array.isArray(d.warnings) && d.warnings.length
+			? `accepted despite: ${d.warnings.map((w: any) => String(w)).join("; ").slice(0, 300)}`
+			: d.error
+				? String(d.error).split("\n")[0].slice(0, 90)
+				: "");
+	// A line the operator is shown should say something when it is shown: `note` used to be dropped, so the
+	// gate's hold arrived as a bare AUTO_COMPACTION_HELD with nothing after it (2026-10-21).
+	const note = typeof d.note === "string" && !LOG_CHATTER.has(String(d.event ?? "")) ? d.note.replace(/\s+/g, " ").slice(0, 400) : "";
+	// The elision events carry their own figures.
+	const elision =
+		d.event === "elision"
+			? [`${fmt(d.applied ?? 0)} result${d.applied === 1 ? "" : "s"} elided`, `${fmt(d.resultsTokens ?? 0)} tok -> ${fmt(d.stubTokens ?? 0)} tok`, `saved ${fmt(d.savedTokens ?? 0)} tok`, `ctx ~${fmt(d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`].join(" \u00b7 ")
+			: "";
+	// A landed summary is a result with a size, and the size is the figure worth keeping in view next to the
+	// aim it was asked for.
+	const summary =
+		typeof d.summaryTokens === "number"
+			? `summary ${fmt(d.summaryTokens)} tok` +
+			  (typeof d.measured === "number" && typeof d.min === "number" ? ` (asked ${fmt(d.min)}-${fmt(d.max)} tok, ${fmt(d.words ?? 0)} words written)` : "") +
+			  (typeof d.quoted === "number" && typeof d.given === "number" ? `, user prompts quoted ${d.quoted} of ${d.given}` : "") +
+			  (Array.isArray(d.failures) && d.failures.length ? `, after ${d.failures.length} candidate(s) tried and lost` : "")
+			: "";
+	return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, summary, note].filter(Boolean).join(" \u00b7 ");
+}
+
+/**
  * The log, human-readable: date and time first, then status, model, elapsed time and the transfer
  * figures in tokens (words are not logged - they were the old sizing flaw, and tokens are what the
  * acceptance window is written in). Unknown fields are simply left out.
@@ -1313,58 +1382,7 @@ function tailLogPretty(lines = 16, verbose = false): string {
 				try {
 					const d = JSON.parse(l);
 					const when = String(d.ts ?? "");
-					const stamp = `${when.slice(0, 10)} ${when.slice(11, 19)}`;
-					const ref = d.ref ? String(d.ref).split("/").pop()?.slice(0, 34) : "";
-					const seconds = typeof d.seconds === "number" ? fmtDuration(d.seconds) : "";
-					// Transfer figures: pi's own provider counts when present, otherwise the estimate.
-					const tokIn = typeof d.input === "number" ? d.input : undefined;
-					const tokOut = typeof d.output === "number" ? d.output : typeof d.measured === "number" ? d.measured : undefined;
-					const transfer =
-						tokIn !== undefined || tokOut !== undefined
-							? `${tokIn !== undefined ? `${fmt(tokIn)} tok in` : ""}${tokIn !== undefined && tokOut !== undefined ? ", " : ""}${tokOut !== undefined ? `${fmt(tokOut)} tok out` : ""}${typeof d.reasoning === "number" && d.reasoning > 0 ? ` (thinking ${fmt(d.reasoning)})` : ""}`
-							: "";
-					// The acceptance bounds are ABSOLUTE TOKENS now (the percent-of-window wording printed
-					// "min ?% / max ?%" after the 2026-10-05 migration killed minPct/maxPct) and the window is
-					// only printed when the event actually carried one - the "of the 0 tok window" tail was noise.
-					// 2026-10-07, on request: the AIM (the size the summary was asked for) is printed with the
-					// acceptance bounds, so a TRY line and an OK line both show what the run was aiming at -
-					// "accept 4,096-30,000 tok" alone said nothing about the target.
-					const aim = typeof d.target === "number" && d.target > 0 ? `aim ${fmt(d.target)} tok` : "";
-					const window =
-						typeof d.min === "number" && typeof d.max === "number"
-							? `${aim ? aim + " \u00b7 " : ""}accept ${fmt(d.min)}-${fmt(d.max)} tok${typeof d.window === "number" && d.window > 0 ? ` (window ${fmt(d.window)} tok)` : ""}`
-							: aim;
-					// The words a row starts with (2026-10-21, on request). The operator reads this view to see
-					// what the compactor DID, so the internal event names get plain ones: a run begins with
-					// COMPACTION START, each model tried is a COMPACTION TRY, and the moment the new context exists
-					// is COMPACTED. An event that is not listed shows its own name in capitals, so a new
-					// record type can be unnamed for a while but never silently nameless.
-					const status = LOG_ROW_NAMES[String(d.event ?? "")] ?? String(d.event ?? "").toUpperCase();
-					// An accepted-with-warnings line must say WHAT was not as asked - the warnings array is the
-					// list of rule violations the summary was accepted despite (2026-10-07, on request).
-					const why =
-						d.reason ??
-						(Array.isArray(d.warnings) && d.warnings.length
-							? `accepted despite: ${d.warnings.map((w: any) => String(w)).join("; ").slice(0, 300)}`
-							: d.error
-								? String(d.error).split("\n")[0].slice(0, 90)
-								: "");
-					// A line the operator is shown should say something when it is shown. `note` used to be
-					// dropped, so the gate's hold - the one line that explains why a compaction did NOT
-					// happen - arrived as a bare AUTO_COMPACTION_HELD with nothing after it (2026-10-21).
-					// Bookkeeping events are filtered out of the results view anyway, so putting the note
-					// here only ever adds words where the operator asked to be told.
-					const note =
-						typeof d.note === "string" && !LOG_CHATTER.has(String(d.event ?? ""))
-							? d.note.replace(/\s+/g, " ").slice(0, 400)
-							: "";
-					// The elision events carry their own figures.
-					const elision = d.event === "elision" ? [`${fmt(d.applied ?? 0)} result${d.applied === 1 ? "" : "s"} elided`, `${fmt(d.resultsTokens ?? 0)} tok -> ${fmt(d.stubTokens ?? 0)} tok`, `saved ${fmt(d.savedTokens ?? 0)} tok`, `ctx ~${fmt(d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`].join(" · ") : "";
-					// A landed summary is a result with a size, and the size is the figure worth keeping
-					// in view next to the aim it was asked for (2026-10-21: "only compaction and elision entries
-					// there with their data').
-					const summary = typeof d.summaryTokens === "number" ? `summary ${fmt(d.summaryTokens)} tok` + (typeof d.measured === "number" && typeof d.min === "number" ? ` (asked ${fmt(d.min)}-${fmt(d.max)} tok, ${fmt(d.words ?? 0)} words written)` : "") + (typeof d.quoted === "number" && typeof d.given === "number" ? `, user prompts quoted ${d.quoted} of ${d.given}` : "") + (Array.isArray(d.failures) && d.failures.length ? `, after ${d.failures.length} candidate(s) tried and lost` : "") : "";
-					return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, summary, note].filter(Boolean).join(" · ");
+					return logRowText(d, `${when.slice(0, 10)} ${when.slice(11, 19)}`);
 				} catch {
 					return l.slice(0, 400);
 				}
