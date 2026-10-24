@@ -392,7 +392,7 @@ export const DEFAULT_RESERVE_TOKENS = 16384;
  *  failed - and we never apply it to our own work. */
 function readPiReserveTokens(): number {
 	try {
-		const raw = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
+		const raw = JSON.parse(readFileSync(process.env.PI_SETTINGS ?? join(AGENT_DIR, "settings.json"), "utf8"));
 		const v = raw?.compaction?.reserveTokens;
 		return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : DEFAULT_RESERVE_TOKENS;
 	} catch {
@@ -443,7 +443,7 @@ function piCompactionModLoad(): Promise<any> {
 export function readPiCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
 	const off = { enabled: false, reserveTokens: DEFAULT_RESERVE_TOKENS, keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS };
 	try {
-		const raw = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
+		const raw = JSON.parse(readFileSync(process.env.PI_SETTINGS ?? join(AGENT_DIR, "settings.json"), "utf8"));
 		const c = raw?.compaction ?? {};
 		const num = (v: unknown, dflt: number) => (Number(v) > 0 ? Math.round(Number(v)) : dflt);
 		return {
@@ -457,7 +457,25 @@ export function readPiCompactionSettings(): { enabled: boolean; reserveTokens: n
 }
 
 /** Whether pi would compact by itself. Kept as its own name because half the file asks exactly that. */
-export function readPiCompactionEnabled(): boolean {
+export /**
+ * Write pi's own `compaction.enabled` (2026-10-25). This extension's switch and pi's switch are one switch
+ * now that pi does the timing: off here means off there, or the thing the operator stopped would carry on
+ * with pi's own summary. Refused in a harness, which must never touch pi's real settings file.
+ */
+function setPiCompactionEnabled(on: boolean): boolean {
+	try {
+		const path = process.env.PI_SETTINGS ?? join(AGENT_DIR, "settings.json");
+		if (writesBlocked() || process.env.PI_SETTINGS) return false;
+		const raw = JSON.parse(readFileSync(path, "utf8"));
+		raw.compaction = { ...(raw.compaction ?? {}), enabled: on };
+		writeFileSync(path, JSON.stringify(raw, null, 2) + String.fromCharCode(10), "utf8");
+		return true;
+	} catch {
+		return false; /* a settings file we cannot read must not break the switch */
+	}
+}
+
+function readPiCompactionEnabled(): boolean {
 	return readPiCompactionSettings().enabled;
 }
 
@@ -3844,7 +3862,7 @@ function otherCompactorDetected(): string | null {
 	}
 	catch { /* no sidecar: not running on this session (statSync throws when the file is missing) */ }
 	try {
-		const raw = JSON.parse(readFileSync(join(AGENT_DIR, "settings.json"), "utf8"));
+		const raw = JSON.parse(readFileSync(process.env.PI_SETTINGS ?? join(AGENT_DIR, "settings.json"), "utf8"));
 		const pkgs: unknown[] = Array.isArray(raw?.packages) ? raw.packages : [];
 		for (const p of pkgs) {
 			const s = String(p).toLowerCase();
@@ -3932,7 +3950,11 @@ export function triggerPointFor(o: { window: number; reserveTokens: number }): n
 export function triggerPoint(ctx: Ctx): number {
 	const window = (ctx as any)?.model?.contextWindow ?? 0;
 	if (!(window > 0)) return 0;
-	return triggerPointFor({ window, reserveTokens: loadConfig().scaling.reserveTokens });
+	// ONE SOURCE OF TRUTH for where compaction starts (2026-10-25, on request): pi's
+	// `compaction.reserveTokens`, read from pi's own settings file every time. Editing that number in
+	// settings.json - with pi running or not - moves this extension's line with it, because there is no
+	// longer a second number of our own to keep in step.
+	return triggerPointFor({ window, reserveTokens: readPiCompactionSettings().reserveTokens });
 }
 
 /**
@@ -3942,16 +3964,20 @@ export function triggerPoint(ctx: Ctx): number {
  */
 export function extReserve(ctx: Ctx): number {
 	const window = (ctx as any)?.model?.contextWindow ?? 0;
-	if (!(window > 0)) return DEFAULT_RESERVE_TOKENS;
-	return Math.max(1024, window - triggerPoint(ctx));
+	// pi's number, read now, not a copy of it kept in this extension's own settings (2026-10-25).
+	const fromPi = readPiCompactionSettings().reserveTokens;
+	if (!(window > 0)) return fromPi;
+	return Math.max(1_024, Math.min(fromPi, window - 1_024));
 }
 
 /** The verbatim tail: what compaction keeps word for word and what elision protects. */
 export function extKeepRecent(ctx: Ctx): number {
 	const window = (ctx as any)?.model?.contextWindow ?? 0;
-	if (!(window > 0)) return DEFAULT_KEEP_RECENT_TOKENS;
-	// A tail bigger than the room available is nonsense; the window is the only limit worth having.
-	return clamp(loadConfig().scaling.preserveTokens, 1024, Math.max(1024, window - extReserve(ctx)));
+	// The same rule: pi's `compaction.keepRecentTokens` is the tail, and pi itself does the cutting when it
+	// triggers, so keeping a second copy here could only ever mean the two disagreed.
+	const fromPi = readPiCompactionSettings().keepRecentTokens;
+	if (!(window > 0)) return fromPi;
+	return clamp(fromPi, 1_024, Math.max(1_024, window - extReserve(ctx)));
 }
 
 /** Short effective-settings line for a model row. */
@@ -5862,6 +5888,10 @@ class CompactionMenu implements Component, Focusable {
 						return;
 					}
 					update((c) => void (c.enabled = on));
+					// Turning this extension's compaction off turns pi's off with it (2026-10-25, on request): with
+					// pi doing the timing now, leaving pi's switch on would mean compaction continued - by pi's own
+					// summariser - after being told to stop.
+					setPiCompactionEnabled(on);
 					// pi's own compaction is a separate thing in pi's own settings file, and this switch never
 					// touches it. The automatic trigger here is this extension's own check, which works with
 					// pi's flag either way - so switching pi's compaction off means off, and it stays off.
@@ -5869,7 +5899,7 @@ class CompactionMenu implements Component, Focusable {
 						"__exit:notice:" +
 							(on
 								? `COMPACTION IS ON. WHO TIMERS DEPENDS ON PI'S OWN SWITCH: with pi's compaction enabled, pi's threshold is the doorbell and this extension's trigger point is the gate - the two are computed from the same window so they agree, and a hold only happens if pi's reserveTokens drift out of step; with pi's switched off, this extension's own check is the trigger. Either way THIS EXTENSION WRITES EVERY SUMMARY. Your start point is on the settings board. pi's settings are read, never written.`
-								: "THIS EXTENSION'S COMPACTION IS OFF, and nothing of it touches pi's settings. IF PI'S OWN COMPACTION WAS OFF TOO, NOTHING COMPACTS UNTIL ONE OF THE TWO IS ON."),
+								: "Compaction is off - this extension will not summarise, and pi's own compaction has been switched off too, so nothing compacts until it is turned back on."),
 					);
 					return;
 				}
@@ -7893,6 +7923,14 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 	// behind and are answered by the counters on agentLoop instead (see compactSafePoint).
 	const ctx = ctxArg ?? watcherCtx;
 	if (!ctx) return;
+	// PI OWNS THE TRIGGER NOW (2026-10-25, on request). pi's own check runs after every assistant message,
+	// measures the session with its own live view (not a stale message list), fires its own compaction and
+	// lands the summary itself - and, unlike the extension's own timer route, it does not interrupt the
+	// turn. This extension answers that request with its own template, models, size bands and acceptance
+	// rules through `session_before_compact`. Everything below stays for the board's figures and for a
+	// harness that sets `piOwnsTrigger` to false, but in a live session it no longer starts anything.
+	// A harness sets PCP_EXTENSION_TRIGGER to keep testing this route; a live session never sets it.
+	if (process.env.PCP_EXTENSION_TRIGGER !== "1") return;
 	let cfg: Config;
 	try {
 		cfg = loadConfig();
@@ -8655,16 +8693,15 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				// difference would cost a full pass over the context for nothing.
 				slack: Math.max(1_000, Math.round(win * 0.01)),
 			});
-			if (note !== null) {
+			// THE HOLD IS GONE (2026-10-25, on request): pi now owns the trigger, so refusing pi's request and
+			// waiting for our own line would mean waiting for something that never fires. The arithmetic above is
+			// left in place for the board's numbers; whatever pi asks with, we answer with our own summary.
+			if (false && note !== null) {
 				const nowMs = Date.now();
 				if (nowMs - lastGateHoldLogMs > 60_000) {
 					lastGateHoldLogMs = nowMs;
-					// `loadConfig()` here, not the config from the try block above: that one is block-scoped and
-					// does not reach this line, which is how a hold would have thrown instead of cancelling.
 					logLine(loadConfig(), { event: "auto_compaction_held", reason: event.reason, note });
 				}
-				// pi-stamp-plus is told before the cancel goes back to pi, because pi stamps the
-				// failed compaction the instant it receives the answer.
 				markCompactionHeld();
 				if (nowMs - lastGateHoldNoticeAtMs > 600_000) {
 					lastGateHoldNoticeAtMs = nowMs;
