@@ -403,11 +403,6 @@ function parseCharCap(text: string, fallback: CharCap): CharCap {
 	return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-/** One step forward in the CHAR_CAP_STEPS cycle (wraps). */
-function nextCharCap(current: CharCap): CharCap {
-	const i = CHAR_CAP_STEPS.findIndex((s) => s === current);
-	return CHAR_CAP_STEPS[(i + 1) % CHAR_CAP_STEPS.length] ?? CHAR_CAP_STEPS[0];
-}
 
 function sanitizeElision(raw: any): ElisionConfig {
 	return {
@@ -962,10 +957,6 @@ function round2(n: number): number {
 	return Math.round(n * 100) / 100;
 }
 
-/** A fraction of reserveTokens as the menu shows it. */
-function frac(n: number): string {
-	return String(round2(n));
-}
 
 /** Order position of a model in the Compaction models list, -1 when not in it. */
 function orderPosition(cfg: Config, ref: string): number {
@@ -1511,19 +1502,11 @@ function tailLogPretty(lines = 16, verbose = false): string {
 
 // ---------------------------------------------------------------- pi's compaction settings
 
-/** pi's own settings file (kept for reference; the extension no longer writes to it - the 2026-10-01
- *  unlink removed the last writer, writePiCompactionNumber). */
-const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
 // ---------------------------------------------------------------- model helpers
 
 const MAX_SLOTS = 5;
 
-function parseRef(ref: string): { provider: string; id: string } | null {
-	const at = ref.indexOf("/");
-	if (at <= 0 || at === ref.length - 1) return null;
-	return { provider: ref.slice(0, at), id: ref.slice(at + 1) };
-}
 
 function refOf(model: { provider: string; id: string }): string {
 	return `${model.provider}/${model.id}`;
@@ -1561,17 +1544,6 @@ export function lookupRef(ref: string | null, ctx: { modelRegistry: any; model?:
 	return undefined;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve) => {
-		const done = () => {
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", done);
-			resolve();
-		};
-		const timer = setTimeout(done, ms);
-		signal?.addEventListener("abort", done, { once: true });
-	});
-}
 
 /** True for anything served from this machine or the LAN (llama.cpp, ollama, ...). */
 function isLocalModel(model: { provider: string; baseUrl?: string }): boolean {
@@ -1589,9 +1561,6 @@ function profileFor(cfg: Config, model: { provider: string; id: string; baseUrl?
 		if (found) return optionsFor(cfg, found, model);
 	}
 	return { ...DEFAULT_OPTIONS };
-}
-function kindOf(model: any): Kind {
-	return isLocalModel(model) ? "local" : "online";
 }
 
 /**
@@ -1905,9 +1874,6 @@ const GEN_MARGIN = 512;
  *  emit more than it can is not a longer scratchpad, it is a truncation with extra steps. */
 const SCRATCH_ALLOWANCE = 4_096;
 const SCRATCH_MIN_USEFUL = 1_024;
-function asksForScratch(instructions: string): boolean {
-	return /<draft[\s>]/i.test(instructions) || /<analysis[\s>]/i.test(instructions) || /\bscratchpad\b/i.test(instructions);
-}
 /** The scratchpad share of the output budget: the allowance below, shrunk to whatever a model can
  *  actually still emit above the summary ceiling and the thinking allowance, and written down in the log
  *  when that leaves too little to matter (2026-10-18). It deliberately reads nothing but the model and
@@ -1924,20 +1890,6 @@ function scratchAllowanceFor(model: any, baseCap: number): { allowance: number; 
 }
 
 
-/** When a model THINKS before writing the summary, the reasoning tokens ride inside the same
- * generation cap. Without extra room the thinking eats the summary's budget and the answer is cut
- * mid-sentence (stop reason "length"). Sized for llama.cpp-style local servers; a too-small
- * allowance just fails the attempt, a bigger one only wastes nothing when unused. */
-/** Output-token headroom a THINKING summarizer needs on top of the summary ceiling, so the
- *  reasoning cannot push the generation into a length-stop before the summary is finished. The
- *  reasoning rides inside the same max_tokens budget as the summary itself, and on huge compaction
- *  inputs (200k+) even effort "low" reasons for many thousands of tokens - glm-flash-latest CANNOT
- *  disable reasoning at all (OpenRouter rejects reasoning.enabled=false with "Reasoning is mandatory
- *  for this endpoint"; verified 2026-10-01), so the only cure is room. This is pure permission
- *  headroom: the acceptance window still judges the summary alone (reasoning is subtracted before
- *  measuring), so a chatty model is rejected as before. (Raised 2026-10-01 after glm/qwen compaction
- *  attempts with thinking on died at the cap with the summary half written.) */
-const THINKING_ALLOWANCE: Record<string, number> = { minimal: 4_096, low: 8_192, medium: 12_288, high: 16_384, xhigh: 20_480, max: 20_480 };
 
 /** Output-token headroom a scratchpad needs on top of the summary ceiling, so that a long one cannot
  *  push the summary itself into a length-stop. The scratchpad is stripped before measuring, but it
@@ -2812,15 +2764,6 @@ const SAMPLING_HELP: Record<SamplingKey, string> = {
 	repetition_penalty: 'Repetition penalty for the compaction call only. Qwen3.8-Flash-Next recommends 1.0 in both modes. Sent as repeat_penalty (the name llama-server reads). "ignore" = server default.',
 };
 
-/** Cycle ladders for the TUI rows; the Qwen instruct value sits first where one exists. */
-const SAMPLING_LADDERS: Record<SamplingKey, string[]> = {
-	temperature: ["0.7", "1", "0.9", "0.8", "0.6", "0.5", "0.3", "0.2"],
-	top_p: ["0.8", "0.95", "1", "0.9", "0.7"],
-	top_k: ["20", "40", "60", "10", "0"],
-	min_p: ["0", "0.02", "0.05", "0.1"],
-	presence_penalty: ["1.5", "1", "0.5", "0.2", "0"],
-	repetition_penalty: ["1", "1.05", "1.1", "1.15", "0.9"],
-};
 
 // ---------------------------------------------------------------- the direct request (fork)
 
@@ -3331,23 +3274,6 @@ function isTurnStart(m: any): boolean {
 	}
 }
 
-function combineSignals(signal: AbortSignal | undefined, ms: number, onTimeout?: () => void): { signal: AbortSignal | undefined; dispose: () => void } {
-	if (!ms || ms <= 0) return { signal, dispose: () => {} };
-	const ctrl = new AbortController();
-	const timer = setTimeout(() => {
-		onTimeout?.();
-		ctrl.abort(new Error(`timed out after ${Math.round(ms / 1000)}s`));
-	}, ms);
-	const onAbort = () => ctrl.abort((signal as any)?.reason);
-	signal?.addEventListener("abort", onAbort, { once: true });
-	return {
-		signal: ctrl.signal,
-		dispose: () => {
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
-		},
-	};
-}
 
 /** What "timed out" ought to mean (2026-10-19, item (a) of the 19:15 report). The plain wall-clock
  *  ceiling above cannot tell a slow model from a dead request: it cut a generation that was still
@@ -3465,12 +3391,6 @@ function supportedThinkingLevels(model: any): Level[] {
 	);
 }
 
-/** Translate a hand-written token budget into the smallest level that can hold it. */
-function thinkingForBudget(model: any, budgetTokens: number, available: Level[]): Level {
-	const want = Math.max(0, Math.floor(budgetTokens));
-	const ladder = THINKING_LADDER.filter((s) => available.includes(s.level));
-	return (ladder.find((s) => s.capacity >= want) ?? ladder[ladder.length - 1])?.level ?? "off";
-}
 
 /** What the request will actually ask for, and whether it differs from what the config says. */
 function effectiveThinking(wanted: Level, model: any): { level: Level; note: string } {
@@ -3551,10 +3471,6 @@ function buildRotation(cfg: Config, ctx: { modelRegistry: any; model?: any }): {
 	return { candidates, missing };
 }
 
-function displayRef(ref: string, model: any): string {
-	if (isSessionRef(ref)) return `session (pi's current model: ${shortName(model?.id ?? "unknown")})`;
-	return ref;
-}
 
 type AttemptOutcome =
 	| { ok: true; compaction: any; ref: string; model: any; kind: Kind; measured: number; target: number; min: number; max: number; words: number; seconds: number }
@@ -4025,9 +3941,6 @@ export async function summarizeWithRotation(
 /** A menu option is a title plus one explaining line (used by the fallback menus). */
 type Row = { label: string; hint?: string; run: () => void | Promise<void> };
 
-function opt(title: string, hint: string): string {
-	return hint ? `${title}\n${hint}` : title;
-}
 
 /** The names this file uses for its keys, and pi's name for the same key. pi's parser answers in its
  *  own vocabulary; the rest of the file was written around these shorter names, so they are translated
@@ -4119,18 +4032,7 @@ function chord(data: string, ...piNames: string[]): boolean {
 	return false;
 }
 
-function cut(text: string, width: number): string {
-	if (width <= 0) return "";
-	return text.length <= width ? text : text.slice(0, Math.max(0, width - 1)) + "…";
-}
 
-/** A model's short name in a menu row (no model object needed, so it works for models that are not
- *  the one pi is running). */
-function menuModelLabel(ref: string): string {
-	if (!ref) return "(empty)";
-	const tail = ref.includes("/") ? ref.slice(ref.lastIndexOf("/") + 1) : ref;
-	return tail.replace(/\.gguf$/i, "").slice(0, 34);
-}
 
 function slotLabel(ref: string | null, model: any): string {
 	if (!ref) return "(empty)";
@@ -4141,11 +4043,6 @@ function slotLabel(ref: string | null, model: any): string {
 }
 // ---------------------------------------------------------------- option cycles
 
-/** Timeout periods in the exact order they toggle. 0 = unlimited. */
-function nextValue(values: string[], current: string): string {
-	const i = values.indexOf(current);
-	return values[(i + 1) % values.length];
-}
 
 /** Seconds as the menu shows them ("2 min" ... "unlimited"). */
 function timeoutLabel(ms: number): string {
@@ -4347,33 +4244,9 @@ export function warnOnceAboutTwoCompactors(ctx: any): void {   // exported for t
 	catch { /* a warning never breaks a request */ }
 }
 
-function toggleEnabled(): boolean {
-	if (enableBlockedByOtherCompactor()) return false;
-	update((c) => void (c.enabled = !c.enabled));
-	return true;
-}
 
-function cycleRetries(dir: number): void {
-	update((c) => {
-		c.retries = clamp(c.retries + dir, 0, 5);
-	});
-}
 
-function cycleRetryWait(dir: number): void {
-	const steps = [3, 5, 10, 15, 20, 30, 60];
-	const current = steps.reduce((best, s) => (Math.abs(s - c_retryWait()) < Math.abs(s - best) ? s : best), steps[0]);
-	function c_retryWait(): number {
-		return loadConfig().retryDelaySeconds;
-	}
-	const i = steps.indexOf(current);
-	update((c) => void (c.retryDelaySeconds = steps[clamp(i + dir, 0, steps.length - 1)]));
-}
 
-function cycleNoThinkMarker(): void {
-	update((c) => {
-		c.noThinkMarker = c.noThinkMarker ? "" : DEFAULT_NO_THINK_TAG;
-	});
-}
 
 /** Live reserveTokens from pi's own compaction settings (falls back to pi's documented default). */
 /**
@@ -6995,37 +6868,6 @@ export class LogView implements Component {
 
 // ---------------------------------------------------------------- template menu + editor
 
-function templateMenu(done: (selectedValue?: string) => void): Component {
-	const cfg = loadConfig();
-	const own = cfg.additionalInstruction;
-	const rows: SettingItem[] = [
-		{
-			id: "edit",
-			label: "Edit in the text editor:",
-			currentValue: own ? "custom text saved" : "default text in use",
-			values: ["open the editor"],
-			description:
-				"The text is added after pi's own compaction prompt, for every model (local and online alike). 'default' is the built-in text below - resetting always gets you back to it, exactly as shipped.",
-		},
-		{
-			id: "reset",
-			label: "Reset to the default text:",
-			currentValue: own ? own.split("\n")[0].slice(0, 44) : "already default",
-			values: ["reset now"],
-			description: "Throws away your custom text and puts the default Additional instruction back.",
-		},
-	];
-	return new SettingsList(
-		rows,
-		rows.length + 2,
-		getSettingsListTheme(),
-		(id: string, value: string) => {
-			if (id === "edit" && value === "open the editor") done("edit");
-			else if (id === "reset" && value === "reset now") done("reset");
-		},
-		() => done(),
-	);
-}
 
 /** Break one line into screen rows of at most `width` columns, cutting at a space where there is one.
  *  2026-10-21, on request: a template line is written as one long line, and the read-only preview cut it
@@ -7236,12 +7078,6 @@ async function editText(ctx: Ctx, title: string, prefill: string): Promise<strin
 	return await showText(ctx, title, prefill, true);
 }
 
-/** A one-line value (a number, a tag) in pi's own one-line box, same reason. */
-async function editField(ctx: Ctx, title: string, value: string): Promise<string | undefined> {
-	const inp = (ctx.ui as any)?.input;
-	if (typeof inp === "function") return await inp.call(ctx.ui, title, value);
-	return await showText(ctx, title, value, true);
-}
 
 /**
  * What a summarizer would actually be sent for one model: the template with its placeholders already
