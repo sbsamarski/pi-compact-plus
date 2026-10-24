@@ -1060,7 +1060,7 @@ function migrateV1andV2(raw: any): { models: Record<string, ModelOptions>; retri
 		const looksLocal = refLooksLocal(ref);
 		const v3 = raw?.models?.[ref];
 		if (v3 && typeof v3 === "object") {
-			models[ref] = modelOptionsFrom(v3, noThinkMarker, looksLocal ? "off" : "full");
+			models[ref] = modelOptionsFrom(v3, noThinkMarker);
 			continue;
 		}
 		const kindDefault = looksLocal ? defaultsLocal : defaultsOnline;
@@ -2056,7 +2056,7 @@ export function measuredTokens(
 	if (words > 0) return { tokens: Math.ceil(words * tokPerWordFor(ref)), by: "words" };
 	// No words at all - a summary of nothing but symbols, or an empty reply. The character ruler is the
 	// last thing left standing, and it is a last resort, not a habit.
-	return { tokens: Math.ceil((summary.length * 1.15) / 4), by: "estimate" };
+	return { tokens: Math.ceil((summary.length * 1.15) / 4), by: "chars" };
 }
 
 /**
@@ -3122,7 +3122,7 @@ export async function directCompact(args: {
 	 *  keeps the silence clock restarted for as long as the model is writing: a request that streams
 	 *  is a request that is alive, whatever the wall clock says. Absent keeps the old behaviour. */
 	onActivity?: (chars: number) => void;
-}): Promise<{ text: string; usage: any; lastTurn: number; inputText: string; segmentBy: "count" | "estimate"; fromReasoning: boolean }> {
+}): Promise<{ text: string; usage: any; lastTurn: number; inputText: string; segmentBy: string; fromReasoning: boolean }> {
 	const { preparation, model, registry, sizes, options } = args;
 	const startTurn = args.prevTurn > 0 ? args.prevTurn : 0;
 	const main = serializeRegion(preparation?.messagesToSummarize ?? [], { startTurn, inputStubs: options.inputStubs, argCap: options.argCap });
@@ -4202,7 +4202,7 @@ export function optionsFor(cfg: Config, ref: string, model: any): ModelOptions {
 	// percent keys, so every menu edit was saved, read back as a field nobody read and silently lost.)
 	const stored = cfg.models[ref];
 	const local = isLocalModel(model ?? {});
-	const o = modelOptionsFrom(stored, local ? cfg.noThinkMarker : "", local ? "off" : "full");
+	const o = modelOptionsFrom(stored, local ? cfg.noThinkMarker : "");
 	// A pre-2026-10-05 config stored the limits as percents of the window: convert them with THIS
 	// model's window, so a stored "min 5%" on a 192k model becomes 9,600 tokens, not NaN.
 	const win = Number(model?.contextWindow);
@@ -7992,8 +7992,6 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 				},
 			},
 			{
-			},
-			{
 				label: `Summary timeout period - now ${timeoutLabel(o.timeoutMs)}`,
 				hint: "2 → 3 → 5 → 7 → 10 → 15 → 20 → 30 → 45 → 60 min → unlimited. How long to wait with nothing arriving; output restarts the clock.",
 				run: async () => {
@@ -8776,6 +8774,15 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 					}
 					const note = String(r.note ?? "").slice(0, 160);
 					logLine(loadConfig(), { event: "no_abort_landing_failed", note, source, line, window });
+					// Do not hand the session to pi's own compaction after our own code broke. Until 2026-10-24 this
+					// line called ctx.compact() unconditionally: the hook then cancelled it (pi's summarizer is never
+					// substituted), so all it achieved was an aborted turn and a "Compaction cancelled" line, while the
+					// context stayed over the line and pi asked again on the next request. A parked trigger stays
+					// parked - that is the operator's rule, and it is what stops a broken compaction from looping.
+					if ((r as any)?.parked === true) {
+						ctx.ui?.notify?.("COMPACTION NOT RETIED · the automatic trigger is parked after the failure. Nothing else will be attempted until a manual compaction arms it again (/compact or the menu).", "error");
+						return;
+					}
 					ctx.ui?.notify?.(`Compaction could not land without an interrupt (${note.slice(0, 90)}) - using pi's own path, which stops the turn.`, "warning");
 					(ctx as any).compact?.({
 						onComplete: () => ctx.ui?.notify?.("Automatic compaction landed. The turn was interrupted to run it - send any message and the session continues from the summary.", "info"),
@@ -9118,19 +9125,29 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		lastCompactionDoneAtMs = Date.now();
 
 		const entry: any = (event as any)?.compactionEntry ?? {};
-		logLine(loadConfig(), {
-			event: "compaction_landed",
-			reason: (event as any)?.reason,
-			fromExtension: Boolean((event as any)?.fromExtension),
-			// One figure, not two: when the engine told us what the summary cost, that is the size on the row.
-			// The old character estimate of the stored text sat beside it as a second, different number
-			// (13,090 against an engine count of 12,355) and both looked authoritative.
-			summaryTokens: landedSummarySize(lastLandingInfo, String(entry?.summary ?? c?.summary ?? "")),
-			handoff: true,
-			// No note: the 45-second floor this used to repeat is the trigger's own arithmetic, and this row
-			// is a result the operator reads for one number - the size of the summary that landed.
-			...lastLandingInfo,
-		});
+		// Reporting only, and wrapped: on 2026-10-24 this line read a name that did not exist (`c`), and a
+		// ReferenceError thrown by a report turned a compaction that HAD landed into a failure. A summary
+		// that is in the session file stays in the session file; a lost row is a lost row.
+		try {
+			logLine(loadConfig(), {
+				event: "compaction_landed",
+				reason: (event as any)?.reason,
+				fromExtension: Boolean((event as any)?.fromExtension),
+				// One figure, not two: when the engine told us what the summary cost, that is the size on the row.
+				// The old character estimate of the stored text sat beside it as a second, different number
+				// (13,090 against an engine count of 12,355) and both looked authoritative.
+				summaryTokens: landedSummarySize(lastLandingInfo, String(entry?.summary ?? "")),
+				handoff: true,
+				// No note: the 45-second floor this used to repeat is the trigger's own arithmetic, and this row
+				// is a result the operator reads for one number - the size of the summary that landed.
+				...lastLandingInfo,
+			});
+		} catch (reportErr: any) {
+			logLine(loadConfig(), {
+				event: "accepted_with_warnings",
+				note: `the summary landed; only the row about it failed: ${String(reportErr?.message ?? reportErr).slice(0, 160)}`,
+			});
+		}
 		return undefined;
 	});
 	pi.on("session_compact_failed", (event: any, ctx: any) => {
@@ -9466,7 +9483,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					/* parking is best-effort */
 				}
 			}
-			return { ok: false, note: `the summary could not be written: ${String(err?.message ?? err).slice(0, 150)}` };
+			return { ok: false, parked: true, note: `the summary could not be written: ${String(err?.message ?? err).slice(0, 150)}` };
 		} finally {
 			compactionInFlight = false;
 		}
@@ -9487,6 +9504,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		// compaction just landed (it refuses to start another one while the size is unmeasured), and the
 		// log must carry the COMPACTED row with the size that landed.
 		lastCompactionDoneAtMs = Date.now();
+		// Reporting only, and wrapped, for the same reason as the other route: on 2026-10-24 this line read
+		// a name that did not exist (`entry` - this routine has no entry, only `c`), the ReferenceError
+		// escaped landCompactionNoAbort, and a summary that had already been appended to the session was
+		// reported on screen as a compaction that could not be written.
+		try {
 		logLine(cfg, {
 			event: "compaction_landed",
 			reason: "threshold",
@@ -9494,14 +9516,14 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			// One figure, not two: when the engine told us what the summary cost, that is the size on the row.
 			// The old character estimate of the stored text sat beside it as a second, different number
 			// (13,090 against an engine count of 12,355) and both looked authoritative.
-			summaryTokens: landedSummarySize(lastLandingInfo, String(entry?.summary ?? c?.summary ?? "")),
+			summaryTokens: landedSummarySize(lastLandingInfo, String(c?.summary ?? "")),
 			handoff: false,
 			noAbort: true,
 			source: why,
 			entry: String(entryId ?? "").slice(0, 12),
 			...lastLandingInfo,
 		});
-// The closing block on screen, the same one the interrupting route prints. Both routes announce the
+		// The closing block on screen, the same one the interrupting route prints. Both routes announce the
 		// opening row; until now only that one route announced the end, so a compaction that landed
 		// without an interrupt left the operator reading a start row and then silence (2026-10-23).
 		announceCompaction(
@@ -9513,6 +9535,13 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				failures: lastRotationFailures,
 				trigger: lastLandingInfo?.trigger ?? "auto",
 			}),);
+		} catch (reportErr: any) {
+			logLine(cfg, {
+				event: "accepted_with_warnings",
+				note: `the summary landed without an interrupt; only the report about it failed: ${String(reportErr?.message ?? reportErr).slice(0, 160)}`,
+			});
+			ctx?.ui?.notify?.(`COMPACTED · the summary stands · the report about it could not be built: ${String(reportErr?.message ?? reportErr).slice(0, 120)}`, "warning");
+		}
 		return { ok: true };
 	}
 	// The top-level watcher reaches the nested routine through this single assignment.
