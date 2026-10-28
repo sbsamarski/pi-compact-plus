@@ -4433,7 +4433,7 @@ export function modelOptionsScreen(
 		});
 		rows.push({
 			id: "summaryAim",
-			label: "Summary aim (tokens):",
+			label: "Summary aim:",
 			currentValue: `${fmt(o.summaryAimTokens)} tok`,
 			values: [EDIT_NUMBER],
 			description:
@@ -5775,7 +5775,7 @@ class CompactionMenu implements Component, Focusable {
 			// Enter cycles a choice; a row showing EDIT opens a field to type the number in.
 			{
 				id: "summaryAim",
-				label: "Summary aim (tokens):",
+				label: "Summary aim:",
 				currentValue: `${fmt(o.summaryAimTokens)} tok`,
 				values: [EDIT_NUMBER],
 				description:
@@ -5783,7 +5783,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "summaryMin",
-				label: "Summary minimum (all models):",
+				label: "Summary minimum:",
 				currentValue: `${fmt(o.summaryMinTokens)} tok`,
 				values: [EDIT_NUMBER],
 				description:
@@ -5791,7 +5791,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "summaryMax",
-				label: "Summary maximum (all models):",
+				label: "Summary maximum:",
 				currentValue: `${fmt(o.summaryMaxTokens)} tok`,
 				values: [EDIT_NUMBER],
 				description:
@@ -5799,7 +5799,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "inputstubs",
-				label: "Summarizer input (all models):",
+				label: "Summarizer input:",
 				currentValue: `${o.inputStubs ? "stubs" : "raw"}`,
 				values: ["stubs", "raw"],
 				description:
@@ -5807,7 +5807,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "argcap",
-				label: "Tool-call argument cap (all models):",
+				label: "Tool-call argument cap:",
 				currentValue: `${charCapLabel(o.argCap)}`,
 				values: [EDIT_NUMBER, "full"],
 				description:
@@ -5815,7 +5815,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "preservestubs",
-				label: "Tool stubs in summary (all models):",
+				label: "Tool stubs in summary:",
 				currentValue: `${o.preserveStubs}`,
 				values: withCurrent(PRESERVE_CYCLE as string[], o.preserveStubs),
 				description:
@@ -5823,7 +5823,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "preserveuser",
-				label: "User prompts in summary (all models):",
+				label: "User prompts in summary:",
 				currentValue: `${o.preserveUser}`,
 				values: withCurrent(PRESERVE_CYCLE as string[], o.preserveUser),
 				description:
@@ -5831,7 +5831,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "preservereply",
-				label: "Assistant replies in summary (all models):",
+				label: "Assistant replies in summary:",
 				currentValue: `${o.preserveReplies}`,
 				values: withCurrent(PRESERVE_CYCLE as string[], o.preserveReplies),
 				description:
@@ -5839,7 +5839,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "preservethinking",
-				label: "Assistant thinking in summary (all models):",
+				label: "Assistant thinking in summary:",
 				currentValue: `${o.preserveThinking}`,
 				values: withCurrent(PRESERVE_CYCLE as string[], o.preserveThinking),
 				description:
@@ -5847,7 +5847,7 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "chain",
-				label: "Previous summary (all models):",
+				label: "Previous summary:",
 				currentValue: `${o.chainMode}`,
 				values: ["fold", "attach", "skip"],
 				description:
