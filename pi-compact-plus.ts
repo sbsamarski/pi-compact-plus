@@ -152,9 +152,9 @@ type ModelOptions = {
 	/** How long to keep the request when NOTHING is arriving. Every character that comes in restarts
 	 *  it, so this is a silence limit rather than a length limit (2026-10-19). 0 = unlimited. */
 	timeoutMs: number;
-	/** THE SUMMARY AIM: this percent of the model's ctx window (2026-10-03: everything - aim, min,
-	 *  max - is a window percent; the numbers the settings show are the numbers enforced). */
-	summaryPercent: number;
+	/** THE SUMMARY AIM, in tokens (a window percent until 2026-10-25, on request: a number of one's own
+	 *  should not move when the model changes). Still clamped by the acceptance floor and ceiling below. */
+	summaryAimTokens: number;
 	/** THE LIMITS (2026-10-03): percent of the model's WINDOW, used DIRECTLY as the acceptance
 	 *  bounds - a summary below min or above max is thrown away. The aim is clamped inside them,
 	 *  so at a 95k window 23% means 21,850 tokens, and the same settings scale on a 1M model. */
@@ -463,15 +463,25 @@ export /**
  * with pi's own summary. Refused in a harness, which must never touch pi's real settings file.
  */
 function setPiCompactionEnabled(on: boolean): boolean {
+	return setPiCompactionNumbers({ enabled: on }) === "";
+}
+
+/**
+ * Write pi's own compaction settings (2026-10-25, on request). The trigger reserve and the verbatim tail
+ * live in pi's `settings.json` and are READ from there by this extension, so the rows that change them
+ * have to write there too - a number stored twice is a number that disagrees with itself. Returns "" on
+ * success, or the reason it could not write; a test harness never touches the real file.
+ */
+function setPiCompactionNumbers(patch: { reserveTokens?: number; keepRecentTokens?: number; enabled?: boolean }): string {
 	try {
 		const path = process.env.PI_SETTINGS ?? join(AGENT_DIR, "settings.json");
-		if (writesBlocked() || process.env.PI_SETTINGS) return false;
+		if (writesBlocked() || process.env.PI_SETTINGS) return "this run is pointed at a test copy, so pi's real settings file was left alone";
 		const raw = JSON.parse(readFileSync(path, "utf8"));
-		raw.compaction = { ...(raw.compaction ?? {}), enabled: on };
+		raw.compaction = { ...(raw.compaction ?? {}), ...patch };
 		writeFileSync(path, JSON.stringify(raw, null, 2) + String.fromCharCode(10), "utf8");
-		return true;
-	} catch {
-		return false; /* a settings file we cannot read must not break the switch */
+		return "";
+	} catch (e: any) {
+		return String(e?.message ?? e).slice(0, 140);
 	}
 }
 
@@ -882,7 +892,7 @@ function modelOptionsFrom(src: any, fallbackMarker: string): ModelOptions {
 	const o: ModelOptions = {
 		thinking: (levels.includes(src?.thinking) ? src.thinking : "off") as Level,
 		timeoutMs: clamp(Math.round(numOr(src?.timeoutMs, 600_000)), 0, 7_200_000),
-		summaryPercent: pctField(src?.summaryPercent, DEFAULT_OPTIONS.summaryPercent),
+		summaryAimTokens: nonNegField(src?.summaryAimTokens, DEFAULT_OPTIONS.summaryAimTokens),
 		summaryMinTokens: nonNegField(src?.summaryMinTokens, DEFAULT_OPTIONS.summaryMinTokens),
 		summaryMaxTokens: nonNegField(src?.summaryMaxTokens, DEFAULT_OPTIONS.summaryMaxTokens),
 		legacyMinPct: typeof src?.summaryMinPercent === "number" && Number.isFinite(src.summaryMinPercent) ? src.summaryMinPercent : undefined,
@@ -1120,6 +1130,12 @@ export function changedSettings(before: Config, after: Config): string[] {
 		}
 		const b = (before.models ?? {}) as Record<string, Record<string, unknown>>;
 		const a = after.models ?? {};
+		// The order of the keys IS a setting - it is the try order - so a difference in how the two objects
+		// stringify can mean one thing only: a model moved place. Comparing model by model cannot see that,
+		// because every field of every model is unchanged; the list silently refused to reorder until
+		// 2026-10-25, when the operator reported that pressing a digit did nothing.
+		const orderBefore = Object.keys(b).join("|");
+		const orderAfter = Object.keys(a).join("|");
 		for (const ref of new Set([...Object.keys(b), ...Object.keys(a)])) {
 			const x = b[ref] ?? {};
 			const y = a[ref] ?? {};
@@ -1129,6 +1145,7 @@ export function changedSettings(before: Config, after: Config): string[] {
 				}
 			}
 		}
+		if (orderBefore !== orderAfter) out.push("models.order");
 	}
 	return out;
 }
@@ -1787,8 +1804,10 @@ export function sizesFor(profile: ModelOptions, opts: { inputTokens: number; his
 	let max = Math.max(1_024, Math.min(maxTok, regionCeil));
 	if (maxTok > regionCeil) notes.push("max capped to the region itself (a summary longer than the source is pointless)");
 	let min = Math.min(Math.max(128, minTok), max);
-	const aimPct = pctField(profile.summaryPercent, DEFAULT_OPTIONS.summaryPercent);
-	let target = clamp(Math.round((aimPct * (window > 0 ? window : regionCeil)) / 100), min, max);
+	// THE AIM IS A TOKEN NUMBER now (2026-10-25, on request), not a percentage of a window that changes
+	// with every model switch: 22,000 means 22,000 on a 128k model and on a 200k one. The acceptance
+	// floor and ceiling still clamp it, so an aim above the ceiling cannot make an over-long summary.
+	let target = clamp(Math.round(nonNegField(profile.summaryAimTokens, DEFAULT_OPTIONS.summaryAimTokens)), min, max);
 	if (prevTokens > 0 && profile.chainMode === "attach") {
 		// The verbatim previous summary rides INSIDE the summary: raise the ceiling by its size and
 		// demand it in the minimum too - a lazy model cannot pass by returning only the previous
@@ -3758,7 +3777,7 @@ export const DEFAULT_OPTIONS: ModelOptions = {
 	sampling: { ...SAMPLING_DEFAULTS },
 	thinking: "off",
 	timeoutMs: 600_000, // 10 min
-	summaryPercent: 10,
+	summaryAimTokens: 22_000,
 	summaryMinTokens: 4096,
 	summaryMaxTokens: 30_000,
 	inputStubs: true,
@@ -3787,7 +3806,7 @@ export function optionsFor(cfg: Config, ref: string, model: any): ModelOptions {
 	if (lmax !== undefined) o.summaryMaxTokens = lmax;
 	o.summaryMinTokens = tok(o.summaryMinTokens, DEFAULT_OPTIONS.summaryMinTokens);
 	o.summaryMaxTokens = Math.max(o.summaryMinTokens, tok(o.summaryMaxTokens, DEFAULT_OPTIONS.summaryMaxTokens));
-	o.summaryPercent = pctField(o.summaryPercent, DEFAULT_OPTIONS.summaryPercent);
+	o.summaryAimTokens = nonNegField(o.summaryAimTokens, DEFAULT_OPTIONS.summaryAimTokens);
 	delete o.legacyMinPct;
 	delete o.legacyMaxPct;
 	return o;
@@ -3806,7 +3825,7 @@ function optionsOfAnyModel(cfg: Config, ref: string, model: any): ModelOptions {
  * What stays per-model: the thinking level, the no-think tag, the timeout and the sampling flags.
  */
 export const GLOBAL_MODEL_KEYS = [
-	"summaryPercent", "summaryMinTokens", "summaryMaxTokens", "inputStubs", "argCap",
+	"summaryAimTokens", "summaryMinTokens", "summaryMaxTokens", "inputStubs", "argCap",
 	"preserveStubs", "preserveUser", "preserveReplies", "preserveThinking", "chainMode",
 ] as const;
 
@@ -4367,7 +4386,7 @@ export class OrderList implements Component, Focusable {
 // model keeps its reasoning and sampling controls here and its compaction settings sit with the rest
 // of the compaction settings.
 export const MODEL_KEEP_ROWS = ["thinking", "nothink", "timeout", "sampling"] as const;
-export const MODEL_MOVED_ROWS = ["summaryPct", "summaryMin", "summaryMax", "inputstubs", "argcap", "preservestubs", "preserveuser", "preservereply", "preservethinking", "chain", "previewDesc"] as const;
+export const MODEL_MOVED_ROWS = ["summaryAim", "summaryMin", "summaryMax", "inputstubs", "argcap", "preservestubs", "preserveuser", "preservereply", "preservethinking", "chain", "previewDesc"] as const;
 
 // One selected model's options. Every row toggles through its values on Enter/Space:
 // The full reasoning: DESIGN.md -> modelOptionsScreen
@@ -4413,12 +4432,12 @@ export function modelOptionsScreen(
 				"Enter opens a free numeric entry in minutes (0 = unlimited); cycling reaches 'unlimited'. This is how long to wait with NOTHING arriving: every character that comes in restarts the clock, so a model that keeps writing keeps its request however slow it is. A second ceiling nobody sets - twice what this model's last measured speed says the summary should take, never under 20 minutes, never over 2 hours - stops a stream that produces forever. When either one fires the next model in the Compaction models list is asked, and the log says which clock it was.",
 		});
 		rows.push({
-			id: "summaryPct",
-			label: "Summary aim (% of ctx window):",
-			currentValue: `${o.summaryPercent}% (now: ~${fmt(Math.round((o.summaryPercent * (ctx?.model?.contextWindow ?? 0)) / 100))} tok)`,
+			id: "summaryAim",
+			label: "Summary aim (tokens):",
+			currentValue: `${fmt(o.summaryAimTokens)} tok`,
 			values: [EDIT_NUMBER],
 			description:
-				"THE SUMMARY AIM: this percent of the context GETTING COMPACTED - the session ctx minus the preserved tail, after the stubbing pass. The value on the right is what this percent aims for right now (example: ctx 441k, preserve 100k, region 341k; 15% aims 51,150 tok). The acceptance bounds are the min/max rows below. Enter opens a free numeric entry (1-99). Default 10.",
+				"HOW LONG the summary should be, in tokens - a number of your own, not a share of a window that moves with every model switch. It is still clamped on the right is what this percent aims for right now (example: ctx 441k, preserve 100k, region 341k; 15% aims 51,150 tok). The acceptance bounds are the min/max rows below. Enter opens a free numeric entry (1-99). Default 10.",
 		});
 		rows.push({
 			id: "summaryMin",
@@ -4541,7 +4560,7 @@ export function modelOptionsScreen(
 			} else if (id === "timeout") {
 				if (value === EDIT_NUMBER) { if (onExit) { onExit(id); return; } rebuildList(); }
 				else setModelOptions(ref, { timeoutMs: parseDuration(value) });
-			} else if (id === "summaryPct" || id === "summaryMin" || id === "summaryMax") {
+			} else if (id === "summaryAim" || id === "summaryMin" || id === "summaryMax") {
 				// Free numeric entry. pi's input overlay must NOT open while this screen is mounted:
 				// the screen's list keeps consuming the keys, the input's promise hangs, and the empty
 				// overlay sticks on top of everything (bug 2026-10-01). The request therefore travels
@@ -5704,41 +5723,39 @@ class CompactionMenu implements Component, Focusable {
 			},
 			{
 				id: "reserveTok",
-				label: "Autocompaction trigger point:",
+				label: "Compaction trigger point (pi's reserveTokens):",
 				currentValue: (() => {
 					const win = (this.ctx as any)?.model?.contextWindow ?? 0;
-					const set = cfg.scaling.reserveTokens;
+					const set = readPiCompactionSettings().reserveTokens;
 					const eff = extReserve(this.ctx);
 					// The number that was typed is the number that is shown. It used to show the reserve IN FORCE
 					// only, which was honest but unreadable as an editor: setting 30,000 while pi's own reserve was
 					// 30,600 printed 30,600 back, and the operator reasonably read that as the edit not taking
 					// (2026-10-22). The line is the setting now, so the two can only differ when no number is set.
-					if (!(win > 0)) return set > 0 ? `${fmt(set)} tok before a full window` : `automatic: ${fmt(eff)} tok before a full window`;
-					const head = `${fmt(eff)} tok before the ${fmt(win)} tok window (fires at ${fmt(triggerPoint(this.ctx))} tok)`;
-					return set > 0
-						? head + (eff !== set ? ` (your ${fmt(set)} cannot fit this window; ${fmt(eff)} is used)` : "")
-						: head + ` (no number set: a tenth of the window, floor 16,384)`;
+					// The stored number and the line it produces, both shown: on a smaller model the whole
+					// reserve cannot be spent, and a row printing only one of the two read like an edit that
+					// had not taken (2026-10-22).
+					if (!(win > 0)) return `${fmt(set)} tok of room (no model chosen yet, so no line to show)`;
+					return `${fmt(set)} tok of room on the ${fmt(win)} tok window: fires at ${fmt(triggerPoint(this.ctx))} tok` + (eff !== set ? ` (only ${fmt(eff)} fits this window)` : "");
 				})(),
 				values: [EDIT_NUMBER],
 				description:
-					"Automatic compaction fires once the context is this close to the top of the window: the line " +
-						"is the model's context window minus this number, so one value means the same on every model. " +
-						"0 leaves the choice to pi's own reserveTokens. This is the mirror of that pi setting and the " +
-						"two do interact: if pi's reserveTokens is LARGER than this, pi asks to compact first and this " +
-						"extension holds the ask until its own line, which costs a full pass over the context each turn " +
-						"until then - the pi's own reserveTokens row below shows both points. The line moves the moment " +
-						"this number is saved, so set it while the context is small rather than in the middle of a run.",
+					"Compaction fires once the context is this close to the top of the window: the line is the " +
+						"model's context window minus this number. Since 2026-10-25 this IS pi's " +
+						"`compaction.reserveTokens` - the one number pi times itself by and the one this extension reads, " +
+						"so there is no second setting to keep in step. Saving writes it into pi's settings.json, and " +
+						"pi reads that file when it starts, so the row reloads pi afterwards (or says to do it by hand).",
 			},
 			{
 				id: "preserveTok",
 				label: "Preserve tail context:",
-				currentValue: `${fmt(extKeepRecent(this.ctx))} tok of the context tail kept verbatim` + (cfg.scaling.preserveTokens !== extKeepRecent(this.ctx) ? ` (you set ${fmt(cfg.scaling.preserveTokens)}, this window keeps ${fmt(extKeepRecent(this.ctx))})` : ""),
+				currentValue: `${fmt(extKeepRecent(this.ctx))} tok of the context tail kept word for word` + (readPiCompactionSettings().keepRecentTokens !== extKeepRecent(this.ctx) ? ` (pi's ${fmt(readPiCompactionSettings().keepRecentTokens)}; only ${fmt(extKeepRecent(this.ctx))} fits this window)` : ""),
 				values: [EDIT_NUMBER],
 				description:
-					"How much of the window is kept free for the conversation that stays word for word: the tail " +
-					"compaction keeps, and the recent tool results elision refuses to stub. This is the extension's " +
-					"equivalent of pi's keepRecentTokens. Also a token count now, with the old min and max limit rows " +
-					"gone. Enter opens a free numeric entry.",
+					"How much of the recent conversation survives a compaction word for word: pi keeps this much " +
+					"when it picks the cut point, and elision refuses to stub tool results inside it. Since " +
+					"2026-10-25 this IS pi's `compaction.keepRecentTokens`, written into pi's settings.json and read " +
+					"back from there - the extension keeps no copy of its own. Saving reloads pi (or says to).",
 			},
 		// pi's own compaction settings are read for information only. This extension never writes
 		// that file: it compacts on its own trigger with its own models, which works whether pi's
@@ -5757,14 +5774,12 @@ class CompactionMenu implements Component, Focusable {
 			// differs per model: the thinking level, the no-think tag, the summary timeout, the sampling flags.
 			// Enter cycles a choice; a row showing EDIT opens a field to type the number in.
 			{
-				id: "summaryPct",
-				label: "Summary aim:",
-				// The percent alone told nobody how big that is: the token number rides next to it, the
-				// way the other size rows show their tokens (2026-10-07).
-				currentValue: `${o.summaryPercent}% (${fmt(Math.round((o.summaryPercent / 100) * ((this.ctx as any)?.model?.contextWindow ?? 0)))} tok)`,
+				id: "summaryAim",
+				label: "Summary aim (tokens):",
+				currentValue: `${fmt(o.summaryAimTokens)} tok`,
 				values: [EDIT_NUMBER],
 				description:
-					"What percent of the context that gets summarized the summary should aim at. One setting for every model in the try order.",
+					"How long the summary should be, in tokens. One setting for every model in the try order.",
 			},
 			{
 				id: "summaryMin",
@@ -5917,7 +5932,7 @@ class CompactionMenu implements Component, Focusable {
 					this.onAction("__exit:edit-nothinktag:menu");
 					return;
 				}
-				if (id === "summaryPct" || id === "summaryMin" || id === "summaryMax" || id === "argcap") {
+				if (id === "summaryAim" || id === "summaryMin" || id === "summaryMax" || id === "argcap") {
 					// A number: the box runs over the plain chat. This is the ALL-MODELS copy of the setting, so
 					// it asks for the first model in the order WITHOUT saying "open that model's options" - the
 					// per-model action used here is what threw the operator into the 4-item model screen after a
@@ -7229,11 +7244,11 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
 	let title = "", cur = 0, lo = 0, hi = 0, unit = "";
 	let save: (v: number) => void = () => {};
 	let shown: (v: number) => string = (v) => fmt(v);
-	if (key === "summaryPct") {
-		title = "Summary aim — % of the ctx window — default 10";
-		cur = o.summaryPercent; lo = 1; hi = 99; unit = "percent of the ctx window";
-		save = (v) => setModelOptions(ref, { summaryPercent: v });
-		shown = (v) => `${v}%`;
+	if (key === "summaryAim") {
+		title = "Summary aim - tokens the summary should reach - default 22000";
+		cur = o.summaryAimTokens; lo = 256; hi = 1_000_000; unit = "tokens";
+		save = (v) => setModelOptions(ref, { summaryAimTokens: v });
+		shown = (v) => `${fmt(v)} tok`;
 	} else if (key === "summaryMin") {
 		title = "Summary min — absolute tokens (the acceptance floor) — default 4096";
 		cur = o.summaryMinTokens; lo = 0; hi = 1_000_000; unit = "tokens (absolute)";
@@ -7304,8 +7319,8 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
  */
 const NUMBER_EDITORS: Record<string, { title: string; lo: number; hi: number; unit: string; def: number; apply: (v: number) => string | undefined }> = {
 	retryWait: { title: "Wait between retries", lo: 0, hi: 300, unit: "seconds", def: 5, apply: (v) => { update((c) => void (c.retryDelaySeconds = v)); return undefined; } },
-	reserveTok: { title: "Autocompaction trigger point", lo: 0, hi: 10_000_000, unit: "tokens before the full context window size (0 = pi's own reserve)", def: 0, apply: (v) => { update((c) => void (c.scaling.reserveTokens = v)); return undefined; } },
-	preserveTok: { title: 'Preserve tail context', lo: 1024, hi: 10_000_000, unit: 'tokens of the context tail preserved verbatim', def: 20_000, apply: (v) => { update((c) => void (c.scaling.preserveTokens = v)); return undefined; } },
+	reserveTok: { title: "Compaction trigger point", lo: 1_024, hi: 10_000_000, unit: "tokens of room left free at the top of the window (pi's reserveTokens)", def: 0, apply: (v) => setPiCompactionNumbers({ reserveTokens: v }) || undefined },
+	preserveTok: { title: 'Preserve tail context', lo: 1024, hi: 10_000_000, unit: "tokens of the tail kept word for word (pi's keepRecentTokens)", def: 20_000, apply: (v) => setPiCompactionNumbers({ keepRecentTokens: v }) || undefined },
 	elisionStart: { title: "Elision start", lo: 1, hi: 99, unit: "percent of window", def: 70, apply: (v) => { update((c) => void (c.elision = { ...c.elision, softPercent: v })); return undefined; } },
 	elisionProtect: { title: "Elision protect (tool results)", lo: 0, hi: 1_000_000, unit: "tokens", def: 20_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, protectRecentTokens: v })); return undefined; } },
 	elisionTail: { title: "Stub tail", lo: 0, hi: 100_000, unit: "chars (0 = none; 'full' is a separate row value)", def: 200, apply: (v) => { update((c) => void (c.elision = { ...c.elision, stubTailChars: v })); return undefined; } },
@@ -7324,8 +7339,8 @@ async function editNumber(ctx: Ctx, id: string): Promise<void> {
 	const cfg = loadConfig();
 	const current =
 		id === "retryWait" ? cfg.retryDelaySeconds
-		: id === "reserveTok" ? cfg.scaling.reserveTokens
-		: id === 'preserveTok' ? cfg.scaling.preserveTokens
+		: id === "reserveTok" ? readPiCompactionSettings().reserveTokens
+		: id === 'preserveTok' ? readPiCompactionSettings().keepRecentTokens
 		: id === "piReserve" ? readPiReserveTokens()
 		: id === "elisionStart" ? cfg.elision.softPercent
 		: id === "elisionProtect" ? cfg.elision.protectRecentTokens
@@ -7338,7 +7353,26 @@ async function editNumber(ctx: Ctx, id: string): Promise<void> {
 	const v = await askNumber(ctx, `${d.title} — default ${fmt(d.def)} ${d.unit}`, current, d.lo, d.hi, d.unit);
 	if (v === undefined) return;
 	const err = d.apply(v);
-	if (err) ctx.ui?.notify?.(`Not saved: ${err}`, "error");
+	if (err) {
+		ctx.ui?.notify?.(`Not saved: ${err}`, "error");
+		return;
+	}
+	// TWO OF THESE NUMBERS LIVE IN PI'S FILE (2026-10-25, on request): pi reads its settings.json once, when
+	// it starts, so a saved number is inert until pi reads it again. The row says where the number went and
+	// asks pi to reload itself - which is safe at exactly this moment, because the operator pressed Enter on
+	// a settings row, so the session is idle. Where pi cannot reload itself from here, it says so plainly
+	// instead of leaving a number that looks saved and is not.
+	if (id === "reserveTok" || id === "preserveTok") {
+		const pi = readPiCompactionSettings();
+		const where = `pi's settings.json (${fmt(pi.reserveTokens)} tok of room, ${fmt(pi.keepRecentTokens)} tok kept word for word)`;
+		const reload = (ctx as any)?.reload;
+		if (typeof reload === "function") {
+			ctx.ui?.notify?.(`Saved in ${where}. Reloading pi now so the number takes effect.`, "info");
+			void Promise.resolve(reload.call(ctx)).catch(() => undefined);
+		} else {
+			ctx.ui?.notify?.(`Saved in ${where}, but pi cannot reload itself from this screen - run /reload (or restart pi) for it to take effect.`, "warning");
+		}
+	}
 }
 
 /**
@@ -7444,11 +7478,11 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 				},
 			},
 			{
-				label: `Summary % of region - now ${o.summaryPercent}%`,
+				label: `Summary aim - now ${fmt(o.summaryAimTokens)} tok`,
 				hint: "THE SUMMARY AIM: this percent of the region being folded (measured after the stubbing pass). Free numeric entry, 1-99.",
 				run: async () => {
-					const v = await askNumber(ctx, "Summary aim — % of the ctx window — default 10", o.summaryPercent, 1, 99, "percent");
-					if (v !== undefined) setModelOptions(ref, { summaryPercent: v });
+					const v = await askNumber(ctx, "Summary aim - tokens the summary should reach - default 22000", o.summaryAimTokens, 256, 1_000_000, "tokens");
+					if (v !== undefined) setModelOptions(ref, { summaryAimTokens: v });
 				},
 			},
 			{
@@ -7638,7 +7672,7 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 		const o = optionsFor(cfg, ref, model);
 		const th = model ? effectiveThinking(o.thinking, model) : { level: o.thinking, note: "" };
 		lines.push(
-			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${o.summaryPercent}% of the ctx window, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, thinking ${th.level}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
+			`  ${i + 1}. ${slotLabel(ref, model)} — summary aim ${fmt(o.summaryAimTokens)} tok, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, thinking ${th.level}, timeout ${timeoutLabel(o.timeoutMs)}, sampling ${samplingLabel(o.sampling)}`,
 		);
 	});
 	lines.push(`retries: ${cfg.retries} per model, ${cfg.retryDelaySeconds}s apart · no-think tag: ${cfg.noThinkMarker || "(empty)"} · additional instruction: ${cfg.additionalInstruction ? "custom" : "default (turn ledger)"} · transcript pointer: ${cfg.transcriptPointer ? "on" : "off"}`);
@@ -8464,6 +8498,10 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		try {
 			logLine(loadConfig(), {
 				event: "compaction_landed",
+				// WHICH MODEL WROTE IT, on the screen as well as in the file (2026-10-25, on request). The row
+				// used to name no model at all, so a COMPACTED line said a summary existed and nothing about who
+				// wrote it - the model was only ever on the earlier TRY line, minutes back.
+				ref: String((lastLandingInfo as any)?.ref ?? ""),
 				reason: (event as any)?.reason,
 				fromExtension: Boolean((event as any)?.fromExtension),
 				// One figure, not two: when the engine told us what the summary cost, that is the size on the row.
@@ -8528,7 +8566,12 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		// two compactors would be live in this session (adviseOnPiFlag, which nags at most once an hour and
 		// writes nothing anywhere). This is NOT where pi's line used to be kept equal to ours - the pre-request
 		// coupling that did that came out on 2026-10-18, and pi's settings.json is read here and never written.
-		// A comment claiming a write survived three days longer than the code that justified it did.
+		// A comment that describes a write which no longer exists is worse than no comment: it has been read
+		// as fact while the code did something else. (As of 2026-10-25 this extension DOES write pi's
+		// settings - the compaction switch and the two numbers - but from the settings rows, not from here.)
+		// Remember whose screen to write on: this event arrives with every request, so it is the freshest
+		// session context there is, and the log rows mirrored to the screen are written on it.
+		watcherCtx = ctx;
 		try {
 			const cc = loadConfig();
 			// FULLY OFF = invisible (2026-10-06): no settings write, no timer, no elision, no log line.
@@ -8806,7 +8849,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		let answer: any;
 		try {
 			answer = await handleCompaction(
-				{ reason: "threshold", windowSize: ctx?.model?.contextWindow ?? 0, customInstructions: undefined, signal: undefined },
+				// A button press is a MANUAL run, and must be labelled so: this route used to announce every
+				// request as "threshold", which is an automatic reason, and a parked trigger therefore refused
+				// the operator's own "Compaction with resume" with "parked after repeated failures" (2026-10-25).
+				// Only the timer and the settle check arrive as automatic.
+				{ reason: why === "menu" ? "manual" : "threshold", windowSize: ctx?.model?.contextWindow ?? 0, customInstructions: undefined, signal: undefined },
 				ctx,
 				preparation,
 			);
@@ -8858,7 +8905,8 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		try {
 		logLine(cfg, {
 			event: "compaction_landed",
-			reason: "threshold",
+			ref: String((lastLandingInfo as any)?.ref ?? ""),
+			reason: why === "menu" ? "manual" : "threshold",
 			fromExtension: true,
 			// One figure, not two: when the engine told us what the summary cost, that is the size on the row.
 			// The old character estimate of the stored text sat beside it as a second, different number
@@ -9125,7 +9173,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 								.map((ref, i) => {
 									const model = lookupRef(ref, ctx);
 									const o = optionsFor(loadConfig(), ref, model);
-									return `${i + 1}. ${ref} — summary aim ${o.summaryPercent}% of the ctx window, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, ${timeoutLabel(o.timeoutMs)}, ${o.thinking}`;
+									return `${i + 1}. ${ref} — summary aim ${fmt(o.summaryAimTokens)} tok, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, ${timeoutLabel(o.timeoutMs)}, ${o.thinking}`;
 								})
 								.join("\n"),
 						);
@@ -9152,7 +9200,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (parts.length === 2) {
 						const model = lookupRef(ref, ctx);
 						const o = optionsFor(loadConfig(), ref, model);
-						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${o.summaryPercent}% of the ctx window, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
+						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${fmt(o.summaryAimTokens)} tok, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
 					}
 					const patch: Partial<ModelOptions> = {};
 					for (let i = 2; i < parts.length; i += 2) {
@@ -9161,7 +9209,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						if (!key || value === undefined) break;
 						if (key === "thinking" && ALL_LEVELS.includes(value as Level)) patch.thinking = value as Level;
 						else if (key === "timeout") patch.timeoutMs = clamp(Math.round(Number(value) * 60_000) || 0, 0, 7_200_000);
-						else if (key === "aim" || key === "pct") patch.summaryPercent = clamp(Math.round(Number(value)), 1, 99);
+						else if (key === "aim" || key === "pct" || key === "tokens") patch.summaryAimTokens = clamp(Math.round(Number(value)), 256, 1_000_000);
 						else if (key === "min") patch.summaryMinTokens = clamp(Math.round(Number(value)), 0, 1_000_000);
 						else if (key === "max") patch.summaryMaxTokens = clamp(Math.round(Number(value)), 1, 1_000_000);
 						
@@ -9179,7 +9227,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					if (!loadConfig().models[ref]) rotateAdd(ref);
 					setModelOptions(ref, patch);
 					const o2 = optionsFor(loadConfig(), ref, lookupRef(ref, ctx));
-					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${o2.summaryPercent}% of the ctx window, limits min ${fmt(o2.summaryMinTokens)} / max ${fmt(o2.summaryMaxTokens)} tok, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
+					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${fmt(o2.summaryAimTokens)} tok, limits min ${fmt(o2.summaryMinTokens)} / max ${fmt(o2.summaryMaxTokens)} tok, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
 				}
 				case "elision": {
 					const sub = (parts[1] ?? "").toLowerCase();
