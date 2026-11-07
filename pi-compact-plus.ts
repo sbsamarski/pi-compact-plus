@@ -10,6 +10,7 @@
 
 import { compact, convertToLlm, estimateTokens, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { streamSimple as piStreamSimple } from "@earendil-works/pi-ai/compat";
+import { Type } from "@earendil-works/pi-ai";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -106,8 +107,19 @@ export function migrateScaling(raw: any, base: ScalingConfig, window = LEGACY_WI
 }
 
 type ElisionConfig = {
-	/** false = never stub anything in live requests. */
+	/** AUTO-ELISION. false = never stub anything in live requests. This switch says nothing about
+ *  the summary request, which has its own switch (compactEnabled below). */
 	enabled: boolean;
+	/** COMPACTION ELISION. false = the summariser reads every tool result in full. true = results over
+ *  stubFromChars reach the summariser as stubs. Two switches because one "elision" word used to cover
+ *  both jobs, and turning the live sweep off did not stop the summary request from being shortened
+ *  (2026-11-01). This one is GLOBAL on purpose (2026-11-01): what the summariser is allowed to read is
+ *  a decision about the summary, not a property of the model being summarised. */
+	compactEnabled: boolean;
+	/** The trigger for BOTH kinds of elision, in characters: a tool result shorter than this is left
+ *  in one piece, since a stub of a short answer saves nothing. Stubs are also never allowed to come
+ *  out longer than the text they replace. */
+	stubFromChars: number;
 	/** Start stubbing when the live context reaches this percent of the session model's window. */
 	softPercent: number;
 	/** The newest this many tokens of context are never touched (the working model keeps its
@@ -116,6 +128,16 @@ type ElisionConfig = {
 	/** The tail excerpt a stub carries, in characters (the exit/status line is always included).
 	 *  "full" = the whole result text (a stub that saves nothing - elision becomes pointless). */
 	stubTailChars: CharCap;
+	/** Cap for tool-call argument VALUES, per value, in characters. "full" = uncapped. A whole file inside a
+	 *  write/edit argument otherwise arrives uncapped, and the cut keeps the BEGINNING AND THE END of the
+	 *  value with a marker naming the hole (see capArgValue).
+	 *  GLOBAL since 2026-11-01 - it used to be a per-model option, which meant one number in one model's row
+	 *  quietly governed what every other model's summaries were built from.
+	 *  Applies to BOTH routes since the same day: the summariser's input, and - as of 2026-11-01 - the live
+	 *  sweep. The live half matters more than it looks: a long `bash` or `edit` call used to ride EVERY
+	 *  request until the compaction, because auto-elision judged a tool call by its RESULT and left the
+	 *  argument side alone entirely. */
+	argCap: CharCap;
 	/** A new stub batch is applied only when it saves at least this many tokens (prompt caches
 	 *  charge a re-prefill per change; batching amortizes that cost). */
 	minSavingsTokens: number;
@@ -131,6 +153,23 @@ type ElisionConfig = {
 	 *  next request: on a big window the batches fired one after another and each one cost a fresh
 	 *  upload of most of the context. One batch per gap, however many results pile up in between. */
 	minBatchGapSec: number;
+	/** ONE CONTIGUOUS SWEEP, NO HOLES (2026-11-05). Elision starts at the first tool call that is not elided
+	 *  yet and runs forward to the protected window, taking everything on the way. The server's cache breaks
+	 *  at that first changed call and nowhere earlier, because everything above it is byte for byte what the
+	 *  server already holds - so the cost of a sweep is the length of the context AFTER that point, and the
+	 *  only thing worth controlling is not reaching back above it. When a backlog exceeds maxResultsPerBatch,
+	 *  the batch takes the OLDEST ones so the next pass continues where this one stopped.
+	 *  OFF takes the NEWEST ones instead, which leaves raw holes that nothing ever fills; it exists only to
+	 *  compare the two against each other. */
+	cacheFriendly: boolean;
+	/** Register `recall_tool_result`? The tool is what makes a pointer in a stub worth anything: the original
+	 *  stays in the session file, and the model can ask for it back by number. */
+	recallTool: boolean;
+	/** Put `full: #N` in a stub. Off means the model cannot get an elided result back. */
+	recallPointer: boolean;
+	/** How much one recall response may return, in characters. This is the budget that keeps a recall tool
+	 *  from putting a 187,402-character result straight back into the window it was just removed from. */
+	recallMaxChars: number;
 	/** A new batch also needs at least this many results waiting - the per-fire prefill cost is
 	 *  roughly fixed (the whole tail after the break point re-prefills), so more results per fire
 	 *  means better amortization. Big results each clearing minSavingsTokens would otherwise fire
@@ -143,8 +182,26 @@ type ElisionConfig = {
  * of these fields in `overrides`.
  */
 /**
- * The options of ONE model. Every model in the Compaction models list carries its own values; models
- * not in the list are only ever asked with the internal defaults (DEFAULT_OPTIONS below).
+ * The settings that are ONE setting for the whole extension - see Config.shared. They live here as a type
+ * so `optionsFor` can layer them under any model's own options and every existing read site
+ * (`profile.summaryAimTokens` and friends) keeps working unchanged.
+ */
+type SharedModelOptions = {
+	summaryAimTokens: number;
+	summaryMinTokens: number;
+	summaryMaxTokens: number;
+	preserveStubs: Preserve;
+	preserveUser: Preserve;
+	preserveReplies: Preserve;
+	preserveThinking: Preserve;
+	chainMode: ChainMode;
+};
+
+/**
+ * The options of ONE model. What stays genuinely per-model: the thinking level, the silence timeout, the
+ * no-think tag and the sampling flags. The summary sizes and the "what the summary keeps" levels are ONE
+ * setting for every model and live in Config.shared since 2026-11-05; a model that is not in the Compaction
+ * models list is asked with those shared values plus the internal defaults, not with a blank profile.
  */
 type ModelOptions = {
 	/** Thinking level for this model's summarisation request. */
@@ -152,12 +209,16 @@ type ModelOptions = {
 	/** How long to keep the request when NOTHING is arriving. Every character that comes in restarts
 	 *  it, so this is a silence limit rather than a length limit (2026-10-19). 0 = unlimited. */
 	timeoutMs: number;
-	/** THE SUMMARY AIM, in tokens (a window percent until 2026-10-25, on request: a number of one's own
+	/** LEGACY COPY (2026-11-05): the summary aim, in tokens, is ONE setting for every model and is stored in
+	 *  Config.shared; this per-entry field is filled from there and any copy left in the file is ignored.
+	 *  THE SUMMARY AIM, in tokens (a window percent until 2026-10-25, on request: a number of one's own
 	 *  should not move when the model changes). Still clamped by the acceptance floor and ceiling below. */
 	summaryAimTokens: number;
 	/** THE LIMITS (2026-10-03): percent of the model's WINDOW, used DIRECTLY as the acceptance
 	 *  bounds - a summary below min or above max is thrown away. The aim is clamped inside them,
 	 *  so at a 95k window 23% means 21,850 tokens, and the same settings scale on a 1M model. */
+	/** LEGACY COPIES (2026-11-05): the acceptance floor and ceiling are ONE setting for every model, stored
+	 *  in Config.shared. Filled from there; per-entry copies in the file are ignored. */
 	summaryMinTokens: number;
 	summaryMaxTokens: number;
 	/** LEGACY ONLY: configs written before 2026-10-05 stored the two limits as PERCENTS of the
@@ -167,18 +228,22 @@ type ModelOptions = {
 	legacyMaxPct?: number;
 	/** Hidden analysis written before the summary in the same call, stripped before storing:
 	 *  "full" = a chronological per-turn analysis; "mini" = at most ten lines; "off" = none. */
-	/** The summarizer's input has every tool result replaced by an informative stub (smaller,
-	 *  faster, and the exit/tail message survives pi's 2,000-char clip). false = pi's raw input. */
+	/** LEGACY (2026-11-01): this used to be the per-model "Summarizer input" row. Whether the summariser
+	 *  reads stubs or raw results is the GLOBAL elision.compactEnabled now. Parsed so an old config file
+	 *  still loads, read by nothing. */
 	inputStubs: boolean;
-	/** Cap for tool-call argument VALUES in the summarizer's input (whole files inside
-	 *  write/edit arguments otherwise arrive uncapped). "full" = uncapped. */
+	/** LEGACY (2026-11-01): the per-model argument cap. Now the GLOBAL elision.argCap (the "Tool-call
+	 *  argument cap" row in the Elision settings submenu). Parsed for compatibility, read by nothing. */
 	argCap: CharCap;
-	/** How much of each content type the summary keeps; each maps to its own instruction sentence. */
+	/** LEGACY COPIES (2026-11-05): the four "what the summary keeps" levels are ONE setting for every model,
+	 *  stored in Config.shared; per-entry copies are ignored. How much of each content type the summary
+	 *  keeps; each maps to its own instruction sentence. */
 	preserveStubs: Preserve;
 	preserveUser: Preserve;
 	preserveReplies: Preserve;
 	preserveThinking: Preserve;
-	/** How the previous compaction's summary rides into this one: fold / attach / skip. */
+	/** LEGACY COPY (2026-11-05): stored in Config.shared. How the previous compaction's summary rides into
+	 *  this one: fold / attach / skip. */
 	chainMode: ChainMode;
 	noThinkMarker: string;
 	sampling: SamplingFlags;
@@ -192,6 +257,23 @@ type Config = {
 	 * keys is the try order. JSON keeps insertion order, so the file is hand-editable too.
 	 */
 	models: Record<string, ModelOptions>;
+	/**
+	 * THE SETTINGS THAT ARE ONE SETTING FOR THE WHOLE EXTENSION, in one place since 2026-11-05.
+	 *
+	 *  The summary aim and its acceptance floor and ceiling, and the four "what the summary keeps" levels
+	 *  plus the chain mode, have been edited as globals since 2026-10-06 - but they were still STORED once
+	 *  per model in the list. That storage shape was the source of a bug the operator lived with for weeks:
+	 *  `setModelOptions` wrote the shared values to every model ALREADY in the map and to nobody else, so an
+	 *  edit made while the session ran a model that was NOT in the list was thrown away, and the next read
+	 *  fell back to DEFAULT_OPTIONS - which looked exactly like "my aim and min/max reset themselves when I
+	 *  change models". It also let entries drift apart (`-dq8` was still sitting at min 4,096 / max 30,000
+	 *  while everything else read 6,000 / 28,000), and a model added later arrived with code defaults.
+	 *
+	 *  One copy, read by every model including ones not in the list, is the fix. The per-entry copies are
+	 *  still written (so a hand-edited file stays self-consistent) but are no longer read - see the LEGACY
+	 *  note on the matching ModelOptions fields.
+	 */
+	shared: SharedModelOptions;
 	/** Extra tries per model while the endpoint reports itself busy. 0 = move on immediately. */
 	retries: number;
 	/** Seconds to wait before each retry. */
@@ -221,6 +303,14 @@ type Config = {
 	 *  order, supersession/amended tags referencing turns that exist. Malformed = rejected, the
 	 *  next model tries. */
 	shapeGate: boolean;
+	/** Does the summariser get to READ the assistant's thinking blocks? ON (the default) = the thinking
+	 *  text rides into the summary request as [Assistant thinking] lines, which is where decisions like
+	 *  "why this fix and not that one" live. OFF = thinking is left out of the summary input, which is
+	 *  the single largest saving available on a thinking-heavy session (measured on a real 226,000-token
+	 *  context: the region the summariser read fell from 326,004 characters to 140,000 without it). This
+	 *  says nothing about how the summary WRITES about thinking - that is each model's "thought" keep
+	 *  level. Nothing is deleted from the session file either way. */
+	thinkingToSummariser: boolean;
 	/** Cap on the CHAT request's generation permission (max_tokens / max_completion_tokens). pi sizes
 	 *  it as window − estimate − 4,096, which balloons on big-window models and dies on estimate
 	 *  undercounts; the cap makes every chat request fit until real ≈ window − cap. 0 = no cap. */
@@ -232,6 +322,15 @@ type Config = {
 	 *  pi's static trigger sits above the request death line on big windows, so without this the
 	 *  first compaction would only ever happen via overflow recovery (which deletes entries). */
 	autoCompact: boolean;
+	/** THE SAFETY NET UNDER PI'S TRIGGER (2026-11-05). pi decides by the token count of the LAST ANSWER,
+	 *  which is the size of the request the server accepted. Elision makes that request smaller than the
+	 *  session, so with elision on pi's figure can sit below its line for a whole session and never fire.
+	 *  This net starts a compaction once the REAL fill has passed this extension's trigger line by
+	 *  `watchdogMarginTokens` - that is, once it is plain that pi did not. ON by default; OFF leaves pi as
+	 *  the only trigger. */
+	watchdogAuto: boolean;
+	/** How far past the trigger line the safety net waits before it acts, in tokens. */
+	watchdogMarginTokens: number;
 	/** Set when an auto-compaction was cancelled by the user or failed twice: the proactive trigger
 	 *  stays armed off until a MANUAL compaction runs (2026-10-05 - a failing auto-compaction used to
 	 *  re-fire every minute, ~100 attempts in one session, each one uploading the whole context). */
@@ -293,6 +392,18 @@ const PRESERVE_CYCLE: Preserve[] = ["verbatim", "detailed", "summary", "brief"];
  *  "attach" - the new summary must copy it VERBATIM into a PREVIOUS SUMMARY section (nothing lost),
  *  "skip"   - drop it (maximum compression; history before the previous compaction ends there). */
 type ChainMode = "fold" | "attach" | "skip";
+
+/** The starting values of Config.shared - the same numbers DEFAULT_OPTIONS carries for those fields. */
+const DEFAULT_SHARED: SharedModelOptions = {
+	summaryAimTokens: 22_000,
+	summaryMinTokens: 4_096,
+	summaryMaxTokens: 30_000,
+	preserveStubs: "verbatim",
+	preserveUser: "verbatim",
+	preserveReplies: "detailed",
+	preserveThinking: "summary",
+	chainMode: "fold",
+};
 function isChainMode(v: unknown): v is ChainMode {
 	return v === "fold" || v === "attach" || v === "skip";
 }
@@ -303,16 +414,52 @@ const CHAR_CAP_STEPS: CharCap[] = [0, 50, 100, 150, 200, 300, 500, 750, 1000, "f
  *  trip exactly as entered. */
 
 const ELISION_DEFAULTS: ElisionConfig = {
-	enabled: true,
+	// AUTO-ELISION IS OFF BY DEFAULT (2026-11-06, the operator's decision after measurement). A sweep in the
+	// live session buys window space and pays for it with a server re-read of everything after its first
+	// change; on a session whose front is already crushed, that was 235,211 tokens re-read for 13,868 saved
+	// (basalt-nvfp4.log line 8674: pp=247,236 cached=12,025), about eight minutes at his measured 500 tok/s.
+	// The same five sweeps replayed from a clean state break at 1,187 / 121,642 / 146,026 / 177,674 /
+	// 215,723 tokens and re-read only 54,337 / 61,814 / 68,226 / 73,660 - so it pays once and stays cheap,
+	// but it must never be allowed to reach back into already-read territory for a handful of tokens.
+	// Compaction elision below stays on: that request is read cold in any case, so shrinking it is free.
+	enabled: false,
+	compactEnabled: true,
+	// 2,000 is pi's own clip (TOOL_RESULT_MAX_CHARS in core/compaction/utils.js), so a result the
+	// extension leaves alone is still cut to 2,000 by pi's serializer.
+	stubFromChars: 2_000,
 	softPercent: 70,
 	protectRecentTokens: 20_000,
 	stubTailChars: 200,
+	argCap: 500,
 	minSavingsTokens: 2_000,
 	stopGapTokens: 4_000,
 	minResultsToStub: 5,
 	minBatchGapSec: 300,
 	maxResultsPerBatch: 40,
+	cacheFriendly: true,
+	recallTool: true,
+	recallPointer: true,
+	recallMaxChars: 20_000,
 };
+
+/** Does a tool result get stubbed on its way INTO a summary? One global switch (2026-11-01): the old
+ *  per-model "Summarizer input" option is gone, because the choice is about how much evidence a summary
+ *  should be built from, and that is not a property of the model whose context is being compacted. */
+function compactStubsOn(): boolean {
+	return loadConfig().elision.compactEnabled;
+}
+
+/** How much of a tool-call argument the summariser gets to read. Global with the rest of the elision
+ *  settings, and read through one helper so no call site can miss a "full" vs number difference. */
+function elisionArgCap(): CharCap {
+	return loadConfig().elision.argCap;
+}
+
+/** The length at which a tool result becomes worth a stub, in characters. One number for both
+ *  kinds of elision, so the menu row means the same thing in the live session and in compaction. */
+function stubFromChars(): number {
+	return loadConfig().elision.stubFromChars;
+}
 
 function isCharCap(v: unknown): v is CharCap {
 	return v === "full" || (typeof v === "number" && Number.isFinite(v) && v >= 0);
@@ -337,23 +484,33 @@ function parseCharCap(text: string, fallback: CharCap): CharCap {
 function sanitizeElision(raw: any): ElisionConfig {
 	return {
 		enabled: typeof raw?.enabled === "boolean" ? raw.enabled : ELISION_DEFAULTS.enabled,
+		compactEnabled: typeof raw?.compactEnabled === "boolean" ? raw.compactEnabled : ELISION_DEFAULTS.compactEnabled,
+		stubFromChars: typeof raw?.stubFromChars === "number" && Number.isFinite(raw.stubFromChars) && raw.stubFromChars >= 0
+			? Math.round(raw.stubFromChars) : ELISION_DEFAULTS.stubFromChars,
 		// Free-entry values must survive the round trip: accept any sane number, the ladders above
 		// are only the board's cycle suggestions. (Bug fixed 2026-10-01: softPercent 10 and any
 		// protectRecentTokens outside the ladder were silently reset to the defaults on every read.)
 		softPercent: typeof raw?.softPercent === "number" && Number.isFinite(raw.softPercent) && raw.softPercent >= 1 && raw.softPercent <= 99 ? Math.round(raw.softPercent) : ELISION_DEFAULTS.softPercent,
 		protectRecentTokens: typeof raw?.protectRecentTokens === "number" && Number.isFinite(raw.protectRecentTokens) && raw.protectRecentTokens >= 0 ? Math.round(raw.protectRecentTokens) : ELISION_DEFAULTS.protectRecentTokens,
 		stubTailChars: isCharCap(raw?.stubTailChars) ? raw.stubTailChars : ELISION_DEFAULTS.stubTailChars,
+		argCap: isCharCap(raw?.argCap) ? raw.argCap : ELISION_DEFAULTS.argCap,
 		minSavingsTokens: typeof raw?.minSavingsTokens === "number" && Number.isFinite(raw.minSavingsTokens) && raw.minSavingsTokens >= 0 ? Math.round(raw.minSavingsTokens) : ELISION_DEFAULTS.minSavingsTokens,
 		stopGapTokens: typeof raw?.stopGapTokens === "number" && Number.isFinite(raw.stopGapTokens) && raw.stopGapTokens >= 0 ? Math.round(raw.stopGapTokens) : ELISION_DEFAULTS.stopGapTokens,
 		minResultsToStub: typeof raw?.minResultsToStub === "number" && Number.isInteger(raw.minResultsToStub) && raw.minResultsToStub >= 1 ? raw.minResultsToStub : ELISION_DEFAULTS.minResultsToStub,
 		minBatchGapSec: typeof raw?.minBatchGapSec === "number" && Number.isFinite(raw.minBatchGapSec) && raw.minBatchGapSec >= 0 ? Math.round(raw.minBatchGapSec) : ELISION_DEFAULTS.minBatchGapSec,
 		maxResultsPerBatch: typeof raw?.maxResultsPerBatch === "number" && Number.isFinite(raw.maxResultsPerBatch) && raw.maxResultsPerBatch >= 1 ? Math.round(raw.maxResultsPerBatch) : ELISION_DEFAULTS.maxResultsPerBatch,
+		cacheFriendly: typeof raw?.cacheFriendly === "boolean" ? raw.cacheFriendly : ELISION_DEFAULTS.cacheFriendly,
+		recallTool: typeof raw?.recallTool === "boolean" ? raw.recallTool : ELISION_DEFAULTS.recallTool,
+		recallPointer: typeof raw?.recallPointer === "boolean" ? raw.recallPointer : ELISION_DEFAULTS.recallPointer,
+		recallMaxChars: typeof raw?.recallMaxChars === "number" && Number.isFinite(raw.recallMaxChars) && raw.recallMaxChars >= 200 ? Math.round(raw.recallMaxChars) : ELISION_DEFAULTS.recallMaxChars,
 	};
 }
 
 const DEFAULT_CONFIG: Config = {
 	enabled: false,
 	models: {},
+	shared: { ...DEFAULT_SHARED },
+	/* models and shared are the per-model / shared-settings stores; see SharedModelOptions */
 	retries: 2,
 	retryDelaySeconds: 5,
 	log: true,
@@ -364,9 +521,12 @@ const DEFAULT_CONFIG: Config = {
 	landWithoutAbort: false,
 	directRequest: true,
 	shapeGate: true,
+	thinkingToSummariser: true,
 	chatMaxTokensCap: 65_536,
 	scaling: { ...SCALING_DEFAULTS },
 	autoCompact: true,
+	watchdogAuto: true,
+	watchdogMarginTokens: 8_000,
 	autoCompactPaused: false,
 	elision: ELISION_DEFAULTS,
 	noThinkMarker: DEFAULT_NO_THINK_TAG,
@@ -740,7 +900,7 @@ export function applyTemplate(src: string, o: ModelOptions, inputStubs: boolean,
 		"{STUB EXAMPLE RULE}",
 		inputStubs
 			? `- Tool results arrive as stubs like "[bash "bun test" - output elided: 203 lines / 13,238 chars - tail: "Command exited with code 1" - re-run to see the full output]". A stub is the complete record of that call: copy it into the ledger; when a detail is missing, trust its re-run/re-read hint - never guess what was in the output.`
-			: `- Long tool outputs arrive truncated to their first 2,000 characters: keep the path or the command and the decisive lines you saw; if a needed detail was cut, write "[clipped - re-read <path> / re-run <command>]" instead of guessing.`,
+			: `- Tool results arrive as complete text, not as stubs (a very long one may still be cut off by the harness): quote the decisive lines you actually read, keep the path or the command, and if a detail was clearly cut off write "[clipped - re-read <path> / re-run <command>]" instead of guessing.`,
 	);
 	sub(
 		"{PREVIOUS SUMMARY RULE}",
@@ -845,7 +1005,9 @@ export function buildInstructions(args: {
 	// did NOT show won - the request carried a different template from the one on screen. Now the
 	// menu's text is the template, the extension default rides when none is saved, and the Additional
 	// instruction is what its name says: an extra paragraph after the template, never a replacement.
-	parts.push(applyTemplate(args.userDefault?.trim() || DEFAULT_TEMPLATE_TEXT, options, options.inputStubs, { sizes, inputTokens, segmentTokens }));
+	// The template has to describe the material as it really arrives, so it is told the EFFECTIVE
+	// stubbing (the global compaction-elision switch AND this model's own option), not the option alone.
+	parts.push(applyTemplate(args.userDefault?.trim() || DEFAULT_TEMPLATE_TEXT, options, compactStubsOn(), { sizes, inputTokens, segmentTokens }));
 	// The extra instruction, when it is an instruction. A stored one that is itself a whole template
 	// (it carries the placeholders) is a leftover of the old two-text design and is NOT appended twice.
 	const extraInstruction = args.additionalInstruction?.trim();
@@ -887,7 +1049,63 @@ function refLooksLocal(ref: string): boolean {
 }
 
 /** Migrate one stored per-model profile (config v2 "overrides"/"defaults") to the new options. */
-function modelOptionsFrom(src: any, fallbackMarker: string): ModelOptions {
+/**
+ * Normalise one stored per-model profile. `shared` (Config.shared) is the source for the fields that are
+ * ONE setting for every model: they are taken from it and only from it, so a stale copy left in a model's
+ * entry cannot win over the value the operator set on the board (2026-11-05).
+ */
+/**
+ * Read Config.shared. A config written before 2026-11-05 has no `shared` block: the values then come from
+ * the model entries that carry them, by MAJORITY per key (raw JSON, so "absent" is still distinguishable
+ * from "filled with a default"; ties go to the first entry that states the value).
+ *
+ *  Majority rather than first, because the entries genuinely disagree, and the disagreement is the bug this
+ *  change removes: on 2026-11-05 the operator's list held 6,000/28,000 on four models and 4,096/30,000 on
+ *  `-dq8`, which is the entry that joined the list AFTER the last global write and therefore never received
+ *  it. First-entry order would have promoted that stale entry's numbers to global - a fifth model's
+ *  accident, applied to everything.
+ */
+function readSharedSettings(raw: any, base: SharedModelOptions): SharedModelOptions {
+	const out: SharedModelOptions = { ...base };
+	const s = raw?.shared;
+	const entries: any[] = Object.values(raw?.models ?? {}) as any[];
+	// Most-stated value wins; first stated breaks the tie. Values are read before clamping so a majority is
+	// counted on what the file actually says.
+	const majority = (key: string): number | string | undefined => {
+		if (s && s[key] !== undefined) return s[key];
+		const counts = new Map<string, { v: number | string; n: number }>();
+		for (const e of entries) {
+			const v = e?.[key];
+			if (typeof v !== "number" && typeof v !== "string") continue;
+			const k = String(v);
+			const hit = counts.get(k);
+			if (hit) hit.n += 1;
+			else counts.set(k, { v, n: 1 });
+		}
+		let best: { v: number | string; n: number } | undefined;
+		for (const c of counts.values()) if (!best || c.n > best.n) best = c;
+		return best?.v;
+	};
+	const num = (key: string, cur: number, lo: number, hi: number) => {
+		const v = majority(key);
+		return typeof v === "number" && Number.isFinite(v) ? clamp(Math.round(v), lo, hi) : cur;
+	};
+	const word = <T extends string>(key: string, cur: T, ok: (v: unknown) => v is T): T => {
+		const v = majority(key);
+		return ok(v) ? v : cur;
+	};
+	out.summaryAimTokens = num("summaryAimTokens", out.summaryAimTokens, 256, 1_000_000);
+	out.summaryMinTokens = num("summaryMinTokens", out.summaryMinTokens, 128, 1_000_000);
+	out.summaryMaxTokens = Math.max(out.summaryMinTokens, num("summaryMaxTokens", out.summaryMaxTokens, 128, 1_000_000));
+	out.preserveStubs = word("preserveStubs", out.preserveStubs, isPreserve);
+	out.preserveUser = word("preserveUser", out.preserveUser, isPreserve);
+	out.preserveReplies = word("preserveReplies", out.preserveReplies, isPreserve);
+	out.preserveThinking = word("preserveThinking", out.preserveThinking, isPreserve);
+	out.chainMode = word("chainMode", out.chainMode, isChainMode);
+	return out;
+}
+
+function modelOptionsFrom(src: any, fallbackMarker: string, shared?: SharedModelOptions): ModelOptions {
 	const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 	const o: ModelOptions = {
 		thinking: (levels.includes(src?.thinking) ? src.thinking : "off") as Level,
@@ -909,6 +1127,18 @@ function modelOptionsFrom(src: any, fallbackMarker: string): ModelOptions {
 	};
 	// Keep 0 = unlimited; sub-minute odd values snap up to the smallest step (2 min).
 	if (o.timeoutMs > 0 && o.timeoutMs < 60_000) o.timeoutMs = TIMEOUT_STEPS[0];
+	// The shared settings, from one place. When no shared block was handed in (a config still being
+	// assembled), the stored copy is used as-is, which is what older builds did.
+	if (shared) {
+		o.summaryAimTokens = shared.summaryAimTokens;
+		o.summaryMinTokens = shared.summaryMinTokens;
+		o.summaryMaxTokens = shared.summaryMaxTokens;
+		o.preserveStubs = shared.preserveStubs;
+		o.preserveUser = shared.preserveUser;
+		o.preserveReplies = shared.preserveReplies;
+		o.preserveThinking = shared.preserveThinking;
+		o.chainMode = shared.chainMode;
+	}
 	return o;
 }
 
@@ -934,7 +1164,10 @@ function migrateV1andV2(raw: any): { models: Record<string, ModelOptions>; retri
 		push(raw?.model);
 		if (Array.isArray(raw?.fallbacks)) for (const v of raw.fallbacks) push(v);
 	}
-	const selected = refs.slice(0, MAX_SLOTS);
+	// EVERY entry is kept (2026-11-05). This line used to read `refs.slice(0, MAX_SLOTS)`, so a sixth model
+	// in the file was invisible to the program and then written out of existence at the next save. The cap
+	// belongs where a model is added - see rotateAdd - not here.
+	const selected = refs;
 
 	// --- the pi-wide no-think tag: v3 name first, then the v2 name
 	const noThinkMarker = typeof raw?.noThinkMarker === "string" ? raw.noThinkMarker.trim() : typeof raw?.thinkOffMarker === "string" ? raw.thinkOffMarker.trim() : DEFAULT_NO_THINK_TAG;
@@ -1035,11 +1268,15 @@ export function loadConfig(): Config {
 		// so the stored value is ignored and the direct request always runs.
 		directRequest: true,
 		shapeGate: typeof raw.shapeGate === "boolean" ? raw.shapeGate : base.shapeGate,
+		shared: readSharedSettings(raw, base.shared),
+		thinkingToSummariser: typeof raw.thinkingToSummariser === "boolean" ? raw.thinkingToSummariser : base.thinkingToSummariser,
 		chatMaxTokensCap: typeof raw.chatMaxTokensCap === "number" && Number.isFinite(raw.chatMaxTokensCap) && raw.chatMaxTokensCap >= 0 ? Math.round(raw.chatMaxTokensCap) : base.chatMaxTokensCap,
 		// The two sizes are token counts now; migrateScaling translates a file that still holds the old
 		// percentages, so an upgrade changes nothing the operator can see or feel.
 		scaling: migrateScaling(raw, base.scaling),
 		autoCompact: typeof raw.autoCompact === "boolean" ? raw.autoCompact : base.autoCompact,
+		watchdogAuto: typeof raw.watchdogAuto === "boolean" ? raw.watchdogAuto : base.watchdogAuto,
+		watchdogMarginTokens: Number.isFinite(raw.watchdogMarginTokens) && raw.watchdogMarginTokens >= 0 ? Math.round(raw.watchdogMarginTokens) : base.watchdogMarginTokens,
 		autoCompactPaused: typeof raw.autoCompactPaused === "boolean" || typeof raw.autoCompactPaused === "string" ? raw.autoCompactPaused : base.autoCompactPaused,
 		elision: sanitizeElision(raw?.elision),
 		noThinkMarker: m.noThinkMarker,
@@ -1253,10 +1490,14 @@ function logLine(cfg: Config, record: Record<string, unknown>): void {
 // The full reasoning: DESIGN.md -> LOG_ROW_NAMES
 const LOG_ROW_NAMES: Record<string, string> = {
 	start: "COMPACTION START",
-	attempt: "COMPACTION TRY",
+	// The pair the operator reads, named as a pair on 2026-11-01: COMPACTION STARTED when a model is asked
+	// to write, COMPACTION DONE when the summary has landed. "TRY" described the rotation's private view of
+	// itself - from the seat it is one compaction starting, and a second TRY line only appears when a model
+	// failed, which made the normal case and the exceptional one read the same.
+	attempt: "COMPACTION STARTED",
 	ok: "COMPACTION SUMMARY",
 	done: "COMPACTION DONE",
-	compaction_landed: "COMPACTED",
+	compaction_landed: "COMPACTION DONE",
 	// The append path of #43 explaining itself is worth a row: it is the difference between "nothing
 	// happened" and "it fell back to the interrupting route, and here is why".
 	no_abort_landing_failed: "NO-ABORT LANDING FAILED",
@@ -1276,7 +1517,13 @@ const LOG_ROW_NAMES: Record<string, string> = {
 	auto_compaction_held: "HELD",
 };
 
-const LOG_CHATTER = new Set(["user_prompts", // one per candidate that passed its checks; COMPACTED carries the figures
+const LOG_CHATTER = new Set(["user_prompts", // one per candidate that passed its checks; COMPACTION DONE carries the figures
+	// The middle row of a compaction, hidden from the screen and from the results-only log view on
+	// 2026-11-01 at the operator's request: STARTED and DONE say everything a person reads, and this row
+	// repeated the size and the aim between them. It STAYS IN THE FILE, because it is the only row carrying
+	// `segmentBy` (which ruler measured the input), `measuredBy`, `via`, `tokPerSec`, `stubsIn` and the word
+	// count - the four fields this investigation has needed twice - and press-v in the log view shows it.
+	"ok",
 	// Two rows that repeat what a neighbour says (2026-10-22): `done` is written the moment a finished
 	// summary is handed over and COMPACTED follows it in the same second; the notes row fires for about
 	// four summaries in ten, because a model-written summary is rarely exactly the shape asked for. Both
@@ -1302,7 +1549,10 @@ const LOG_CHATTER = new Set(["user_prompts", // one per candidate that passed it
 	// comes back into the view, because it is the entry that carries the numbers - what was stubbed and
 	// how many tokens it saved (2026-10-21: "i want to see only compaction and elision entries there with
 	// their data").
-	"elision_off",
+	// Written by the build of 2026-11-06 up to 15:30, one row per sweep, beside the ELISION row. It read like a
+	// headline that had forgotten what it was talking about ("this sweep is the first to change message 1"), and
+	// its whole content is now inside the ELISION row. Kept in the file, never on the display.
+	"elision_wire",
 	"elision_hold",
 	"elision_wait",
 	"two_compactors",
@@ -1348,18 +1598,44 @@ function logRowText(d: any, stamp = ""): string {
 	const seconds = typeof d.seconds === "number" ? fmtDuration(d.seconds) : "";
 	// Transfer figures: pi's own provider counts when present, otherwise the estimate.
 	const tokIn = typeof d.input === "number" ? d.input : undefined;
+	// The STARTED row's own input figure: the size of the request that is about to go out. Counted by the
+	// engine where the server can count, estimated from characters where it cannot - the tilde tells the two
+	// apart, because the DONE row prints a same-looking number taken from the engine's usage report after the
+	// fact, and the two are different measurements (2026-11-05, on request).
+	const planned = typeof d.inputPlanned === "number" ? `input ${String(d.inputBy ?? "").startsWith("estimate") ? "~" : ""}${fmt(d.inputPlanned)} tok` : "";
 	const tokOut = typeof d.output === "number" ? d.output : typeof d.measured === "number" ? d.measured : undefined;
 	const transfer =
 		tokIn !== undefined || tokOut !== undefined
-			? `${tokIn !== undefined ? `${fmt(tokIn)} tok in` : ""}${tokIn !== undefined && tokOut !== undefined ? ", " : ""}${tokOut !== undefined ? `${fmt(tokOut)} tok out` : ""}${typeof d.reasoning === "number" && d.reasoning > 0 ? ` (thinking ${fmt(d.reasoning)})` : ""}`
+			? `${tokIn !== undefined ? `${fmt(tokIn)} tok in` : ""}${tokIn !== undefined && tokOut !== undefined ? " \u00b7 " : ""}${tokOut !== undefined ? `${fmt(tokOut)} tok out` : ""}${typeof d.reasoning === "number" && d.reasoning > 0 ? ` (thinking ${fmt(d.reasoning)})` : ""}`
 			: "";
 	// The acceptance bounds are ABSOLUTE TOKENS, and the AIM (the size the summary was asked for) is printed
 	// with them: "accept 4,096-30,000 tok" alone said nothing about what the run was aiming at (2026-10-07).
 	const aim = typeof d.target === "number" && d.target > 0 ? `aim ${fmt(d.target)} tok` : "";
-	const window =
-		typeof d.min === "number" && typeof d.max === "number"
-			? `${aim ? aim + " \u00b7 " : ""}accept ${fmt(d.min)}-${fmt(d.max)} tok${typeof d.window === "number" && d.window > 0 ? ` (window ${fmt(d.window)} tok)` : ""}`
-			: aim;
+	// Aim and acceptance bounds are one phrase (2026-11-01): "aim 22,000 tok, accept 6,000-28,000 tok".
+	const bounds = [aim, typeof d.min === "number" && typeof d.max === "number" ? `accept ${fmt(d.min)}-${fmt(d.max)} tok` : ""].filter(Boolean).join(", ");
+	// The window is a segment of its own, not a bracket on the acceptance band.
+	const windowTxt = typeof d.window === "number" && d.window > 0 ? `context window ${fmt(d.window)} tok` : "";
+	// "triggered at" is the context that was MEASURED the second the compaction began - not the configured
+	// line (window minus reserve), which this figure always differs from by however full the session
+	// happened to be. The STARTED row reads it live; the DONE row repeats the same stored number, so the
+	// pair tells one story rather than two slightly different ones.
+	const triggeredAt = Number(d.triggeredAt ?? d.contextFill ?? 0) || Number(d.before ?? 0);
+	const triggered = triggeredAt > 0 ? `triggered at ${fmt(triggeredAt)} tok` : "";
+	// How many of the session's user prompts the summary carried, as its own segment: it is the coverage
+	// figure a ledger is judged on, and it used to hang off the end of a "summary N tok (asked ...)" clause.
+	// Prompt coverage. The honest pair (carried / matchable, 2026-11-01) wins when it is present, and a round
+	// that handed over no prompt prints nothing at all. The old loose pair printed two figures measured over
+	// different scopes ("quoted 8 of 2": 8 prompt lines anywhere in a summary that also carries earlier
+	// ledgers, against 2 prompts handed over this round), which read as data loss where there was none.
+	const prompts =
+		typeof d.matchable === "number"
+			? d.matchable > 0
+				? `user prompts quoted ${d.carried ?? 0} of ${d.matchable}`
+				: ""
+			: typeof d.quoted === "number" && typeof d.given === "number" && d.given > 0
+				? `user prompts quoted ${d.quoted} of ${d.given}`
+				: "";
+	const lost = Array.isArray(d.failures) && d.failures.length ? `after ${d.failures.length} candidate(s) tried and lost` : "";
 	// Plain words for the internal event names: a run begins with COMPACTION START, each model tried is a
 	// COMPACTION TRY, the moment the new context exists is COMPACTED. An unlisted event shows its own name
 	// in capitals, so a new record type can be unnamed for a while but never silently nameless.
@@ -1375,21 +1651,59 @@ function logRowText(d: any, stamp = ""): string {
 	// A line the operator is shown should say something when it is shown: `note` used to be dropped, so the
 	// gate's hold arrived as a bare AUTO_COMPACTION_HELD with nothing after it (2026-10-21).
 	const note = typeof d.note === "string" && !LOG_CHATTER.has(String(d.event ?? "")) ? d.note.replace(/\s+/g, " ").slice(0, 400) : "";
-	// The elision events carry their own figures.
+	// The elision events carry their own figures. A tool call is elided in TWO halves - its RESULT and its
+	// ARGUMENTS - and `savedTokens` is both together. On 2026-11-04 a row read "27,776 tok -> 7,254 tok, then
+	// saved 40,958 tok", which looked like 20,000 tokens had been invented out of thin air: the size pair
+	// counted only the results, and 20,436 tok had come out of long arguments in the same batch (the ctx pair
+	// confirms the total: 208,737 -> 167,779). Each half gets its own figures, so the total is visibly their
+	// sum instead of a contradiction.
 	const elision =
 		d.event === "elision"
-			? [`${fmt(d.applied ?? 0)} result${d.applied === 1 ? "" : "s"} elided`, `${fmt(d.resultsTokens ?? 0)} tok -> ${fmt(d.stubTokens ?? 0)} tok`, `saved ${fmt(d.savedTokens ?? 0)} tok`, `ctx ~${fmt(d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`].join(" \u00b7 ")
+			? [
+				// (the context window itself is already in the generic prefix of every row - do not repeat it)
+				`${fmt(d.applied ?? 0)} tool call${d.applied === 1 ? "" : "s"} elided`,
+				// The total first, its two halves in brackets, so the sum is checkable at a glance.
+				`saved ${fmt(d.savedTokens ?? 0)} tok (${fmt(Math.max(0, (d.resultsTokens ?? 0) - (d.stubTokens ?? 0)))} tok in results, ${fmt(d.argsSavedTokens ?? 0)} tok in arguments)`,
+				// The ctx pair must be the BEFORE and AFTER of THIS batch, or its drop contradicts `saved`.
+				// A row read `saved 32,232 tok` next to `ctx ~257,720 -> ~197,505` (a 60,215 drop) on
+				// 2026-11-06 and looked like fabricated arithmetic: the left side was the RAW transcript, so the
+				// drop silently included 27,983 tok that earlier batches of the same session had already saved.
+				`ctx ~${fmt(d.preBatchWire ?? d.effTokens ?? 0)} tok -> ~${fmt(d.postBatchWire ?? 0)} tok`,
+				// WHERE in the context this sweep worked, first to last, counted in tokens of the request the
+				// server holds. The message NUMBER used to be printed here and meant nothing: it cannot be compared
+				// with anything the engine says, and it changes meaning when messages are elided.
+				typeof d.firstElidedAtCtx === "number" ? `first elision at ctx ${fmt(d.firstElidedAtCtx)} tok` : "",
+				// Not where this sweep ENDED, but where the next one must BEGIN: the first tool call still raw and
+				// worth cutting, in the context as it stands after this sweep. It is the promise made readable -
+				// next sweep's `first elision` should equal this figure.
+				typeof d.nextElisionAtCtx === "number" ? `next elision at ctx ${fmt(d.nextElisionAtCtx)} tok` : "",
+				// The price of the sweep, on the same line as its gain. Compare it with the engine's own
+				// `pp=<prompt>/<cached>c` row: prompt minus cached should be this figure (plus the system prompt,
+				// which is not in the message list this row measures).
+				typeof d.serverReReadsTokens === "number" ? `server to read ${fmt(d.serverReReadsTokens)} tok` : "",
+				typeof d.appliedSavedTokens === "number" && d.appliedSavedTokens > 0
+					? `total ${fmt(d.appliedSavedTokens + (d.savedTokens ?? 0))} tok saved in this session`
+					: "",
+			]
+				.filter(Boolean).join(" \u00b7 ")
 			: "";
-	// A landed summary is a result with a size, and the size is the figure worth keeping in view next to the
-	// aim it was asked for.
+	// The DONE row no longer prints the summary's size a second time: "N tok out" IS the summary, and two
+	// figures for one thing read as a discrepancy (2026-11-01). The word count and the asked band stay in
+	// the file, and every other event that carries a summaryTokens still shows it.
 	const summary =
-		typeof d.summaryTokens === "number"
-			? `summary ${fmt(d.summaryTokens)} tok` +
-			  (typeof d.measured === "number" && typeof d.min === "number" ? ` (asked ${fmt(d.min)}-${fmt(d.max)} tok, ${fmt(d.words ?? 0)} words written)` : "") +
-			  (typeof d.quoted === "number" && typeof d.given === "number" ? `, user prompts quoted ${d.quoted} of ${d.given}` : "") +
-			  (Array.isArray(d.failures) && d.failures.length ? `, after ${d.failures.length} candidate(s) tried and lost` : "")
-			: "";
-	return [stamp, status, ref ?? "", seconds, transfer, window, elision, why, summary, note].filter(Boolean).join(" \u00b7 ");
+		d.event === "compaction_landed" || !(typeof d.summaryTokens === "number")
+			? ""
+			: `summary ${fmt(d.summaryTokens)} tok` +
+			  (typeof d.measured === "number" && typeof d.min === "number" ? ` (asked ${fmt(d.min)}-${fmt(d.max)} tok, ${fmt(d.words ?? 0)} words written)` : "");
+	// A plain trigger word (manual / threshold / auto) is not repeated on the DONE row: the STARTED row is
+	// the row that says why a compaction began, and both rows still carry the word in the file.
+	// Anything else in `reason` - a warning, an error - still prints, on every row.
+	const plainTrigger = /^(manual|auto|threshold|overflow|menu|idle|watcher)$/i.test(String(d.reason ?? ""));
+	const whyTxt = d.event === "compaction_landed" && plainTrigger ? "" : why;
+	// On an ELISION row the window is scenery, not the story: the operator asked for it at the END there, after
+	// what was saved and where. Every other row keeps it where it always was.
+	const windowLast = d.event === "elision";
+	return [stamp, status, ref ?? "", seconds, transfer, planned, bounds, triggered, windowLast ? "" : windowTxt, elision, whyTxt, summary, prompts, lost, windowLast ? windowTxt : "", note].filter(Boolean).join(" \u00b7 ");
 }
 
 /**
@@ -1433,7 +1747,22 @@ function tailLogPretty(lines = 16, verbose = false): string {
 
 // ---------------------------------------------------------------- model helpers
 
-const MAX_SLOTS = 5;
+/**
+ * HOW MANY models may stand in the Compaction models list - 10 since 2026-11-05 (it was 5, and a list of
+ * qwen variants with their quantisations fills five in no time). The cap is enforced where a model is
+ * ADDED, not where the config is read: reading used to `slice(0, MAX_SLOTS)`, which quietly DELETED the
+ * sixth and later entries from the file on the next save. That is how a list of models - and with them
+ * their per-model thinking, timeout and sampling - could shrink back to five without anyone touching it.
+ */
+const MAX_SLOTS = 10;
+
+/** A list entry that stands for any model whose name contains a piece of text, rather than for one exact
+ *  "provider/id". A leading "*" is what makes it unmistakable in the config file: a real ref always reads
+ *  "provider/id", so "*qwen3.8-flash-next" can never be mistaken for one. */
+const PATTERN_PREFIX = "*";
+const isPatternRef = (ref: string): boolean => String(ref ?? "").startsWith(PATTERN_PREFIX);
+/** The text a pattern entry looks for, lower-cased, with the marker removed. */
+const patternNeedle = (ref: string): string => String(ref ?? "").slice(PATTERN_PREFIX.length).trim().toLowerCase();
 
 
 function refOf(model: { provider: string; id: string }): string {
@@ -1482,13 +1811,45 @@ function isLocalModel(model: { provider: string; baseUrl?: string }): boolean {
 	return /llama|ollama|lm-?studio|cpu-om|local/i.test(model.provider);
 }
 
-function profileFor(cfg: Config, model: { provider: string; id: string; baseUrl?: string } | undefined, ref?: string): ModelOptions {
-	if (ref && cfg.models[ref]) return optionsFor(cfg, ref, model);
-	if (model) {
-		const found = Object.keys(cfg.models).find((r) => !isSessionRef(r) && r === refOf(model));
-		if (found) return optionsFor(cfg, found, model);
+/**
+ * WHICH LIST ENTRY APPLIES TO A MODEL (2026-11-05). Exact `provider/id` wins; failing that, a pattern entry
+ * (*qwen3.8-flash-next) whose text is contained anywhere in the model's ref or id - beginning, middle or
+ * end - matches. Patterns are tried in list order, so the operator controls precedence by position: put
+ * "*qwen3.8-flash-next-nvfp4-gptq" above "*qwen3.8-flash-next" and the specific one is chosen.
+ *
+ *  This is what the operator asked for after maintaining five near-identical qwen entries: one pattern
+ *  covers the variants, and the pattern entry carries the settings (thinking, timeout, sampling, no-think
+ *  tag) that the variants share.
+ */
+export function entryRefFor(cfg: Config, model: { provider?: string; id?: string; baseUrl?: string } | undefined, exactRef?: string): string | undefined {
+	const refs = Object.keys(cfg.models);
+	if (exactRef && cfg.models[exactRef] && !isPatternRef(exactRef)) return exactRef;
+	const hay = [exactRef, model ? refOf(model as any) : "", String(model?.id ?? "")].filter(Boolean).map((r) => String(r).toLowerCase());
+	for (const r of refs) {
+		if (!isPatternRef(r) && (r === exactRef || (model && r === refOf(model as any)))) return r;
 	}
-	return { ...DEFAULT_OPTIONS };
+	for (const r of refs) {
+		if (!isPatternRef(r)) continue;
+		const needle = patternNeedle(r);
+		if (needle.length >= 3 && hay.some((h) => h.includes(needle))) return r;
+	}
+	return undefined;
+}
+
+/** The models a pattern entry would match right now, from a pool of reachable ones - for the list row and
+ *  for the rotation, which can only ask a pattern when some reachable model answers to it. */
+function patternHits(cfg: Config, ref: string, pool: any[]): string[] {
+	const needle = patternNeedle(ref);
+	if (needle.length < 3) return [];
+	return pool.filter((m: any) => m && (refOf(m).toLowerCase().includes(needle) || String(m.id ?? "").toLowerCase().includes(needle))).map((m: any) => refOf(m));
+}
+
+function profileFor(cfg: Config, model: { provider: string; id: string; baseUrl?: string } | undefined, ref?: string): ModelOptions {
+	const hit = entryRefFor(cfg, model, ref);
+	if (hit) return optionsFor(cfg, hit, model);
+	// Not in the list: the shared settings still apply. Returning bare DEFAULT_OPTIONS here is what made a
+	// session running an unlisted model ignore the operator's aim and limits (2026-11-05).
+	return modelOptionsFrom(undefined, cfg.noThinkMarker, cfg.shared ?? DEFAULT_SHARED);
 }
 
 /**
@@ -1591,14 +1952,31 @@ const SUMMARISER_FRAMING_TOKENS = 1500;
  */
 const TOKEN_HEAVINESS = 1.3;
 
+/** How a tool result reaches the summariser, for the ruler that measures the material. `direct`
+ *  says the request is the one THIS extension builds with serializeRegion; without it the material is
+ *  what pi's own compact() would flatten. */
+type RegionMeasure = { inputStubs: boolean; argCap: CharCap; stubFrom?: number; tailChars?: CharCap; withThinking?: boolean };
+
 /**
- * The conversation exactly as the summariser receives it. pi flattens the messages with convertToLlm
- * and serializeConversation, and that writer clips every tool result to 2,000 characters
- * (TOOL_RESULT_MAX_CHARS in core/compaction/utils.js). That clip alone removed 30 to 55 percent of the
- * characters of the last fourteen regions on this session (117,021 raw against 85,343 kept, 193,524
- * against 122,177): a 120,000 character file read reaches the summariser as 2,000 characters.
+ * The conversation exactly as the summariser receives it. THE RULER HAS TO MEASURE THE TEXT THAT IS
+ * REALLY GOING OUT. pi flattens with convertToLlm and serializeConversation, a writer that DROPS every
+ * thinking block and clips every tool result to 2,000 characters (TOOL_RESULT_MAX_CHARS in
+ * core/compaction/utils.js); this extension's own serializeRegion keeps thinking, stubs by the
+ * effective elision setting and caps argument values. Those two texts are not close: on the session of
+ * 2026-10-31 the direct request carried 326,004 characters while pi's flattener described 148,000, and
+ * every decision built on that figure (the summary ceiling and aim clamp, the window-fit test that can
+ * skip a candidate or trim the region, and the attempt row in the log) was taken against a text nobody
+ * sent. Pass `direct` when the route is the direct one, and the ruler measures that text.
  */
-function summariserText(preparation: any): string {
+function summariserText(preparation: any, direct?: RegionMeasure): string {
+	const prev = preparation?.previousSummary ? `\n${preparation.previousSummary}` : "";
+	if (direct) {
+		// The same calls, the same lists and the same options directCompact makes, so the length is
+		// the length of the material - not an estimate of it.
+		const main = serializeRegion(preparation?.messagesToSummarize ?? [], { startTurn: 0, inputStubs: direct.inputStubs, argCap: direct.argCap, stubFrom: direct.stubFrom, tailChars: direct.tailChars, withThinking: direct.withThinking });
+		const prefix = serializeRegion(preparation?.turnPrefixMessages ?? [], { startTurn: main.lastTurn, inputStubs: direct.inputStubs, argCap: direct.argCap, partial: true, stubFrom: direct.stubFrom, tailChars: direct.tailChars, withThinking: direct.withThinking });
+		return [main.text, prefix.text].filter(Boolean).join("\n\n") + prev;
+	}
 	const lists = [...(preparation?.messagesToSummarize ?? []), ...(preparation?.turnPrefixMessages ?? [])];
 	try {
 		let text = serializeConversation(convertToLlm(lists));
@@ -1619,8 +1997,8 @@ function summariserText(preparation: any): string {
  * the system prompt and the tool definitions (about 24,755 tokens with the MCP servers on this machine) are
  * not in it. Counting them here cost a slot on 2026-09-22 for no reason.
  */
-export function summariserInputTokens(preparation: any, extraInstructionChars = 0): number {
-	return Math.ceil(((summariserText(preparation).length + extraInstructionChars) * TOKEN_HEAVINESS) / 4) + SUMMARISER_FRAMING_TOKENS;
+export function summariserInputTokens(preparation: any, extraInstructionChars = 0, direct?: RegionMeasure): number {
+	return Math.ceil(((summariserText(preparation, direct).length + extraInstructionChars) * TOKEN_HEAVINESS) / 4) + SUMMARISER_FRAMING_TOKENS;
 }
 
 /** The size of the SEGMENT ALONE, with no framing in it (2026-10-17). {SEGMENT SIZE} used to be filled
@@ -1628,8 +2006,8 @@ export function summariserInputTokens(preparation: any, extraInstructionChars = 
  *  below was worth 1,500 tokens more than it is. It plans its length against the figure it is given, so
  *  the figure it is given has to be the material. Both are heuristic (chars x TOKEN_HEAVINESS / 4); the
  *  server's own count is the truth, and switching this to that count is the open follow-up. */
-export function summariserSegmentTokens(preparation: any): number {
-	return Math.ceil((summariserText(preparation).length * TOKEN_HEAVINESS) / 4);
+export function summariserSegmentTokens(preparation: any, direct?: RegionMeasure): number {
+	return Math.ceil((summariserText(preparation, direct).length * TOKEN_HEAVINESS) / 4);
 }
 
 /** Allowance for the fixed part of a request when the live projection cannot be read. */
@@ -1683,6 +2061,19 @@ export function localSummariserBaseUrl(model: any, ref: string): string | undefi
 /** What this base URL answers, remembered so a server without the route is not probed every time. A
  *  missing route is remembered for an hour (it is not a transient fault, and retrying it every
  *  compaction would put a timeout in front of every request); a 5xx or a timeout for a minute. */
+/** The model name to send with a counting request. Basalt (and ollama) answer a name they do not
+ *  host with 404, so the old placeholder "count" switched server-side counting off for an whole
+ *  hour on exactly the local engines whose count is worth having; llama.cpp-family servers ignore
+ *  the field, so the real id is safe everywhere. A caller with no model keeps the placeholder. */
+function countModelId(model: any, ref: string): string {
+	if (typeof model?.id === "string" && model.id) return model.id;
+	// A ref is "provider/modelId" - but a local ref can also be written "llama-server=http://host:port",
+	// where the first slash belongs to the URL, not to the separator. Only cut on a real separator.
+	if (/:\/\//.test(ref)) return "count";
+	const slash = ref.indexOf("/");
+	return slash > 0 ? ref.slice(slash + 1) : "count";
+}
+
 const countCapability = new Map<string, { how: "messages" | "tokenize" | "no"; at: number }>();
 function countRoute(base: string): "messages" | "tokenize" | "no" {
 	const hit = countCapability.get(base.replace(/\/+$/, ""));
@@ -1693,25 +2084,57 @@ function countRoute(base: string): "messages" | "tokenize" | "no" {
 
 // The exact number of tokens this server would read for this text, or null when it cannot be trusted.
 // The full reasoning: DESIGN.md -> countTextAt
-export async function countTextAt(base: string, text: string, estimate: number, ms = 6_000): Promise<{ n: number; how: "messages" | "tokenize" } | null> {
+export async function countTextAt(base: string, text: string, estimate: number, ms = 6_000, modelId = "count"): Promise<{ n: number; how: "messages" | "tokenize" } | null> {
+	// The routes below are "/v1/messages/count_tokens" and "/tokenize", both mounted at the server's ROOT.
+	// People paste the OpenAI-style URL with "/v1" on the end (Strata answers /v1/v1/messages/... purely
+	// for that), so the suffix comes off here - otherwise both routes would be assembled under /v1/ and
+	// every engine would look like it had no counting route at all. This cleaned URL is also the key the
+	// capability verdict is stored under, so it is worked out before any verdict is looked up.
+	const url = base.replace(/\/+$/, "").replace(/\/v1$/i, "");
 	// A server that already failed both routes is not asked again for an hour: an engine with neither
 	// route would otherwise pay two timeouts on every single compaction, which is slower than the guess.
-	if (countRoute(base) === "no") return null;
+	if (countRoute(url) === "no") return null;
 	const sane = (n: any): boolean => {
 		const v = Number(n);
 		return Number.isFinite(v) && v > 0 && v >= estimate * 0.5 && v <= Math.max(estimate * 2, 4096);
 	};
-	const url = base.replace(/\/+$/, "");
-	const route = countRoute(base);
+	const route = countRoute(url);
 	const post = async (path: string, body: any, extra: Record<string, string>) => {
 		const r = await fetch(url + path, { method: "POST", headers: { "content-type": "application/json", ...extra }, body: JSON.stringify(body), signal: AbortSignal.timeout(ms) });
 		if (r.status === 404 || r.status === 405 || r.status === 501) return "missing" as const;
 		if (!r.ok) return "bad" as const;
 		return ((await r.json().catch(() => null)) ?? null) as any;
 	};
+	/** The name this server says it hosts. pi's model id and the engine's alias are usually the same
+	 *  string, but nothing requires it: Basalt answers 404 {"message":"model: <name>"} for a name it
+	 *  does not host, while llama.cpp, ik_llama.cpp and Strata ignore the field completely. Asking the
+	 *  engine for its own name is the one approach that also works on an engine nobody has met yet. */
+	const hostedName = async (): Promise<string | null> => {
+		try {
+			const r = await fetch(url + "/v1/models", { signal: AbortSignal.timeout(ms) });
+			if (!r.ok) return null;
+			const j: any = await r.json().catch(() => null);
+			const first = Array.isArray(j?.data) ? j.data[0] : Array.isArray(j?.models) ? j.models[0] : null;
+			const id = typeof first?.id === "string" ? first.id : typeof first?.name === "string" ? first.name : null;
+			return id && id !== modelId ? id : null;
+		} catch {
+			return null;
+		}
+	};
 	if (route !== "tokenize") {
 		try {
-			const out = await post("/v1/messages/count_tokens", { model: "count", max_tokens: 1, messages: [{ role: "user", content: text }] }, { "anthropic-version": "2023-06-01" });
+			const ask = (name: string) => post("/v1/messages/count_tokens", { model: name, max_tokens: 1, messages: [{ role: "user", content: text }] }, { "anthropic-version": "2023-06-01" });
+			let out = await ask(modelId);
+			// A 404 from this route means either "I do not host that model" or "I have no such route",
+			// and the status code cannot tell them apart. Ask the engine its own name and try once more
+			// before writing the route off: a route that is really absent simply fails the second time too.
+			if (out === "missing" || out === "bad") {
+				const alt = await hostedName();
+				if (alt) {
+					const again = await ask(alt);
+					if (again !== "missing" && again !== "bad") out = again;
+				}
+			}
 			if (out === "missing") countCapability.set(url, { how: "tokenize", at: Date.now() });
 			else if (out === "bad") countCapability.set(url, { how: route === "messages" ? "messages" : route, at: Date.now() });
 			else if (sane(out?.input_tokens)) {
@@ -2000,9 +2423,9 @@ export function buildResultStub(
 	argsSummary: string,
 	text: string,
 	tailChars: CharCap,
+	ord?: number,
 ): string {
 	const clean = String(text ?? "");
-	const lines = clean ? clean.split("\n").length : 0;
 	const status = clean.match(LAST_STATUS_RE)?.[0]?.trim();
 	let tail = "";
 	if (tailChars === "full") {
@@ -2014,13 +2437,24 @@ export function buildResultStub(
 	if (status && !tail.includes(status)) {
 		tail = tail ? `${status}  (${tail})` : status;
 	}
-	const parts = [
-		`[${toolName}${argsSummary ? ` "${argsSummary.trim()}"` : ""}`,
-		`output elided: ${fmt(lines)} lines / ${fmt(clean.length)} chars`,
-	];
-	if (tail) parts.push(`tail: "${tail}"`);
-	parts.push(`re-run or re-read to see the full output`);
-	return `${parts.join(" - ")}]`;
+	// ONE fixed shape, three sentences, in plain readable English (the operator's wording, 2026-11-06):
+	//   [187,402 chars of tool call result truncated. read the result with recall_tool_result: #7. last 200
+	//    chars: "...verbatim ending of the output..."]
+	// What each sentence is for: the first says how much is gone and that the HARNESS removed it, not the
+	// tool, so a result count is never read as a failure; the second is the way back, and it NAMES the tool
+	// that resolves it (an earlier shape wrote a bare `full: #1`, which could have been a fragment, an error
+	// code or a line count); the third keeps the ending, where a command writes its verdict.
+	// THE ORDER IS THE POINT (the operator's reasoning, 2026-11-06): that ending is quoted VERBATIM result
+	// text, so any harness sentence placed after it sits inside the result as far as a reader and a tokeniser
+	// are concerned - "anything after that sentence would get lost in the result text". Both harness sentences
+	// therefore come first, and the quote goes last with nothing after it.
+	// Tool name and key arguments are left OUT (the assistant message carrying this call sits directly above
+	// it and still names both), which buys back most of what the plainer sentences cost.
+	const parts = [`${fmt(clean.length)} chars of tool call result truncated`];
+	if (typeof ord === "number" && ord > 0) parts.push(`read the result with recall_tool_result: #${ord}`);
+	if (tail) parts.push(`last ${fmt(Math.min(typeof tailChars === "number" ? tailChars : clean.length, clean.length))} chars: "${tail}"`);
+	// Plain ASCII only: this text is tokenised in every stub, and a decorative separator costs tokens forever.
+	return `[${parts.join(". ")}]`;
 }
 
 /** True when a message is a tool result (live transcript or prepared region alike). */
@@ -2028,14 +2462,72 @@ function isToolResult(m: any): boolean {
 	return m?.role === "toolResult" && m?.toolCallId !== undefined;
 }
 
+/** A result the tool itself reported as a failure. Never elided: the error IS the information of that turn,
+ *  and a count of lines tells the model nothing about what went wrong. Measured in one real session: 887
+ *  results, 39 flagged as errors, and 9 of those over 800 characters - which is to say the big failures are
+ *  exactly the ones that would have passed the size gates and been hidden. */
+function isErrorResult(m: any): boolean {
+	return isToolResult(m) && m?.isError === true;
+}
+
+/** Tool call id -> its number in this session, for the `full: #N` pointer. Branch order, counted from 1.
+ *
+ *  Branch, not projection: a number written into a stub has to mean the same call after a compaction hides
+ *  the older messages, and `recall_tool_result` reads the branch, where the originals always stay.
+ *
+ *  Rebuilt at the three points that prepare a context (the sweep, the compaction flow, the manual command)
+ *  because the branch grows while the session runs. An empty map is how "pointers off" is carried, so the
+ *  stub builder never needs to read the config itself. */
+let ordinalsByCallId = new Map<string, number>();
+
+function refreshOrdinals(ctx: Ctx, el: ElisionConfig): void {
+	ordinalsByCallId = new Map();
+	sessionBranchRef = ctx?.sessionManager;
+	if (!el.recallPointer) return;
+	try {
+		for (const e of ((ctx?.sessionManager?.getBranch?.() ?? []) as any[])) {
+			if (e?.type !== "message" || e?.message?.role !== "assistant" || !Array.isArray(e.message.content)) continue;
+			for (const b of e.message.content) if (b?.type === "toolCall") ordinalsByCallId.set(String(b.id), ordinalsByCallId.size + 1);
+		}
+	} catch {
+		ordinalsByCallId = new Map(); // no numbers rather than wrong ones
+	}
+}
+
+/** The branch the ordinals were counted from, kept so a recall can read the originals back. */
+let sessionBranchRef: any = undefined;
+
+/** The tool result a numbered recall was asked for, read from the branch so elided and compacted-away
+ *  originals are both still there. Returns the text plus the total, or undefined when the number is not a
+ *  tool call in this session. */
+function recalledResultByOrdinal(n: number): { text: string; total: number; toolName: string; ordinal: number } | undefined {
+	let hit: string | undefined;
+	for (const [id, ordinal] of ordinalsByCallId) if (ordinal === n) { hit = id; break; }
+	if (!hit) return undefined;
+	try {
+		for (const e of ((sessionBranchRef?.getBranch?.() ?? []) as any[])) {
+			const m = e?.type === "message" ? e.message : undefined;
+			if (!isToolResult(m) || String(m.toolCallId) !== hit) continue;
+			const text = contentTextOf(m.content);
+			return { text, total: text.length, toolName: String(m.toolName ?? "tool"), ordinal: n };
+		}
+	} catch {
+		/* fall through to the not-found answer */
+	}
+	return undefined;
+}
+
 /**
  * Replace ONE tool-result message with its stub, as a NEW message object (never mutating the
  * original - the preparation object is shared across the rotation's candidates).
  */
 function stubbedResult(messages: any[], index: number, m: any, tailChars: CharCap): any {
+	// The one guard every path shares: a failed call is never stubbed, whether the stub is being built for
+	// the live sweep, for the summariser input, or for a size measurement.
+	if (m?.isError === true) return m;
 	const call = matchingToolCall(messages, index - 1, m.toolCallId, String(m.toolName ?? "tool"));
 	const name = String(m.toolName ?? call?.name ?? "tool");
-	const stub = buildResultStub(name, keyArgsOf(name, call?.args), contentTextOf(m.content), tailChars);
+	const stub = buildResultStub(name, keyArgsOf(name, call?.args), contentTextOf(m.content), tailChars, ordinalsByCallId.get(String(m.toolCallId)));
 	return { ...m, content: [{ type: "text", text: stub }] };
 }
 
@@ -2051,19 +2543,10 @@ export function capToolCallArgs(messages: any[], cap: CharCap): { messages: any[
 		if (m?.role !== "assistant" || !Array.isArray(m.content)) return m;
 		const content = m.content.map((b: any) => {
 			if (b?.type !== "toolCall" || !b.arguments || typeof b.arguments !== "object") return b;
-			let argsChanged = false;
-			const args: Record<string, unknown> = {};
-			for (const [k, v] of Object.entries(b.arguments)) {
-				if (typeof v === "string" && v.length > cap) {
-					args[k] = `${v.slice(0, cap)}...(+${fmt(v.length - cap)} chars)`;
-					argsChanged = true;
-				} else {
-					args[k] = v;
-				}
-			}
-			if (!argsChanged) return b;
+			const cut = cutArgValues(b.arguments, cap);
+			if (!cut.removedChars) return b;
 			capped++;
-			return { ...b, arguments: args };
+			return { ...b, arguments: cut.args };
 		});
 		if (content === m.content) return m;
 		return { ...m, content };
@@ -2072,15 +2555,24 @@ export function capToolCallArgs(messages: any[], cap: CharCap): { messages: any[
 }
 
 /**
- * The summarizer's input, per the model's own options: every tool result becomes an informative
- * stub (pi's 2,000-character clip then has nothing important left to cut - the stub is short by
- * design and carries the exit/tail message the head-only clip used to destroy), and tool-call
- * argument values get capped. Returns a NEW preparation; the caller's object is untouched.
+ * The summarizer's input, per the GLOBAL elision settings: every tool result over the trigger becomes
+ * an informative stub (pi's 2,000-character clip then has nothing important left to cut - the stub is
+ * short by design and carries the exit/tail message the head-only clip used to destroy), tool-call
+ * argument values get capped, and - when the operator asked for it - the assistant's thinking blocks are
+ * left out altogether. Returns a NEW preparation; the caller's object is untouched.
  */
-export function preprocessForSummariser(prep: any, options: { inputStubs: boolean; argCap: CharCap; stubTailChars?: CharCap }): { prep: any; stubbed: number; argsCapped: number; rawChars: number; keptChars: number; savedChars: number } {
+export function preprocessForSummariser(prep: any, options: { inputStubs?: boolean; argCap?: CharCap; stubTailChars?: CharCap; stubFrom?: number; withThinking?: boolean }): { prep: any; stubbed: number; argsCapped: number; thinkingDropped: number; rawChars: number; keptChars: number; savedChars: number } {
 	const tail = options.stubTailChars ?? ELISION_DEFAULTS.stubTailChars;
+	const from = options.stubFrom ?? stubFromChars();
+	const stubs = options.inputStubs ?? compactStubsOn();
+	const cap = options.argCap ?? elisionArgCap();
+	const withThinking = options.withThinking ?? loadConfig().thinkingToSummariser;
 	let stubbed = 0;
 	let argsCapped = 0;
+	// Characters of thinking text taken OUT of the material. The rawChars/keptChars pair above is built
+	// from contentTextOf, which never counted thinking, so the two must be kept apart: mixing thinking
+	// into that pair would also inflate the elision estimate that elidedTokens() scales from it.
+	let thinkingDropped = 0;
 	// How much material the elision actually removed, so the log can say where the tokens went. Before
 	// this, a compaction could read 49,151 tokens out of a 164,239-token context and the log had no way
 	// to account for the difference beyond a count of how many results were touched.
@@ -2092,26 +2584,43 @@ export function preprocessForSummariser(prep: any, options: { inputStubs: boolea
 		const list: any[] = prep?.[key] ?? [];
 		rawChars += charsOf(list);
 		let working = list;
-		if (options.inputStubs) {
+		if (stubs) {
 			working = working.map((m, i) => {
 				if (!isToolResult(m)) return m;
 				// Results at or under pi's 2,000-char clip threshold arrive complete (exit line at the
 				// end included) - their original is strictly better than a stub. Stub only what the
 				// clip would actually damage.
-				if (contentTextOf(m.content).length <= 2_000) return m;
-				return stubbedResult(working, i, m, tail);
+				const text = contentTextOf(m.content);
+				if (text.length <= from) return m;
+				const st = stubbedResult(working, i, m, tail);
+				// A stub of a shortish result can come out LONGER than the result it replaces (the stub
+				// carries the tool name, the key argument, a line/char count and a recovery hint). Keep
+				// the original in that case: elision that adds text is not elision.
+				if (contentTextOf(st.content).length >= text.length) return m;
+				return st;
 			});
 		}
-		const cappedRes = capToolCallArgs(working, options.argCap);
+		if (!withThinking) {
+			// Take the thinking blocks out of what the summariser is handed. This is a copy: the entries in
+			// the session file keep every word of thinking, and the next compaction can be told to read them.
+			for (const m of working) {
+				if (m?.role !== "assistant") continue;
+				for (const b of m.content ?? []) if (b?.type === "thinking") thinkingDropped += String(b.thinking ?? "").length;
+			}
+			working = working.map((m) => (m?.role === "assistant" && (m.content ?? []).some((b: any) => b?.type === "thinking")
+				? { ...m, content: (m.content ?? []).filter((b: any) => b?.type !== "thinking") }
+				: m));
+		}
+		const cappedRes = capToolCallArgs(working, cap);
 		working = cappedRes.messages;
 		argsCapped += cappedRes.capped;
-		if (options.inputStubs) {
+		if (stubs) {
 			stubbed += working.filter((m: any, i: number) => isToolResult(m) && m !== list[i]).length;
 		}
 		out[key] = working;
 		keptChars += charsOf(working);
 	}
-	return { prep: out, stubbed, argsCapped, rawChars, keptChars, savedChars: Math.max(0, rawChars - keptChars) };
+	return { prep: out, stubbed, argsCapped, thinkingDropped, rawChars, keptChars, savedChars: Math.max(0, rawChars - keptChars) };
 }
 
 /** What the elision removed from the material, in the same tokens the material is measured in. The
@@ -2128,7 +2637,21 @@ function elidedTokens(pre: { savedChars?: number; keptChars?: number }, material
 
 // ELISION - the rule-based first stage of context management (the harness paper's headline finding:
 // The full reasoning: DESIGN.md -> elisionStateBySession
-const elisionStateBySession = new Map<string, { applied: Map<string, { stub: string; savedTokens: number }> }>();
+/**
+ * One tool call event whose footprint on the wire has already been cut, remembered across restarts.
+ * A tool call is TWO halves of one event: `stub` replaces the RESULT, `args` holds the cut VALUES of the
+ * CALL (argument name -> cut text). They are kept in one entry because a 100-character answer can sit on
+ * top of a 4,000-character command, and judging the event by its result alone left the bigger half riding
+ * every request of the session (2026-11-01).
+ */
+type ElisionEntry = { stub: string; savedTokens: number; args?: Record<string, string>; argsSaved?: number };
+
+/** What elision remembers about one session: the cuts already made, and `breakAt` - the token position of
+ *  the SHALLOWEST change this session has already put on the wire, which is where the server's prompt cache
+ *  breaks and everything from. It is remembered on purpose: a batch that does not know it can reach back to
+ *  the first tool result in the session and cost a full re-prefill (2026-11-05). 0 = nothing known. */
+type ElisionState = { applied: Map<string, ElisionEntry>; breakAt: number };
+const elisionStateBySession = new Map<string, ElisionState>();
 
 /** One state file per session, named with the session id - the same uuid pi uses in its own session
  *  file name (<ISO-time>_<uuid>.jsonl), so a session's stub file is findable by eye: the elision
@@ -2151,46 +2674,60 @@ function elisionStatePath(sessionId: string): string {
  *  session id, started with an empty store, every already-stubbed result became a fresh candidate
  *  again, and the live wire flipped back to the raw originals and had to be re-prefilled in full.
  *  Tool-call ids survive a resume; a session id does not. */
-function loadElisionState(sessionId: string): { applied: Map<string, { stub: string; savedTokens: number }> } {
+/** Read the cuts of ONE session, from its own state file. Reading every file in the directory, which this
+ *  function used to do, poisons the session with hundreds of other sessions' tool-call ids: they match no
+ *  message here, so the prune removes them again on the first sweep - and the prune is also what cleared the
+ *  recorded cache break point, which is why `paidBefore` came back 0 on 2026-11-05 long after a batch had
+ *  written 122,825. One session, one file. */
+function loadElisionState(sessionId: string): ElisionState {
 	const cached = elisionStateBySession.get(sessionId);
 	if (cached) return cached;
-	const applied = new Map<string, { stub: string; savedTokens: number }>();
-	let files: string[] = [];
+	const applied = new Map<string, ElisionEntry>();
+	let raw: any = null;
 	try {
 		mkdirSync(ELISION_STATE_DIR, { recursive: true });
-		files = readdirSync(ELISION_STATE_DIR).filter((f) => f.endsWith(".json"));
+		raw = JSON.parse(readFileSync(elisionStatePath(sessionId), "utf8"));
 	} catch {
-		/* no state dir yet - fresh session */
+		/* no state file yet - a fresh session */
 	}
-	for (const f of files) {
-		let raw: any;
-		try {
-			raw = JSON.parse(readFileSync(join(ELISION_STATE_DIR, f), "utf8"));
-		} catch {
-			continue; // an unreadable state file is not worth losing the others over
-		}
-		for (const [key, entry] of Object.entries(raw?.applied ?? {})) {
-			const e: any = entry;
-			// Stubs never age out: a session opened after a week or a month must find its stubs exactly
-			// where it left them. The `at` stamp is kept for the log only.
-			if (typeof e?.stub === "string" && typeof e?.savedTokens === "number") applied.set(key, { stub: e.stub, savedTokens: e.savedTokens });
+	for (const [key, entry] of Object.entries(raw?.applied ?? {})) {
+		const e: any = entry;
+		// Stubs never age out: a session opened after a week or a month must find its stubs exactly
+		// where it left them. The `at` stamp is kept for the log only.
+		// An entry is worth restoring when at least one half of the event was cut: a stubbed result, or
+		// cut arguments with no result stub at all (the short-answer, long-command case).
+		const stub = typeof e?.stub === "string" ? e.stub : "";
+		const args = e?.args && typeof e.args === "object" ? (e.args as Record<string, string>) : undefined;
+		if ((stub || args) && typeof e?.savedTokens === "number") {
+			applied.set(key, { stub, savedTokens: e.savedTokens, args, argsSaved: typeof e?.argsSaved === "number" ? e.argsSaved : undefined });
 		}
 	}
-	const state = { applied };
+	const state: ElisionState = { applied, breakAt: Number.isFinite(raw?.breakAt) && raw.breakAt > 0 ? Math.round(raw.breakAt) : 0 };
 	elisionStateBySession.set(sessionId, state);
 	return state;
 }
 
-function saveElisionState(sessionId: string, state: { applied: Map<string, { stub: string; savedTokens: number }> }): void {
+function saveElisionState(sessionId: string, state: ElisionState): void {
 	try {
 		mkdirSync(ELISION_STATE_DIR, { recursive: true });
-		const obj: Record<string, { stub: string; savedTokens: number; at: number }> = {};
+		const obj: Record<string, { stub: string; savedTokens: number; args?: Record<string, string>; argsSaved?: number; at: number }> = {};
 		const at = Date.now();
-		for (const [k, v] of state.applied) obj[k] = { stub: v.stub, savedTokens: v.savedTokens, at };
-		writeFileSync(elisionStatePath(sessionId), JSON.stringify({ applied: obj }, null, 0), "utf8");
+		for (const [k, v] of state.applied) obj[k] = { stub: v.stub, savedTokens: v.savedTokens, ...(v.args ? { args: v.args, argsSaved: v.argsSaved } : {}), at };
+		writeFileSync(elisionStatePath(sessionId), JSON.stringify({ applied: obj, ...(state.breakAt > 0 ? { breakAt: state.breakAt } : {}) }, null, 0), "utf8");
 	} catch {
 		/* state persistence is best-effort */
 	}
+}
+
+
+
+/** What the LAST `applyElision` call did, for whoever started it by hand. The request hook only ever reads
+ *  `messages` out of the return value, and the "elide now" command had that and a message count, so a manual
+ *  sweep reported "191 messages processed" and nothing about what it saved (2026-11-05). Every call writes
+ *  this first, including the calls that decide to do nothing, so the command never reads a stale report. */
+let lastElisionReport = { newResults: 0, newArgsCut: 0, newSavings: 0, totalResults: 0, totalSaved: 0, behindFrontier: 0, eligible: 0, breakAt: 0, sweepStart: 0, breaksAtMessage: 0, serverReusesTokens: 0, serverReReadsTokens: 0 };
+export function elisionReport(): typeof lastElisionReport {
+	return lastElisionReport;
 }
 
 /** When the last batch fired per session - the throttle that keeps elision from re-writing the
@@ -2210,6 +2747,44 @@ export function resetElisionBreaker(): void {
 	elisionFailure.fails = 0;
 	elisionFailure.off = false;
 	elisionFailure.retryAtMs = 0;
+}
+
+/** Does the breaker currently forbid LOOKING for new stubs? (It never forbids putting the already-applied ones
+ *  on the wire - see drawWithStubs.) */
+function breakerHolds(): boolean {
+	return elisionFailure.off || (elisionFailure.retryAtMs > 0 && Date.now() < elisionFailure.retryAtMs);
+}
+
+/** Put the raw originals back on the wire, ON PURPOSE, with the guard the on/off switch used to have no
+ *  version of: refuse when the released transcript would not fit in the model's window. This is the only
+ *  route that discards applied stubs, and it says by how much the context would grow before it does it. */
+function releaseAppliedStubs(ctx: Ctx): { ok: boolean; text: string } {
+	const cfg = loadConfig();
+	const sessionId = String(ctx?.sessionManager?.getSessionId?.() ?? "session");
+	const state = elisionStateBySession.get(sessionId);
+	if (!state || state.applied.size === 0) return { ok: true, text: "Nothing to release - this session has no stubs on the wire." };
+	const held = [...state.applied.values()].reduce((s, e) => s + (e.savedTokens ?? 0) + (e.argsSaved ?? 0), 0);
+	const projection: any = (ctx as any)?.sessionManager?.buildSessionProjection?.();
+	const msgs: any[] = (projection?.messages ?? []).filter((m: any) => m?.role !== "system");
+	const usageTok = Math.round((ctx as any)?.getContextUsage?.()?.tokens ?? 0);
+	// pi adds the system prompt and the tool schemas on top of the message sum, so the released wire is
+	// whichever number is bigger: the raw message sum, or today's real usage plus everything being put back.
+	const projected = Math.max(msgs.reduce((s, m) => s + msgTokens(m), 0), usageTok > 0 ? usageTok + held : 0);
+	const window = ctx?.model?.contextWindow ?? 0;
+	const need = Math.max(8_000, cfg.scaling?.reserveTokens ?? 8_000);
+	if (window > 0 && projected + need > window) {
+		logLine(cfg, { event: "stubs_release_refused", sid: sessionId.slice(-8), applied: state.applied.size, holdingTokens: held, projected, window, note: "releasing would put the request over the window - refused" });
+		return {
+			ok: false,
+			text: `NOT RELEASED: putting back ${state.applied.size} stubs adds about ${fmt(held)} tok, which would make the next request about ${fmt(projected)} tok in a ${fmt(window)} tok window - it needs ${fmt(need)} tok of answer room. That is how the window overflowed on 2026-11-06. Compact first, or keep the stubs.`,
+		};
+	}
+	const n = state.applied.size;
+	state.applied.clear();
+	state.breakAt = 0;
+	saveElisionState(sessionId, state);
+	logLine(cfg, { event: "stubs_released", sid: sessionId.slice(-8), released: n, holdingTokens: held, projected, window, note: "the operator asked for the raw originals back" });
+	return { ok: true, text: `Released ${n} stubs. The next request carries the raw originals again (about ${fmt(held)} tok more, roughly ${fmt(projected)} tok in a ${fmt(window)} tok window). Auto-elision can make new ones from here if it is on.` };
 }
 
 // What the SERVER holds is what matters: the last real usage report this session got back
@@ -2312,24 +2887,359 @@ function wireTokensOf(ctx: any): number {
 	}
 }
 
-export function applyElision(messages: any[], ctx: Ctx, opts?: { force?: boolean }): { messages: any[] } | undefined {
+/** Put the session's stored stubs on a message list: the RESULT that was elided, and the ARGUMENTS that were
+ *  cut, both replaced from the state file. Returns the list plus whether anything was replaced at all.
+ *
+ *  This is the part that is NOT optional. pi rebuilds every request from the raw originals in storage, so the
+ *  stubs only exist because this function puts them back on every single request. Handing the incoming list
+ *  straight back - which every "off" and "failed" path in this file used to do - does not preserve the
+ *  elided context, it RELEASES all of it in one request. Measured on the live session: with 146 stubs held,
+ *  the wire went 308,908 tok -> 404,734 tok (basalt-nvfp4.log lines 9450 -> 9452, cached=0) against a
+ *  393,216-tok window, the engine refused the request, and pi then tried to summarize a context that no
+ *  longer fitted. Keep this on the wire whatever else is switched off. */
+function drawWithStubs(messages: any[], entries: Map<string, ElisionEntry>): { list: any[]; changed: boolean } {
+	let changed = false;
+	const list = messages.map((m) => {
+		if (isToolResult(m)) {
+			const entry = entries.get(String(m.toolCallId));
+			// An entry with no `stub` is an arguments-only event: its result stays whole on purpose.
+			if (!entry || !entry.stub) return m;
+			changed = true;
+			return { ...m, content: [{ type: "text", text: entry.stub }] };
+		}
+		// The CALL half. An assistant message can carry several calls, so the cut is matched on the call id
+		// and only that block is rewritten; keys the call never had are not invented.
+		if (m?.role !== "assistant" || !Array.isArray(m.content)) return m;
+		let touched = false;
+		const content = m.content.map((b: any) => {
+			if (b?.type !== "toolCall") return b;
+			const entry = entries.get(String(b.id));
+			if (!entry?.args) return b;
+			touched = true;
+			return { ...b, arguments: { ...(b.arguments ?? {}), ...entry.args } };
+		});
+		if (!touched) return m;
+		changed = true;
+		return { ...m, content };
+	});
+	return { list, changed };
+}
+
+/** Where a sweep first changes the request that is about to be sent.
+ *
+ *  Draw the same message list twice - once with the cuts as they stood before the batch, once with the cuts
+ *  as they stand after it - and find the first message that differs. That position IS the price of the
+ *  sweep: the server can reuse everything before it and has to read everything after it again. No memory of
+ *  any earlier request is needed, so this works on the very first request after a reload, which the earlier
+ *  version (comparing with the one sent last time) could not do.
+ */
+function sweepBreak(messages: any[], before: Map<string, ElisionEntry>, after: Map<string, ElisionEntry>) {
+	const a = drawWithStubs(messages, before).list;
+	const b = drawWithStubs(messages, after).list;
+	const dig = (m: any) => {
+		const s = JSON.stringify(m);
+		let h = 2166136261;
+		for (let i = 0; i < s.length; i++) h = ((h ^ s.charCodeAt(i)) * 16777619) | 0;
+		return `${(h >>> 0).toString(36)}:${s.length}`;
+	};
+	let first = -1;
+	let last = -1;
+	for (let i = 0; i < b.length; i++) if (dig(a[i]) !== dig(b[i])) { if (first < 0) first = i; last = i; }
+	if (first < 0) return undefined;
+	let from = 0;
+	for (let i = 0; i < first; i++) from += msgTokens(b[i]);
+	// `through` runs to the end of the LAST thing the sweep changed: the sweep occupies the context from
+	// `from` to `through`, and the server re-reads from `from` to the end of the request.
+	let through = from;
+	for (let i = first; i <= last; i++) through += msgTokens(b[i]);
+	const total = through + b.slice(last + 1).reduce((s, m) => s + msgTokens(m), 0);
+	return {
+		first,
+		last,
+		from: Math.round(from),
+		through: Math.round(through),
+		reRead: Math.round(total - from),
+		total: Math.round(total),
+	};
+}
+
+/** Where the NEXT sweep will begin, counted in tokens of the request as it will actually be sent.
+ *
+ *  Walk the drawn (already elided) list from the front and stop at the first tool call that is still raw and
+ *  would be worth eliding - the same two tests the sweep itself applies. Everything in front of it is either
+ *  stubbed or too small to pay for a stub, so the next sweep can only start here. Printed as
+ *  `next elision at ctx N tok`, and it is the number that makes the promise checkable: the FOLLOWING sweep's
+ *  `first elision at ctx` must equal it, and anything smaller means content above has changed again.
+ */
+function nextElisionAtCtx(list: any[], applied: Map<string, ElisionEntry>, el: ElisionConfig): number | undefined {
+	let pos = 0;
+	for (let i = 0; i < list.length; i++) {
+		const m = list[i];
+		if (isToolResult(m)) {
+			if (!applied.has(String(m.toolCallId))) {
+				const text = contentTextOf(m.content);
+				if (text.length >= el.stubFromChars && msgTokens(m) - msgTokens(stubbedResult(list, i, m, el.stubTailChars)) >= MIN_STUB_SAVING_TOKENS) {
+					return pos;
+				}
+			}
+		} else if (m?.role === "assistant" && Array.isArray(m.content) && el.argCap !== "full") {
+			for (const b of m.content) {
+				if (b?.type !== "toolCall" || applied.get(String(b.id))?.args) continue;
+				if (Object.values(b.arguments ?? {}).some((v: any) => typeof v === "string" && v.length > (el.argCap as number))) return pos;
+			}
+		}
+		pos += msgTokens(m);
+	}
+	return undefined;
+}
+
+// ---------------------------------------------------------------- LIVE ELISION, AS PI'S OWN CONTEXT EDITS
+//
+// WHY THIS REPLACED THE REQUEST REWRITE (2026-11-06, the operator's choice of route A).
+// The old design kept its own list of applied stubs in `pi-compact-plus-state/<session>.json` and re-drew them
+// on the outgoing payload of every request, because pi rebuilds each request from the raw originals in the
+// session file. Three things were wrong with that, and all three cost him real time:
+//   * every road around the rewrite (switch off, circuit breaker, retry pause, a throw in the sweep) handed
+//     pi the raw originals, which is not "no change" - it RELEASES every stub in one request. On 2026-11-06
+//     that took a 308,908-tok wire to 404,734 tok over a 393,216-tok window and the engine refused it.
+//   * pi's own compaction arithmetic never saw the shrink, because it reads the transcript, not the payload.
+//     That blindness is the whole reason the `watchdogAuto` safety net exists.
+//   * the state file could disagree with the transcript, which is what the stale-entry pruning kept doing.
+// Now the elision is written into the session as pi's own `context_edit` entries: the original stays in the
+// file untouched, pi's projection carries the stub, pi's token maths sees it, the session file itself is the
+// record of what has been elided (so there is no second ledger to keep in step), and `recall_tool_result`
+// reads the original straight back out of the entry the edit was made against.
+// The automatic sweep runs in `turn_end`, the documented boundary where an extension may propose entries;
+// pi validates them, commits them, and rebuilds the running context itself.
+
+/** One proposed edit: pi's entry id, the content that replaces it, and what it is worth. */
+type ElisionDraft = {
+	targetId: string;
+	replacement: { content: any[] };
+	savedTokens: number;
+	what: "result" | "args";
+	pos: number; // tokens into the request as the server currently holds it
+};
+
+/** Plan the elision over the live context, as pi sees it.
+ *
+ *  The list walked is `buildSessionProjection().entries` - exactly the entries contributing to the next
+ *  request, in order, each with its original message and the content currently projected for it. That is
+ *  both the ruler (token positions for the protected window and for `first elision at ctx`) and the marker
+ *  of what has already been done (an entry id that a `context_edit` already targets is never touched twice).
+ *  Nothing is remembered between turns: the session IS the state.
+ */
+function planElisionEdits(ctx: Ctx, el: ElisionConfig): { drafts: ElisionDraft[]; live: any[]; wireTokens: number; skippedTiny: number; skippedError: number } | undefined {
+	const sm: any = (ctx as any)?.sessionManager;
+	if (!sm || typeof sm.getBranch !== "function" || typeof sm.buildSessionProjection !== "function") return undefined;
+	let branch: any[] = [];
+	let projection: any = null;
+	try {
+		branch = sm.getBranch() ?? [];
+		projection = sm.buildSessionProjection();
+	} catch {
+		return undefined; // a transcript we cannot read is not a transcript to edit
+	}
+	const edited = new Set<string>();
+	for (const e of branch) if (e?.type === "context_edit" && e.targetId) edited.add(String(e.targetId));
+	// Live entries, in order: the original message (what the server was told first) and the content projected
+	// for it now (what the server is told today).
+	const live: { id: string; orig: any; cur: any }[] = [];
+	for (const pe of projection?.entries ?? []) {
+		const se = pe?.sourceEntry;
+		if (se?.type !== "message" || !se.message) continue;
+		const msgs: any[] = Array.isArray(pe.messages) && pe.messages.length ? pe.messages : [se.message];
+		live.push({ id: String(se.id), orig: se.message, cur: msgs[msgs.length - 1] });
+	}
+	if (live.length === 0) return undefined;
+	const list = live.map((l) => l.cur);
+	// The protected recent window, counted back from the end of the live context.
+	let acc = 0;
+	let protectedFrom = 0;
+	for (let i = live.length - 1; i >= 0; i--) {
+		acc += msgTokens(live[i].cur);
+		if (acc >= el.protectRecentTokens) { protectedFrom = i; break; }
+	}
+	const pos: number[] = [];
+	let run = 0;
+	for (let i = 0; i < live.length; i++) { pos.push(run); run += msgTokens(live[i].cur); }
+	const wireTokens = run;
+	const drafts: ElisionDraft[] = [];
+	let skippedTiny = 0;
+	let skippedError = 0;
+	for (let i = 0; i < protectedFrom; i++) {
+		const { id, orig, cur } = live[i];
+		if (edited.has(id)) continue; // already elided - pi's own entry is the record
+		if (isToolResult(cur)) {
+			// An error is the information of that turn. Never hidden, whatever its size (measured: 887 results,
+			// 39 errors, 9 of them over 800 chars - exactly the class a size gate would have caught).
+			if (orig?.isError === true || cur?.isError === true) { skippedError++; continue; }
+			const text = contentTextOf(orig.content);
+			if (text.length < el.stubFromChars) continue;
+			const st = stubbedResult(list, i, orig, el.stubTailChars);
+			const s = msgTokens(orig) - msgTokens(st);
+			if (s < MIN_STUB_SAVING_TOKENS) { if (s > 0) skippedTiny++; continue; }
+			drafts.push({ targetId: id, replacement: { content: st.content }, savedTokens: s, what: "result", pos: pos[i] });
+			continue;
+		}
+		// THE CALL HALF. The replacement replaces an assistant message's WHOLE content array, so every other
+		// block is copied through untouched (thinking, text, and each call's id and name, which is what pairs
+		// the call with its result) and only the argument VALUES are shortened.
+		if (orig?.role === "assistant" && Array.isArray(orig.content) && el.argCap !== "full") {
+			let touched = false;
+			const content = orig.content.map((b: any) => {
+				if (b?.type !== "toolCall") return b;
+				const capped = capArgsObj(b.arguments, el.argCap);
+				if (capped === b.arguments) return b;
+				touched = true;
+				return { ...b, arguments: capped };
+			});
+			if (!touched) continue;
+			const s = msgTokens(orig) - msgTokens({ ...orig, content });
+			if (s < MIN_STUB_SAVING_TOKENS) { if (s > 0) skippedTiny++; continue; }
+			drafts.push({ targetId: id, replacement: { content }, savedTokens: s, what: "args", pos: pos[i] });
+		}
+	}
+	return { drafts, live: list, wireTokens, skippedTiny, skippedError };
+}
+
+/** Decide a sweep, say what it did, and either hand the drafts back for a boundary proposal (`direct` false)
+ *  or write them now with pi's own `appendContextEdit` (`direct` true - the manual command, where waiting for
+ *  a turn boundary would mean waiting for a turn that may never come).
+ *
+ *  Both doors share one plan, one set of gates and one log row, so the figures in the log always describe what
+ *  was actually written, whichever door wrote it. */
+function runElisionSweep(ctx: Ctx, opts: { force?: boolean; direct?: boolean }): { ok: boolean; kind: "written" | "proposed" | "nothing" | "held" | "refused"; text: string; drafts: ElisionDraft[] } {
 	const cfg = loadConfig();
 	const el = cfg.elision;
+	const none = (kind: "nothing" | "held" | "refused", text: string) => ({ ok: kind !== "refused", kind, text, drafts: [] as ElisionDraft[] });
+	const window = ctx?.model?.contextWindow ?? 0;
+	if (!(window > 0)) return none("nothing", "No context window on this model, so there is nothing to measure against.");
+	refreshOrdinals(ctx, el); // the #N in a stub and the recall tool must agree on one ruler
+	const planned = planElisionEdits(ctx, el);
+	if (!planned) return none("nothing", "The session transcript could not be read, so nothing was elided.");
+	if (planned.drafts.length === 0) return none("nothing", "Nothing to elide - every tool result outside the preserved tail is either already elided, too small to pay for its own stub, or a failure that must stay whole.");
+	const sessionId = String(ctx?.sessionManager?.getSessionId?.() ?? "session");
+	const usageTok = Math.round((ctx as any)?.getContextUsage?.()?.tokens ?? 0);
+	const fill = Math.max(planned.wireTokens, usageTok);
+	const softTokens = Math.floor((el.softPercent / 100) * window);
+	if (!opts.force && fill < softTokens) return none("nothing", `The context is at ${fmt(fill)} tok, under the ${el.softPercent}% line (${fmt(softTokens)} tok of a ${fmt(window)} tok window).`);
+	const nowMs = Date.now();
+	const sinceLast = nowMs - (lastBatchAtMs.get(sessionId) ?? 0);
+	const throttled = !opts.force && sinceLast < Math.max(0, el.minBatchGapSec) * 1000;
+	const picked = planned.drafts.slice(0, Math.max(1, el.maxResultsPerBatch)); // oldest first, always
+	const newSavings = picked.reduce((s, d) => s + d.savedTokens, 0);
+	const resultsSaved = picked.filter((d) => d.what === "result").reduce((s, d) => s + d.savedTokens, 0);
+	const argsSaved = picked.filter((d) => d.what === "args").reduce((s, d) => s + d.savedTokens, 0);
+	const resultsN = picked.filter((d) => d.what === "result").length;
+	const postBatchWire = planned.wireTokens - newSavings;
+	const stopTokens = Math.max(0, window - (cfg.scaling?.reserveTokens ?? 8_000) - el.stopGapTokens);
+	if (!opts.force) {
+		if (throttled) {
+			logLine(cfg, { event: "elision_hold", sid: sessionId.slice(-8), waiting: planned.drafts.length, waitingTokens: newSavings, sinceLastMs: sinceLast, gapMs: Math.max(0, el.minBatchGapSec) * 1000, note: "batch held back by the elision batch gap" });
+			return none("held", `Held back by the batch gap: ${picked.length} candidates worth ${fmt(newSavings)} tok are waiting, last sweep ${Math.round(sinceLast / 1000)} s ago.`);
+		}
+		if (picked.length < el.minResultsToStub) return none("nothing", `Only ${picked.length} candidate${picked.length === 1 ? "" : "s"} waiting, under the minimum of ${el.minResultsToStub}.`);
+		if (newSavings < el.minSavingsTokens) return none("nothing", `A sweep now would save ${fmt(newSavings)} tok, under the ${fmt(el.minSavingsTokens)} tok floor.`);
+	}
+	const first = Math.min(...picked.map((d) => d.pos));
+	const rest = planned.drafts.slice(picked.length);
+	lastBatchAtMs.set(sessionId, nowMs);
+	lastElisionReport = {
+		newResults: resultsN,
+		newArgsCut: picked.length - resultsN,
+		newSavings,
+		totalResults: picked.length,
+		totalSaved: newSavings,
+		behindFrontier: 0,
+		eligible: planned.drafts.length,
+		breakAt: first,
+		sweepStart: first,
+		breaksAtMessage: 0,
+		serverReusesTokens: first,
+		serverReReadsTokens: planned.wireTokens - first,
+	};
+	const summary = `${picked.length} tool call${picked.length === 1 ? "" : "s"} elided \u00b7 saved ${fmt(newSavings)} tok (${fmt(resultsSaved)} in results, ${fmt(argsSaved)} in arguments) \u00b7 ctx ~${fmt(planned.wireTokens)} tok -> ~${fmt(postBatchWire)} tok \u00b7 first elision at ctx ${fmt(first)} tok` +
+		(rest.length ? ` \u00b7 next elision at ctx ${fmt(rest[0].pos)} tok` : " \u00b7 nothing raw left to elide") +
+		` \u00b7 server to read ${fmt(planned.wireTokens - first)} tok`;
+	logLine(cfg, {
+		event: "elision",
+		sid: sessionId.slice(-8),
+		applied: resultsN,
+		callsWithArgsCut: picked.length - resultsN,
+		argsSavedTokens: argsSaved,
+		resultsTokens: resultsSaved,
+		stubTokens: 0,
+		savedTokens: newSavings,
+		appliedSavedTokens: 0,
+		preBatchWire: planned.wireTokens,
+		effTokens: fill,
+		postBatchWire,
+		window,
+		softPercent: el.softPercent,
+		softTokens,
+		stopTokens,
+		wireTokens: planned.wireTokens,
+		skippedTinySaving: planned.skippedTiny,
+		skippedErrorSaving: planned.skippedError,
+		deferred: rest.length,
+		firstElidedAtCtx: first,
+		lastElidedAtCtx: Math.max(...picked.map((d) => d.pos)),
+		nextElisionAtCtx: rest.length ? rest[0].pos : undefined,
+		serverReusesTokens: first,
+		serverReReadsTokens: planned.wireTokens - first,
+		sentTokens: planned.wireTokens,
+		force: opts.force === true,
+		via: opts.direct ? "context_edit_direct" : "context_edit_boundary",
+		note: rest.length ? `${rest.length} more candidates wait for the next sweep (batch cap ${el.maxResultsPerBatch})` : undefined,
+	});
+	if (!opts.direct) return { ok: true, kind: "proposed", text: summary, drafts: picked };
+	// Write them now. Each edit is independent, so one pi refusing a target cannot lose the rest.
+	const sm: any = (ctx as any)?.sessionManager;
+	if (typeof sm?.appendContextEdit !== "function") {
+		logLine(cfg, { event: "elision_error", where: "manual", note: "this pi build does not expose appendContextEdit on the session manager; the sweep cannot write" });
+		return none("refused", "This pi does not let an extension write context edits outside a turn boundary, so the manual sweep cannot run. The automatic sweep runs at the boundary and is unaffected.");
+	}
+	let written = 0;
+	let refused = 0;
+	for (const d of picked) {
+		try {
+			sm.appendContextEdit(d.targetId, d.replacement);
+			written++;
+		} catch {
+			refused++;
+		}
+	}
+	logLine(cfg, { event: "elision_edits_written", sid: sessionId.slice(-8), written, refused, ...lastElisionReport });
+	return { ok: written > 0, kind: written > 0 ? "written" : "refused", text: `${written} elision${written === 1 ? "" : "s"} written into the session${refused ? `, ${refused} refused by pi` : ""} \u00b7 ${summary} \u00b7 the originals stay in the session file and read back with recall_tool_result`, drafts: picked };
+}
+
+export function applyElision(messages: any[], ctx: Ctx, opts?: { force?: boolean; keepOnly?: boolean }): { messages: any[] } | undefined {
+	const cfg = loadConfig();
+	const el = cfg.elision;
+	// Start every sweep from an empty report, so a command that reports the outcome of THIS sweep can never
+	// quote figures from an earlier one.
+	lastElisionReport = { newResults: 0, newArgsCut: 0, newSavings: 0, totalResults: 0, totalSaved: 0, behindFrontier: 0, eligible: 0, breakAt: 0, sweepStart: 0, breaksAtMessage: 0, serverReusesTokens: 0, serverReReadsTokens: 0 };
 	const sessionId = String(ctx?.sessionManager?.getSessionId?.() ?? "session");
 	let state = elisionStateBySession.get(sessionId);
-	// THE MASTER SWITCH (2026-10-05): "Extension active: OFF" used to switch off only the compaction
-	// side - elision kept firing on its own switch, and every batch moves the prompt-cache break point,
-	// i.e. re-uploads the whole context to the server (the 2026-10-05 night: batches at 717k tokens on
-	// a 1M session, one after another). OFF now means OFF for both, and any stubs already applied are
-	// dropped so the wire goes back to the raw originals straight away.
-	if (!el.enabled) { // elision has its own switch since 2026-10-05 - independent of the compaction switch
-		if (state?.applied.size) {
-			state.applied.clear();
-			saveElisionState(sessionId, state);
-			logLine(cfg, { event: "elision_off", sid: String(sessionId).slice(-8), note: "elision cleared every applied stub (extension/elision switched off)" });
-		}
-		return undefined;
+	// THE SAFE PATH: put the stored stubs on the list and do nothing else. Used when this function's own
+	// sweep has just thrown, so a broken sweep can never be the reason the originals come back.
+	if (opts?.keepOnly) {
+		if (!state?.applied.size || !Array.isArray(messages) || messages.length === 0) return undefined;
+		const d = drawWithStubs(messages, state.applied);
+		return d.changed ? { messages: d.list } : undefined;
 	}
+	// MAY THIS CALL LOOK FOR NEW STUBS? Not while the switch is off, and not while the breaker holds. The
+	// manual command (force) may always, because the operator asked and because stubbing only ever shrinks
+	// the wire - it cannot overflow anything. Searching and RELEASING are different things, and this used to
+	// confuse them: see drawWithStubs for what one release costs.
+	refreshOrdinals(ctx, el); // the #N in a stub and the recall tool must agree on one ruler
+	const maySweep = (el.enabled && !breakerHolds()) || opts?.force === true;
+	// SWITCHED OFF MEANS OFF, QUIETLY (2026-11-06, the operator's call). This used to write one
+	// `elision_paused` row per session explaining that the stubs already applied stay on the wire.
+	// Explaining a state the operator set himself is not a record of anything that happened, so the row
+	// is gone: while the switch is off nothing is counted and nothing is written. The stubs still stay -
+	// see drawWithStubs for why releasing them is a window overflow.
 	const window = ctx?.model?.contextWindow ?? 0;
 	if (!(window > 0) || !Array.isArray(messages) || messages.length === 0) return undefined;
 
@@ -2362,42 +3272,119 @@ export function applyElision(messages: any[], ctx: Ctx, opts?: { force?: boolean
 		state = loadElisionState(sessionId);
 		elisionStateBySession.set(sessionId, state);
 	}
+	// The break point the session came in with, kept for the log: `paidBefore` -> `paidAfter` shows a batch
+	// moving the point deeper, or holding it where it is.
+	const storedBreakAt = state.breakAt;
 	// Prune applied stubs whose result no longer exists (after a compaction or /clear).
 	const present = new Set<string>();
 	for (const m of messages) if (isToolResult(m)) present.add(String(m.toolCallId));
-	for (const key of [...state.applied.keys()]) if (!present.has(key)) state.applied.delete(key);
+	let pruned = 0;
+	for (const key of [...state.applied.keys()]) if (!present.has(key)) { state.applied.delete(key); pruned++; }
+	// A compaction or a /clear removed part of the transcript, so the ruler this session's break point was
+	// measured on has changed under it. Forget the number and let the scan below find a new one from what is
+	// actually still here.
+	if (pruned > 0) state.breakAt = 0;
 
 	// Eligible = tool results before the protected window, oldest first, not yet applied, big
 	// The full reasoning: DESIGN.md -> applyElision
-	let frontier = -1; // index of the oldest stub already on the wire, -1 = none yet
-	for (let i = 0; i < messages.length && i < protectedFrom; i++) {
-		if (isToolResult(messages[i]) && state.applied.has(String(messages[i].toolCallId))) { frontier = i; break; }
+	// WHERE THE SERVER'S CACHE BREAKS (2026-11-05, in tokens, not in message indexes). Message indexes move
+	// with every compaction and every branch; token positions of the messages that stayed do not, so the
+	// break point is remembered in tokens. Two sources, and the SHALLOWEST of them wins, because the cache
+	// breaks at the earliest change the server has been given: the number this session stored, and the
+	// position of the oldest cut still present in this transcript.
+	let frontier = -1; // the same point as an index, for the log
+	let frontierTok = 0; // and as a token position, which is what the sweep enforces
+	{
+		let acc = 0;
+		for (let i = 0; i < messages.length && i < protectedFrom; i++) {
+			// Either half counts, and the CALL comes first: an entry whose arguments were cut moves the break
+			// point to the assistant message, one message before the result a result-only scan would have found.
+			if (elidedHalfOf(messages, i, state.applied)) {
+				frontier = i;
+				frontierTok = acc;
+				break;
+			}
+			acc += msgTokens(messages[i]);
+		}
 	}
-	// PASS 2 - candidates, AFTER the break point only. Results older than the frontier are left as
-	// raw originals on purpose: stubbing one of those would move the break point to the start of the
-	// session and cost a full re-prefill to save a few thousand tokens. They are counted and logged.
+	if (state.breakAt > 0) frontierTok = frontierTok > 0 ? Math.min(frontierTok, state.breakAt) : state.breakAt;
+	// PASS 2 - every eligible result up to the protected window, oldest first. Nothing is skipped and
+	// nothing is left raw on purpose any more (2026-11-05), so this counter is retired: it stays in the log
+	// row so old records and new ones line up, and it only ever counts the results a batch cap had to leave
+	// for the next pass.
 	let behindFrontier = 0;
-	const candidates: Array<{ index: number; key: string; stub: string; savedTokens: number }> = [];
+	let skippedTiny = 0; // results over the operator's floor whose stub would have saved too little
+	// `savedTokens` is the combined saving of both halves (what the batch gates are judged on); the two
+	// halves are ALSO kept apart, because the stored entry must not count one token twice.
+	const candidates: Array<{ index: number; touchedFrom: number; pos: number; key: string; stub: string; resultSaved: number; args?: Record<string, string>; argsSaved: number; savedTokens: number }> = [];
+	let pos = 0; // tokens before message i - the same ruler as frontierTok
+	const posAt: number[] = []; // and the same figures by index, to price the CALL half of an event
 	if (opts?.force || effTokens >= softTokens) {
 		for (let i = 0; i < messages.length && i < protectedFrom; i++) {
 			const m = messages[i];
+			const thisPos = pos;
+			posAt[i] = thisPos;
+			pos += msgTokens(m);
 			if (!isToolResult(m)) continue;
+			// NO reach limit (2026-11-05, the operator's rule). An earlier version of this line refused every
+			// candidate above the break the server had already paid for, which left permanent raw islands in the
+			// middle of the transcript - raw forever, and still riding in every request. The sweep is one
+			// contiguous pass instead: it starts at the first tool call that is not elided yet and runs forward.
 			const key = String(m.toolCallId);
 			if (state.applied.has(key)) continue; // already stubbed - frozen
-			if (frontier >= 0 && i < frontier) { behindFrontier++; continue; } // behind the break point: leave it raw
+			if (m.isError === true) continue; // a failure IS the information of this turn - never hidden
+			// HALF ONE - the result. A stub is only written when it is actually smaller, which is what the
+			// 600-character floor beneath the trigger guards: a stub of a 300-character result is the result.
 			const text = contentTextOf(m.content);
-			if (el.stubTailChars !== "full" && text.length < el.stubTailChars + 600) continue; // stub would save nothing
-			const st = stubbedResult(messages, i, m, el.stubTailChars);
-			const saved = msgTokens(m) - msgTokens(st);
+			let stubTxt = "";
+			let resultSaved = 0;
+			// HALF ONE - the result. THE FLOOR IS THE OPERATOR'S SETTING, NOTHING ELSE (2026-11-06).
+			// This line used to read `text.length >= el.stubFromChars && text.length >= el.stubTailChars + 600`,
+			// which turned their "elide results from 300 chars" into 800 chars in silence - and the compaction
+			// path never had that clause, so the two paths were eliding different sets from one setting.
+			// Whether a cut is worth it is arithmetic, not a guess at a length: build the stub and measure it.
+			// With `stubTailChars` 200 a stub is a fixed ~355 chars, so a 300-char result saves -14 tokens
+			// (refused), 400 saves 12, 500 saves 37, 600 saves 62. What decides is MIN_STUB_SAVING_TOKENS.
+			if (text.length >= el.stubFromChars) {
+				const st = stubbedResult(messages, i, m, el.stubTailChars);
+				const s = msgTokens(m) - msgTokens(st);
+				if (s >= MIN_STUB_SAVING_TOKENS) {
+					stubTxt = String(st.content?.[0]?.text ?? "");
+					resultSaved = s;
+				} else if (s > 0) skippedTiny++;
+			}
+			// HALF TWO - the call's arguments, judged on their own. This is the half the old sweep never
+			// looked at, so `write` and `edit` calls carried their whole payload until the compaction.
+			const call = cutCallArgsFor(messages, i, key, el.argCap);
+			const saved = resultSaved + call.savedTokens;
+			if (!stubTxt && !call.savedTokens) continue; // neither half is worth cutting: leave the event alone
 			if (saved <= 0) continue;
-			candidates.push({ index: i, key, stub: st.content[0].text, savedTokens: saved });
+			// An event is TWO messages: the assistant's CALL and the tool's RESULT. Cutting the arguments rewrites
+			// the call, which sits one or more messages EARLIER, so the point where the wire starts to differ is
+			// the call, not the result. Judging the sweep by the result index made the cache self-check report a
+			// change "above" the sweep for a change the sweep itself had made.
+			const cutTheCall = call.savedTokens > 0 && call.callIndex >= 0 && call.callIndex < i;
+			const touchedFrom = cutTheCall ? call.callIndex : i;
+			candidates.push({ index: i, touchedFrom, pos: cutTheCall ? Math.min(thisPos, posAt[call.callIndex] ?? thisPos) : thisPos, key, stub: stubTxt, resultSaved, args: call.args, argsSaved: call.savedTokens, savedTokens: saved });
 		}
 	}
 
 	// Batch check - a batch fires only when ALL three hold:
 	// The full reasoning: DESIGN.md -> applyElision #2
 	const eligible = candidates.filter((c) => !state!.applied.has(c.key));
-	const newCandidates = eligible.length > el.maxResultsPerBatch ? eligible.slice(eligible.length - el.maxResultsPerBatch) : eligible;
+	// NEWEST FIRST, AND STOP WHEN THE BATCH IS WORTH IT (2026-11-05). Taking the oldest results first put the
+	// break point at the start of the session on the very first batch of a day (log: breakPointIndex 2), so
+	// the engine re-read 130,000-180,000 tokens to save a few thousand. Working from the newest backwards
+	// keeps the break point as deep as the savings allow, and stops the moment the batch clears its own
+	// floor - the older results stay raw, which is what `behindFrontier` counts.
+	const picked: typeof eligible = [];
+	let pickedSavings = 0;
+	for (let k = eligible.length - 1; k >= 0 && picked.length < el.maxResultsPerBatch; k--) {
+		picked.unshift(eligible[k]);
+		pickedSavings += eligible[k].savedTokens;
+		if (el.cacheFriendly && pickedSavings >= el.minSavingsTokens && picked.length >= el.minResultsToStub) break;
+	}
+	const newCandidates = picked;
 	const newSavings = newCandidates.reduce((sum, c) => sum + c.savedTokens, 0);
 	// The batch throttle: one break-point move per gap. Between batches the applied set is stable,
 	// so the wire keeps its shape and the server-side prompt cache stays warm.
@@ -2406,38 +3393,117 @@ export function applyElision(messages: any[], ctx: Ctx, opts?: { force?: boolean
 	const throttled = !opts?.force && lastBatchAtMs.has(sessionId) && sinceLast < Math.max(0, el.minBatchGapSec) * 1000;
 	const compactionPoint = Math.max(0, window - extReserve(ctx));
 	const stopTokens = Math.max(softTokens, compactionPoint - el.stopGapTokens);
-	const appliedSaved = [...state!.applied.values()].reduce((s, e) => s + e.savedTokens, 0);
+	const appliedSaved = [...state!.applied.values()].reduce((s, e) => s + e.savedTokens + (e.argsSaved ?? 0), 0);
 	const postBatchWire = effTokens - appliedSaved - newSavings;
-	if (opts?.force && newCandidates.length === 0) return undefined; // nothing new to elide
-	if (opts?.force || (!throttled && newCandidates.length >= el.minResultsToStub && newSavings >= el.minSavingsTokens && postBatchWire < stopTokens)) {
-		for (const c of newCandidates) state!.applied.set(c.key, { stub: c.stub, savedTokens: c.savedTokens });
+	// The numbers of this sweep, recorded for whoever asked for it (see elisionReport).
+	const reportTotals = () => {
+		let saved = 0;
+		for (const [, e] of state!.applied) saved += e.savedTokens + (e.argsSaved ?? 0);
+		return { totalResults: state!.applied.size, totalSaved: saved, behindFrontier, eligible: eligible.length, breakAt: state!.breakAt };
+	};
+	if (opts?.force && newCandidates.length === 0) {
+		// Nothing NEW. Still worth reporting: the command can then say what is already on the wire instead of
+		// implying the session was untouched.
+		lastElisionReport = { ...lastElisionReport, newResults: 0, newArgsCut: 0, newSavings: 0, ...reportTotals() };
+		// Even with nothing NEW to cut, hand back the stored stubs rather than nothing (2026-11-06): under the
+		// stubs-are-permanent rule an unanswered-looking return is a release of everything already on the wire.
+		const dNothing = drawWithStubs(messages, state.applied);
+		return dNothing.changed ? { messages: dNothing.list } : undefined;
+	}
+	// ALREADY OVER THE STOP LINE = TAKE WHAT YOU CAN (2026-11-05). The gate below demands that a batch bring
+	// the whole wire back under the stop line, which is the right test when there is room: it stops a sweep
+	// that would churn the cache for nothing. But with the cache rule limiting what a batch may reach, a
+	// session can be past the line and still have no single batch that gets it back under - and then elision
+	// would quietly never run again. Over the line, every token saved is worth taking.
+	const overTheLine = effTokens > stopTokens;
+	let preBatchEntries: Map<string, ElisionEntry> | undefined; // what was on the wire before this batch
+	if (maySweep && (opts?.force || (!throttled && newCandidates.length >= el.minResultsToStub && newSavings >= el.minSavingsTokens && (postBatchWire < stopTokens || overTheLine)))) {
+		preBatchEntries = new Map(state!.applied);
+		// The stored entry holds the two halves apart (savedTokens = result, argsSaved = call), so the running
+		// total adds them; storing the combined figure in both fields showed 1,956 tok for a 978 tok batch.
+		for (const c of newCandidates) state!.applied.set(c.key, { stub: c.stub, savedTokens: c.resultSaved, ...(c.args && Object.keys(c.args).length ? { args: c.args, argsSaved: c.argsSaved } : {}) });
+		// Remember where this batch broke the cache, so the NEXT one cannot break it shallower. Only the
+		// oldest change of the batch matters, and only if it is shallower than what is already recorded.
+		if (newCandidates.length) {
+			const cut = Math.min(...newCandidates.map((c) => c.pos));
+			state!.breakAt = state!.breakAt > 0 ? Math.min(state!.breakAt, cut) : cut;
+			void pruned; // counted for the log only
+		}
 		lastBatchAtMs.set(sessionId, nowMs);
 		saveElisionState(sessionId, state!);
 		const resultsTok = newCandidates.reduce((sum, c) => sum + Math.round(msgTokens(messages[c.index])), 0);
-		const stubTok = resultsTok - newSavings;
+		const argsEvents = newCandidates.filter((c) => c.args && Object.keys(c.args).length).length;
+		const argsSaved = newCandidates.reduce((sum, c) => sum + c.argsSaved, 0);
+		// What the RESULT stubs left behind: the result side of the batch only, or a batch of long commands
+		// with short answers would show a negative stub size.
+		const stubTok = Math.max(0, resultsTok - newSavings + argsSaved);
 		// Everything the trigger arithmetic is made of, in one line: the trigger line (softPercent of
 		// the window) and the stop line (pi's compaction point minus the stop gap) next to the actual
 		// size, so "why did elision fire at 81k on a 135k window" is answerable from the log alone.
-		logLine(cfg, { event: "elision", sid: String(sessionId).slice(-8), applied: newCandidates.length, eligible: eligible.length, deferred: eligible.length - newCandidates.length, oldestStubOnWire: frontier, breakPointIndex: newCandidates.length ? newCandidates[0].index : frontier, behindFrontier, resultsTokens: resultsTok, stubTokens: stubTok, savedTokens: newSavings, effTokens, postBatchWire, window, softPercent: el.softPercent, softTokens, stopTokens, rawTokens: effTokens, wireTokens, force: opts?.force === true });
+		// WHAT IT COST to make those savings goes on the SAME line (2026-11-06): a separate elision_wire row
+		// arrived beside it with only a position in it, and read like a status message that had forgotten what
+		// it was talking about. One sweep, one row, with its price.
+		const wb = preBatchEntries ? sweepBreak(messages, preBatchEntries, state!.applied) : undefined;
+		// Where the next one can start, measured on the SAME drawing this request will carry.
+		const nextAt = nextElisionAtCtx(drawWithStubs(messages, state!.applied).list, state!.applied, el);
+		logLine(cfg, { event: "elision", sid: String(sessionId).slice(-8), applied: newCandidates.length, callsWithArgsCut: argsEvents, argsSavedTokens: argsSaved, eligible: eligible.length, deferred: eligible.length - newCandidates.length, skippedTinySaving: skippedTiny, oldestStubOnWire: frontier, breakPointIndex: newCandidates.length ? newCandidates[0].index : frontier, breakAtTokens: newCandidates.length ? Math.min(...newCandidates.map((c) => c.pos)) : frontierTok, paidBefore: storedBreakAt, paidAfter: state!.breakAt, behindFrontier, resultsTokens: resultsTok, stubTokens: stubTok, savedTokens: newSavings, appliedSavedTokens: appliedSaved, preBatchWire: effTokens - appliedSaved, effTokens, postBatchWire, window, softPercent: el.softPercent, softTokens, stopTokens, rawTokens: effTokens, wireTokens, force: opts?.force === true, firstChangedMessage: wb?.first, firstElidedAtCtx: wb?.from, lastElidedAtCtx: wb?.through, nextElisionAtCtx: nextAt, serverReusesTokens: wb?.from, serverReReadsTokens: wb?.reRead, sentTokens: wb?.total });
 		let totalResults = state!.applied.size;
 		let totalSaved = 0;
-		for (const [, entry] of state!.applied) totalSaved += entry.savedTokens;
-		ctx?.ui?.notify?.(`Elision: ${newCandidates.length} new tool call${newCandidates.length === 1 ? "" : "s"} stubbed, ${fmt(newSavings)} tok saved. Total: ${fmt(totalResults)} tool results stubbed, ${fmt(totalSaved)} tok saved. Trigger line ${fmt(softTokens)} tok (${el.softPercent}% of a ${fmt(window)} tok window), stop line ${fmt(stopTokens)} tok.`, "info");
+		for (const [, entry] of state!.applied) totalSaved += entry.savedTokens + (entry.argsSaved ?? 0);
+		// `sweepStart` is what this sweep cost: the server recomputes from the first call this pass changed.
+		// `breakAt` is history - the shallowest change this session has EVER made - and is not a per-request
+		// price, because the server caches the elided form the moment it reads it once.
+		lastElisionReport = { newResults: newCandidates.length, newArgsCut: argsEvents, newSavings, totalResults, totalSaved, behindFrontier, eligible: eligible.length, breakAt: state!.breakAt, sweepStart: Math.min(...newCandidates.map((c) => c.pos)), breaksAtMessage: 0, serverReusesTokens: 0, serverReReadsTokens: 0 };
+		// AFTER the totals, not before: this used to be written above and then blanked by the line over there.
+		if (wb) lastElisionReport = { ...lastElisionReport, breaksAtMessage: wb.first, serverReusesTokens: wb.from, serverReReadsTokens: wb.reRead };
+		ctx?.ui?.notify?.(
+			`${newCandidates.length} tool call${newCandidates.length === 1 ? "" : "s"} elided · saved ${fmt(newSavings)} tok (${fmt(Math.max(0, resultsTok - stubTok))} in results, ${fmt(argsSaved)} in arguments) · ctx ~${fmt(effTokens - appliedSaved)} tok -> ~${fmt(postBatchWire)} tok`
+			+ (wb ? ` · first elision at ctx ${fmt(wb.from)} tok · next elision at ctx ${nextAt === undefined ? "nothing raw left to cut" : `${fmt(nextAt)} tok`} · server to read ${fmt(wb.reRead)} tok` : "")
+			+ (appliedSaved > 0 ? ` · total ${fmt(totalSaved)} tok saved in this session` : ""),
+			"info",
+		);
 	} else if (throttled && newCandidates.length) {
 		// Visible, once per gap: the batch is waiting, not lost.
 		logLine(cfg, { event: "elision_hold", sid: String(sessionId).slice(-8), waiting: newCandidates.length, waitingTokens: newSavings, sinceLastMs: sinceLast, gapMs: Math.max(0, el.minBatchGapSec) * 1000, note: "batch held back by the elision batch gap" });
 	}
 
 	if (state.applied.size === 0) return undefined;
-	let changed = false;
-	const out = messages.map((m) => {
-		if (!isToolResult(m)) return m;
-		const entry = state!.applied.get(String(m.toolCallId));
-		if (!entry) return m;
-		changed = true;
-		return { ...m, content: [{ type: "text", text: entry.stub }] };
-	});
+	// The cost of the sweep was measured inside the batch block above (sweepBreak), on the same list this
+	// returns - so the row, the notice and the wire all describe the same drawing.
+	const drawn = drawWithStubs(messages, state.applied);
+	const out: any[] = drawn.list;
+	const changed = drawn.changed;
 	return changed ? { messages: out } : undefined;
+}
+
+/** Is message i one of the halves of an event already on the wire - the RESULT that was stubbed, or the
+ *  CALL whose arguments were cut? The prompt-cache break point sits at whichever half was touched first. */
+function elidedHalfOf(messages: any[], i: number, applied: Map<string, ElisionEntry>): boolean {
+	const m = messages[i];
+	if (isToolResult(m)) return applied.has(String(m.toolCallId));
+	if (m?.role === "assistant" && Array.isArray(m.content)) {
+		for (const b of m.content) if (b?.type === "toolCall" && applied.get(String(b.id))?.args) return true;
+	}
+	return false;
+}
+
+/** The CALL half of a tool call event, measured against the argument cap: which message made it, which
+ *  argument VALUES come out over the cap and what they become, and how many tokens the cut saves. Strict
+ *  id matching: a call whose id is unknown is left whole rather than guessed at by name. */
+function cutCallArgsFor(messages: any[], resultIndex: number, toolCallId: string, cap: CharCap): { callIndex: number; args: Record<string, string>; savedTokens: number } {
+	if (cap === "full") return { callIndex: -1, args: {}, savedTokens: 0 }; // cap <= 0 is handled by capArgValue
+	for (let i = resultIndex; i >= 0; i--) {
+		const m = messages[i];
+		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+		for (const b of m.content) {
+			if (b?.type !== "toolCall" || String(b.id ?? "") !== toolCallId) continue;
+			const cut = cutArgValues(b.arguments, cap);
+			if (!cut.removedChars) return { callIndex: i, args: {}, savedTokens: 0 };
+			const elided = { ...m, content: m.content.map((x: any) => (x === b ? { ...x, arguments: cut.args } : x)) };
+			return { callIndex: i, args: cut.cut, savedTokens: Math.max(0, msgTokens(m) - msgTokens(elided)) };
+		}
+	}
+	return { callIndex: -1, args: {}, savedTokens: 0 };
 }
 
 // ---------------------------------------------------------------- per-model sampling flags
@@ -2577,27 +3643,77 @@ const SAMPLING_HELP: Record<SamplingKey, string> = {
 const COMPACTOR_SYSTEM_PROMPT = `You are a compaction engine for a coding-agent session. Read the conversation segment and produce the turn-ledger summary described in the instructions below. Do NOT continue the conversation, do NOT answer questions asked in it, and do NOT call tools. Respond with the summary only.`;
 
 /** Cap the string values of ONE tool-call arguments object (copy-on-write). */
-function capArgsObj(args: any, cap: CharCap): any {
-	if (cap === "full" || !args || typeof args !== "object") return args;
+/** What an argument elision marker is allowed to cost. The cap stays the cap: the budget for kept text is
+ *  the cap MINUS the marker, never the cap plus one. */
+/** The smallest token saving that makes a stub worth writing (2026-11-06). A cut below this is noise: it
+ *  moves the prompt and can cost a server re-read, and buys back less than a line of text. 32 tokens is
+ *  about 128 characters, which with `stubTailChars` 200 puts the real break-even near a 450-character
+ *  result - so the operator's "from 300 chars" is honoured as a question, and the arithmetic answers it. */
+const MIN_STUB_SAVING_TOKENS = 32;
+
+const ARG_MARKER_BUDGET = 34;
+
+/**
+ * One tool-call argument value, cut to `cap` characters by keeping its BEGINNING AND ITS END
+ * (2026-11-01, replacing a head-only cut). Two reasons for the tail: in a `write` or `edit` argument the
+ * closing lines carry as much meaning as the opening ones (the end of the function, the last hunk of the
+ * patch), and the reader of a cut value has to be able to see that something is missing and how much.
+ * The marker names the hole in lines and characters, because a silent abbreviation reads like the whole
+ * text - which is how a summary ends up describing a file it was never shown.
+ */
+function capArgValue(value: string, cap: number): string {
+	if (cap <= 0 || value.length <= cap) return value;
+	const keep = Math.max(8, cap - ARG_MARKER_BUDGET);
+	const head = Math.ceil(keep / 2);
+	const tail = Math.floor(keep / 2);
+	const headTxt = value.slice(0, head);
+	const tailTxt = tail > 0 ? value.slice(-tail) : "";
+	const middle = value.slice(headTxt.length, value.length - tailTxt.length);
+	const hole = value.length - headTxt.length - tailTxt.length;
+	const out = `${headTxt}[…${fmt((middle.match(/\n/g) ?? []).length + 1)} lines / ${fmt(hole)} chars elided…]${tailTxt}`;
+	// A cut that does not actually shrink the value is not a cut: with a cap of a handful of characters the
+	// marker alone could outgrow the original. Leave the whole value in that case.
+	return out.length < value.length ? out : value;
+}
+
+/** Every over-cap argument VALUE of one call, cut, plus what came off in characters. One rule, shared by
+ *  the summary input and the live-request elision, so both places measure the same cut the same way. */
+function cutArgValues(args: any, cap: CharCap): { args: any; cut: Record<string, string>; removedChars: number } {
+	if (cap === "full" || !args || typeof args !== "object") return { args, cut: {}, removedChars: 0 };
 	const out: Record<string, unknown> = {};
-	let changed = false;
+	const cut: Record<string, string> = {};
+	let removedChars = 0;
 	for (const [k, v] of Object.entries(args)) {
 		if (typeof v === "string" && v.length > cap) {
-			out[k] = `${v.slice(0, cap)}...(+${fmt(v.length - cap)} chars)`;
-			changed = true;
-		} else {
-			out[k] = v;
-		}
+			const c = capArgValue(v, cap);
+			out[k] = c;
+			if (c.length < v.length) {
+				cut[k] = c;
+				removedChars += v.length - c.length;
+			}
+		} else out[k] = v;
 	}
-	return changed ? out : args;
+	return removedChars ? { args: out, cut, removedChars } : { args, cut: {}, removedChars: 0 };
+}
+
+function capArgsObj(args: any, cap: CharCap): any {
+	return cutArgValues(args, cap).args;
 }
 
 // The fork's own region serializer - the thing pi's serializeConversation does, but with
 // The full reasoning: DESIGN.md -> serializeRegion
 export function serializeRegion(
 	messages: any[],
-	opts: { startTurn: number; inputStubs: boolean; argCap: CharCap; partial?: boolean },
+	opts: { startTurn: number; inputStubs?: boolean; argCap?: CharCap; partial?: boolean; stubFrom?: number; tailChars?: CharCap; withThinking?: boolean },
 ): { text: string; lastTurn: number; hadTurns: boolean } {
+	const from = opts.stubFrom ?? stubFromChars();
+	const tailChars = opts.tailChars ?? loadConfig().elision.stubTailChars;
+	// Every elision rule falls back to the GLOBAL setting, so a call site that names none of them gets
+	// exactly the same text as one that names all of them. That is the point of moving these out of the
+	// per-model rows: there is one answer, and it is the same for every model.
+	const stubs = opts.inputStubs ?? compactStubsOn();
+	const cap = opts.argCap ?? elisionArgCap();
+	const withThinking = opts.withThinking ?? loadConfig().thinkingToSummariser;
 	const parts: string[] = [];
 	let turn = Math.max(0, Math.floor(opts.startTurn));
 	let hadTurns = false;
@@ -2627,13 +3743,16 @@ export function serializeRegion(
 				if (b?.type === "thinking") thinking.push(String(b.thinking ?? ""));
 				else if (b?.type === "text") texts.push(String(b.text ?? ""));
 				else if (b?.type === "toolCall") {
-					const a = Object.entries(capArgsObj(b.arguments, opts.argCap) ?? {})
+					const a = Object.entries(capArgsObj(b.arguments, cap) ?? {})
 						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
 						.join(", ");
 					calls.push(`${b.name}(${a})`);
 				}
 			}
-			if (thinking.length) parts.push(`[Assistant thinking]: ${thinking.join("\n")}`);
+			// The thinking text is only sent when the operator wants the summariser to read it. The blocks
+			// stay in the session file either way, so switching this is a decision about the request, not
+			// about the record.
+			if (withThinking && thinking.length) parts.push(`[Assistant thinking]: ${thinking.join("\n")}`);
 			if (texts.length) parts.push(`[Assistant]: ${texts.join("")}`);
 			for (const c of calls) parts.push(`[Tool call ${c}]:`);
 			continue;
@@ -2641,7 +3760,11 @@ export function serializeRegion(
 		if (role === "toolResult") {
 			const text = contentTextOf(m.content);
 			if (!text) continue;
-			const out = opts.inputStubs && text.length > 2_000 ? stubbedResult(messages, i, m, ELISION_DEFAULTS.stubTailChars).content[0].text : text;
+			let out = text;
+			if (stubs && text.length > from) {
+				const st = stubbedResult(messages, i, m, tailChars).content[0].text;
+				if (st.length < text.length) out = st;   // never make the reading matter longer
+			}
 			parts.push(`[Tool result]: ${out}`);
 			continue;
 		}
@@ -2787,12 +3910,40 @@ export function userPromptCoverage(summary: string): { turns: number; withPrompt
 // How many prompts the summarizer was HANDED (2026-10-19). serializeRegion marks each one - "[User - Turn
 // The full reasoning: DESIGN.md -> userPromptsGiven
 export function userPromptsGiven(material: string): number {
-	let n = 0;
 	const real = (s: string) => s.replace(/[^A-Za-z0-9]/g, "").length >= 4;
-	for (const m of String(material ?? "").matchAll(/^\[(?:User(?: bash)?|Note) - Turn \d+[^\]]*\]:\s*(\S.*)$/gm)) {
-		if (real(m[1])) n += 1;
+	return userPromptsGivenList(material).filter(real).length;
+}
+
+/** The prompt TEXTS the region serializer handed to the summariser, oldest first, unfiltered. The count
+ *  alone could only be compared against another count, and that comparison is what went wrong on
+ *  2026-11-01: "quoted 8 of 2" printed a summary that had in fact carried both of the round's prompts.
+ *  With the texts, coverage can be measured by CONTENT instead of by counting lines that merely begin
+ *  with "user:". */
+export function userPromptsGivenList(material: string): string[] {
+	const out: string[] = [];
+	for (const m of String(material ?? "").matchAll(/^\[(?:User(?: bash)?|Note) - Turn \d+[^\]]*\]:\s*(\S.*)$/gm)) out.push(m[1]);
+	return out;
+}
+
+/** How many of the handed-over prompts are actually FINDABLE in the summary. Both sides are reduced to
+ *  letters and digits, and the first PROMPT_SKELETON characters of the prompt are looked for, because the
+ *  region serializer joins the lines of a multi-line prompt with " / " and the model is free to wrap what
+ *  it copies - an exact substring test failed on 2 of 4 prompts in a real summary for no other reason
+ *  than that wrapping. A prompt shorter than a handful of characters cannot be matched honestly, so it is
+ *  not counted either way. */
+const PROMPT_SKELETON = 160;
+export function promptsCarried(givenPrompts: string[], summary: string): { carried: number; matchable: number } {
+	const skel = (s: string) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+	const hay = skel(summary);
+	let carried = 0;
+	let matchable = 0;
+	for (const p of givenPrompts) {
+		const needle = skel(p).slice(0, PROMPT_SKELETON);
+		if (needle.length < 12) continue;
+		matchable += 1;
+		if (hay.includes(needle)) carried += 1;
 	}
-	return n;
+	return { carried, matchable };
 }
 
 /** pi's machine-readable file appendix (<read-files>/<modified-files>), from the preparation's
@@ -2843,8 +3994,8 @@ export async function directCompact(args: {
 }): Promise<{ text: string; usage: any; lastTurn: number; inputText: string; segmentBy: string; fromReasoning: boolean }> {
 	const { preparation, model, registry, sizes, options } = args;
 	const startTurn = args.prevTurn > 0 ? args.prevTurn : 0;
-	const main = serializeRegion(preparation?.messagesToSummarize ?? [], { startTurn, inputStubs: options.inputStubs, argCap: options.argCap });
-	const prefix = serializeRegion(preparation?.turnPrefixMessages ?? [], { startTurn: main.lastTurn, inputStubs: options.inputStubs, argCap: options.argCap, partial: true });
+	const main = serializeRegion(preparation?.messagesToSummarize ?? [], { startTurn, inputStubs: compactStubsOn(), argCap: elisionArgCap() });
+	const prefix = serializeRegion(preparation?.turnPrefixMessages ?? [], { startTurn: main.lastTurn, inputStubs: compactStubsOn(), argCap: elisionArgCap(), partial: true });
 	const nextTurn = main.lastTurn + (prefix.hadTurns ? 1 : 0);
 	const prevBlock = labeledPreviousSummary(preparation?.previousSummary, args.prevTurn, nextTurn);
 	const regionText = [main.text, prefix.text].filter(Boolean).join("\n\n");
@@ -2855,7 +4006,7 @@ export async function directCompact(args: {
 	// the fact, so it keeps the estimate and the record says which ruler was used.
 	const countBase = localSummariserBaseUrl(model, args.ref);
 	const guessed = Math.ceil((regionText.length * TOKEN_HEAVINESS) / 4);
-	const counted = countBase ? await countTextAt(countBase, [prevBlock, regionText].filter(Boolean).join("\n\n"), guessed) : null;
+	const counted = countBase ? await countTextAt(countBase, [prevBlock, regionText].filter(Boolean).join("\n\n"), guessed, 6_000, countModelId(model, args.ref)) : null;
 	const segmentBy = counted ? counted.how : countBase ? "estimate (this server gave no usable count)" : "estimate (not a local model)";
 	const inputTokens = (counted?.n ?? guessed) + SUMMARISER_FRAMING_TOKENS;
 	const instructions = buildInstructions({ sizes, inputTokens, segmentTokens: counted?.n ?? inputTokens - SUMMARISER_FRAMING_TOKENS, kind: args.kind, options, additionalInstruction: args.additionalInstruction ?? null, userDefault: args.userDefault, customInstructions: args.customInstructions });
@@ -3205,14 +4356,29 @@ export function missingWhy(ref: string, ctx: { modelRegistry: any; model?: any }
 	return `${plabel} is loaded, not "${wanted}"; it offers ${offered.slice(0, 2).map(short).join(", ")}${offered.length > 2 ? ` and ${offered.length - 2} more` : ""}`;
 }
 
-function buildRotation(cfg: Config, ctx: { modelRegistry: any; model?: any }): { candidates: Candidate[]; missing: string[] } {
+function buildRotation(cfg: Config, ctx: { modelRegistry: any; model?: any }): { candidates: Candidate[]; missing: { ref: string; why: string }[] } {
 	const candidates: Candidate[] = [];
-	const missing: string[] = [];
+	const missing: { ref: string; why: string }[] = [];
+	const pool: any[] = [...(ctx?.modelRegistry?.getAvailable?.() ?? []), ...(ctx?.model ? [ctx.model] : [])];
 	for (const ref of Object.keys(cfg.models).slice(0, MAX_SLOTS)) {
-		const model = lookupRef(ref, ctx);
+		// A pattern entry is not a model: it names one. Resolve it to a reachable model that answers to the
+		// text; with nothing answering, the entry is reported rather than silently dropped.
+		// The SESSION MODEL goes first among the matches. Several qwen variants usually answer to one name,
+		// and the one worth asking is the model this session is already running - not whichever happened to
+		// sit first in the registry.
+		const sessionRef = ctx?.model ? refOf(ctx.model) : "";
+		const model = isPatternRef(ref)
+			? ((() => {
+					const hits = patternHits(cfg, ref, pool).sort((a, b) => (a === sessionRef ? -1 : 0) - (b === sessionRef ? -1 : 0));
+					return hits.map((r: string) => lookupRef(r, ctx)).find(Boolean) as any;
+				})())
+			: lookupRef(ref, ctx);
+		// The entry's OWN options are what the pattern stands for - pass its ref. Resolving through the model
+		// instead made the entry's thinking level, timeout and sampling dead settings.
 		const profile = profileFor(cfg, model, ref);
 		if (!model) {
-			missing.push(ref);
+			// A pattern says what it was looking for; an exact ref says what the provider offered instead.
+			missing.push({ ref, why: isPatternRef(ref) ? `no reachable model has "${patternNeedle(ref)}" in its name right now` : missingWhy(ref, ctx).slice(0, 140) });
 			continue;
 		}
 		candidates.push({ ref, model, profile, kind: isLocalModel(model) ? "local" : "online" });
@@ -3230,16 +4396,54 @@ type AttemptOutcome =
  * too long. pi's own retry loop is handed to compact(), so a busy endpoint is retried inside the call
  * with the configured number of extra tries and spacing; every try is written to the log.
  */
+/** HOW MANY compactions are writing a summary RIGHT NOW (2026-11-05).
+ *
+ *  A compaction takes minutes, and three separate doors can open it: the user (a button, /compact),
+ *  pi's own threshold and overflow checks, and this extension's watcher. Until now nothing counted what
+ *  was already running, so two of them could be summarising the same session at the same time - on one
+ *  GPU slot, where each request also has to wait behind the other. That is what produced the 2026-11-04
+ *  report of "2 parallel compactions, then a message that nothing was compacted": the run the operator
+ *  started landed, and the second, now-redundant ask was answered by pi with "Nothing to compact".
+ *
+ *  Only the rotation is counted, because only the rotation is slow: everything else in a compaction is
+ *  bookkeeping that finishes between keystrokes. */
+let rotationsRunning = 0;
+
+/** A compaction landed successfully within this many milliseconds - the window in which a second ask is
+ *  not a failure but a redundancy, and has to be worded that way (see the no-op notice). */
+function landedVeryRecentlyMs(withinMs = 180_000): boolean {
+	return lastCompactionDoneAtMs > 0 && Date.now() - lastCompactionDoneAtMs < withinMs;
+}
+
+/** Guard, count, and pass the trigger label down as a value instead of reading a shared variable that a
+ *  second ask could overwrite mid-run. */
 export async function summarizeWithRotation(
 	preparation: any,
 	customInstructions: string | undefined,
 	cfg: Config,
 	ctx: any,
 	signal: AbortSignal | undefined,
+	triggerLabel?: string,
+): Promise<{ ok: true; result: Extract<AttemptOutcome, { ok: true }> } | { ok: false; error: string }> {
+	rotationsRunning++;
+	try {
+		return await runRotation(preparation, customInstructions, cfg, ctx, signal, triggerLabel);
+	} finally {
+		rotationsRunning--;
+	}
+}
+
+async function runRotation(
+	preparation: any,
+	customInstructions: string | undefined,
+	cfg: Config,
+	ctx: any,
+	signal: AbortSignal | undefined,
+	triggerLabel?: string,
 ): Promise<{ ok: true; result: Extract<AttemptOutcome, { ok: true }> } | { ok: false; error: string }> {
 	const { candidates, missing } = buildRotation(cfg, ctx);
 	// Each skip now says what the provider offered instead of only what it lacked (2026-10-19, item (b)).
-	for (const ref of missing) logLine(cfg, { event: "skip", ref, reason: missingWhy(ref, ctx).slice(0, 140) });
+	for (const m of missing) logLine(cfg, { event: "skip", ref: m.ref, reason: m.why });
 	if (!candidates.length) {
 		return { ok: false, error: missing.length ? `no model found for ${missing.join(", ")}` : "no models configured" };
 	}
@@ -3287,12 +4491,20 @@ export async function summarizeWithRotation(
 		// The summarizer's input, per this model's own options: informative stubs (pi's 2,000-char
 		// head-only clip then has nothing important left to cut - the exit/tail message survives)
 		// and capped tool-call argument values. The raw preparation is never mutated.
-		const pre = preprocessForSummariser(prep, { ...profile, stubTailChars: cfg.elision.stubTailChars });
+		const pre = preprocessForSummariser(prep, { ...profile, inputStubs: compactStubsOn(), argCap: elisionArgCap(), stubTailChars: cfg.elision.stubTailChars, stubFrom: cfg.elision.stubFromChars, withThinking: cfg.thinkingToSummariser });
 		prep = pre.prep;
-		if (pre.stubbed || pre.argsCapped) logLine(cfg, { event: "preprocess", ref: c.ref, stubbed: pre.stubbed, argsCapped: pre.argsCapped, rawChars: pre.rawChars, keptChars: pre.keptChars, savedChars: pre.savedChars });
-		// What the summariser is really sent: the flattened region (tool results clipped to 2,000
-		// characters by pi) plus the previous summary. No system prompt, no tool definitions.
-		const inputTokens = summariserInputTokens(prep);
+		if (pre.stubbed || pre.argsCapped || pre.thinkingDropped) logLine(cfg, { event: "preprocess", ref: c.ref, stubbed: pre.stubbed, argsCapped: pre.argsCapped, thinkingDropped: pre.thinkingDropped, rawChars: pre.rawChars, keptChars: pre.keptChars, savedChars: pre.savedChars });
+		// THE RULER MEASURES THE TEXT THIS ROUTE SENDS (2026-11-01). The direct request is built by
+		// serializeRegion - thinking kept, elision as configured, argument values capped - while pi's own
+		// compact() flattens with serializeConversation, which drops thinking and clips every result to
+		// 2,000 characters. Measuring the wrong one made the summary ceiling, the window-fit test, the
+		// trim decision and the attempt row all speak about a text nobody sends.
+		const measure: RegionMeasure | undefined = cfg.directRequest
+			? { inputStubs: compactStubsOn(), argCap: elisionArgCap(), stubFrom: cfg.elision.stubFromChars, tailChars: cfg.elision.stubTailChars, withThinking: cfg.thinkingToSummariser }
+			: undefined;
+		// What the summariser is really sent: the region as the chosen route serialises it, plus the
+		// previous summary. No system prompt, no tool definitions.
+		const inputTokens = summariserInputTokens(prep, 0, measure);
 		const sizes = sizesFor(profile, {
 			inputTokens,
 			historyTokens: historyTokensOnly(preparation),
@@ -3332,10 +4544,10 @@ export async function summarizeWithRotation(
 		// Counted on the material that is actually going out, after any overflow trim, so the figure the
 		// model is shown describes its real reading matter rather than a guess about a tokenizer's habits.
 		// A server that answers nothing plausible falls back to the heuristic and the record says so.
-		const regionForCount = summariserText(prep);
+		const regionForCount = summariserText(prep, measure);
 		const guessedRegion = Math.ceil((regionForCount.length * TOKEN_HEAVINESS) / 4);
 		const countBase2 = localSummariserBaseUrl(c.model, c.ref);
-		const countedRegion = countBase2 ? await countTextAt(countBase2, regionForCount, guessedRegion) : null;
+		const countedRegion = countBase2 ? await countTextAt(countBase2, regionForCount, guessedRegion, 6_000, countModelId(c.model, c.ref)) : null;
 		const realInput = (countedRegion?.n ?? guessedRegion) + SUMMARISER_FRAMING_TOKENS;
 		const segmentBy2 = countedRegion ? countedRegion.how : countBase2 ? "estimate (this server gave no usable count)" : "estimate (not a local model)";
 		const realSizes = prep === preparation ? sizes : sizesFor(profile, { inputTokens: realInput, historyTokens: historyTokensOnly(prep), headroom: overflow ? 0 : postCompactionHeadroom(ctx, prep), overflow, windowTokens: ctx?.model?.contextWindow ?? 0 }, prevSummaryTokens(prep));
@@ -3348,7 +4560,7 @@ export async function summarizeWithRotation(
 		let instructions = buildInstructions({
 			sizes: realSizes,
 			inputTokens: realInput,
-			segmentTokens: countedRegion?.n ?? summariserSegmentTokens(prep),
+			segmentTokens: countedRegion?.n ?? summariserSegmentTokens(prep, measure),
 			segmentBy: segmentBy2,
 			kind: c.kind,
 			options: profile,
@@ -3361,14 +4573,28 @@ export async function summarizeWithRotation(
 		// max: a summary that overruns the aim is judged later by the size checks, it is no reason to
 		// cut a request that is still producing.
 		const backstop = backstopMsFor(c.kind, realSizes.target, profile.timeoutMs, c.ref);
+		// Measured once and remembered, because the closing row has to quote the same figure (see
+		// lastTriggerContextFill) - the session is eight minutes emptier by the time the summary lands.
+		const fillAtTrigger = realContextTokens(ctx);
+		lastTriggerContextFill = fillAtTrigger ?? 0;
 		logLine(cfg, {
 			// ONE OPENING ROW, NOT TWO (2026-10-23): this is the row that says a compaction is happening,
 			// which model is about to write it, and how full the session was when it started. The separate
 			// COMPACTION START row is gone - on the crash loop of 2026-10-22 it was the only row written at
 			// all, and it named no model, which is why the operator could not see what was happening.
 			event: "attempt",
-			trigger: lastCompactionTrigger,
-			contextFill: realContextTokens(ctx),
+			// THIS run's own label, carried in as a value. `lastCompactionTrigger` is one module variable that
+			// several doors write, and on 2026-11-04 a manual ask arrived while an automatic run was still
+			// going: the automatic run's later attempt rows then reported `trigger: manual`, and everything that
+			// keys off the label (retry, park, cancel wording) followed the wrong story.
+			trigger: triggerLabel ?? lastCompactionTrigger,
+			// The size of the request that is about to go out, measured above from the material that survived
+			// the stubbing pass and any overflow trim - so the STARTED row says what the run costs, not only
+			// what the session weighed (2026-11-05, on request). `inputBy` says how it was measured; the row
+			// puts a tilde in front when it is an estimate.
+			inputPlanned: realInput,
+			inputBy: segmentBy2,
+			contextFill: fillAtTrigger,
 			sessionWindow: ctx?.model?.contextWindow ?? 0,
 			reserveTokens: extReserve(ctx),
 			keepRecentTokens: extKeepRecent(ctx),
@@ -3499,8 +4725,15 @@ export async function summarizeWithRotation(
 				if (wantsPrompts && given >= 6 && upc.linesAnywhere * 4 < given) {
 					throw dFail(`barely any user prompts - the segment offered ${given} and the summary quotes ${upc.linesAnywhere}, under a quarter of what it was handed`);
 				}
-				if (given >= 2 && upc.linesAnywhere < given) {
-					warnings.push(`user prompts quoted in ${upc.linesAnywhere} of ${given} (${given - upc.linesAnywhere} not carried through)`);
+				// Coverage by CONTENT (2026-11-01). upc.linesAnywhere counts every line in the summary that
+				// begins like "user: ...", which includes the prompt lines carried forward from EARLIER
+				// compactions inside the folded previous summary - so on a chained run it always sits above the
+				// round's own figure, and the warning below never meant what it said. `carried`/`matchable` ask
+				// the real question: of the prompts THIS round handed over, how many can be found in the text?
+				const givenList = userPromptsGivenList(raw.inputText ?? "");
+				const carriedInfo = promptsCarried(givenList, summary);
+				if (carriedInfo.matchable >= 2 && carriedInfo.carried < carriedInfo.matchable) {
+					warnings.push(`user prompts quoted ${carriedInfo.carried} of ${carriedInfo.matchable} from this round (${carriedInfo.matchable - carriedInfo.carried} not carried through)`);
 				}
 				if (upc.turns >= 2 && upc.withPrompt === 0 && upc.linesAnywhere > 0) {
 					warnings.push(`the ledger's Turn entries carry no user line, though prompts are quoted elsewhere in the summary (${upc.linesAnywhere} of ${given})`);
@@ -3524,7 +4757,12 @@ export async function summarizeWithRotation(
 				logLine(cfg, { event: "ok", ref: c.ref, via: "direct", kind: c.kind, tokPerSec: dSeconds > 0 ? Math.round((measured.tokens / dSeconds) * 10) / 10 : undefined, seconds: dSeconds, measured: measured.tokens, measuredBy: measured.by, segmentBy: raw.segmentBy, fromReasoning: raw.fromReasoning || undefined, roughWorkStripped: cleaned.strippedChars || undefined, min: realSizes.min, target: realSizes.target, max: realSizes.max, words, stubsIn: inStubs || undefined, stubsCopied: gotStubs || undefined, input: u.input, output: u.output, reasoning: u.reasoning });
 				lastSummaryQuote.quoted = Number(upc.linesAnywhere) || 0;
 				lastSummaryQuote.given = Number(given) || 0;
-				logLine(cfg, { event: "user_prompts", ref: c.ref, quoted: upc.linesAnywhere, given, ledgerTurns: upc.turns, ledgerQuoted: upc.withPrompt });
+				lastSummaryQuote.carried = Number(carriedInfo.carried) || 0;
+				lastSummaryQuote.matchable = Number(carriedInfo.matchable) || 0;
+				// Both figures travel: `quoted` is the loose line count (kept because the two hard gates above
+				// are judged on it and their behaviour must not move), `carried/matchable` is the honest one the
+				// closing row prints.
+				logLine(cfg, { event: "user_prompts", ref: c.ref, quoted: upc.linesAnywhere, given, carried: carriedInfo.carried, matchable: carriedInfo.matchable, ledgerTurns: upc.turns, ledgerQuoted: upc.withPrompt });
 				const compaction = {
 					summary: summary + fileOpsAppendix(preparation.fileOps),
 					firstKeptEntryId: prep.firstKeptEntryId,
@@ -3533,7 +4771,7 @@ export async function summarizeWithRotation(
 					details: { lastTurnNumber: Math.max(raw.lastTurn, maxTurnInSummary(summary)) },
 				};
 				combined.dispose();
-				return { ok: true, result: { ok: true, compaction, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds: dSeconds, material: realInput - SUMMARISER_FRAMING_TOKENS, elided: elidedTokens(pre, realInput - SUMMARISER_FRAMING_TOKENS) } };
+				return { ok: true, result: { ok: true, compaction, ref: c.ref, model: c.model, kind: c.kind, measured: measured.tokens, input: u.input, output: u.output, target: realSizes.target, min: realSizes.min, max: realSizes.max, words, seconds: dSeconds, material: realInput - SUMMARISER_FRAMING_TOKENS, elided: elidedTokens(pre, realInput - SUMMARISER_FRAMING_TOKENS) } };
 			} catch (dErr: any) {
 				if (signal?.aborted) {
 					logLine(cfg, { event: "note", note: "cancelled", ref: c.ref });
@@ -3777,16 +5015,10 @@ export const DEFAULT_OPTIONS: ModelOptions = {
 	sampling: { ...SAMPLING_DEFAULTS },
 	thinking: "off",
 	timeoutMs: 600_000, // 10 min
-	summaryAimTokens: 22_000,
-	summaryMinTokens: 4096,
-	summaryMaxTokens: 30_000,
+	// The shared fields come from DEFAULT_SHARED, so the two profiles cannot drift apart.
+	...DEFAULT_SHARED,
 	inputStubs: true,
 	argCap: 500,
-	preserveStubs: "verbatim",
-	preserveUser: "verbatim",
-	preserveReplies: "detailed",
-	preserveThinking: "summary",
-	chainMode: "fold",
 	noThinkMarker: "",
 };
 
@@ -3796,7 +5028,7 @@ export function optionsFor(cfg: Config, ref: string, model: any): ModelOptions {
 	// percent keys, so every menu edit was saved, read back as a field nobody read and silently lost.)
 	const stored = cfg.models[ref];
 	const local = isLocalModel(model ?? {});
-	const o = modelOptionsFrom(stored, local ? cfg.noThinkMarker : "");
+	const o = modelOptionsFrom(stored, local ? cfg.noThinkMarker : "", cfg.shared ?? DEFAULT_SHARED);
 	// A pre-2026-10-05 config stored the limits as percents of the window: convert them with THIS
 	// model's window, so a stored "min 5%" on a 192k model becomes 9,600 tokens, not NaN.
 	const win = Number(model?.contextWindow);
@@ -3812,10 +5044,14 @@ export function optionsFor(cfg: Config, ref: string, model: any): ModelOptions {
 	return o;
 }
 
-/** Selected models get their stored options; the rest display (and would use) the defaults. */
+/** What a model WOULD be asked with, whether or not it is in the Compaction models list: its own entry if
+ *  it has one, then the shared settings either way. It used to answer with bare DEFAULT_OPTIONS for an
+ *  unlisted model, which is why an edit made while an unlisted model was active looked like it had been
+ *  reverted - the board showed the defaults, not the shared settings that would really have been used.
+ *  One call, through optionsFor, because that function is the single place that applies the legacy percent
+ *  conversion and the clamps; a second copy here would read the same settings a different way. */
 function optionsOfAnyModel(cfg: Config, ref: string, model: any): ModelOptions {
-	if (cfg.models[ref]) return optionsFor(cfg, ref, model);
-	return { ...DEFAULT_OPTIONS };
+	return optionsFor(cfg, ref, model);
 }
 
 /**
@@ -3825,35 +5061,85 @@ function optionsOfAnyModel(cfg: Config, ref: string, model: any): ModelOptions {
  * What stays per-model: the thinking level, the no-think tag, the timeout and the sampling flags.
  */
 export const GLOBAL_MODEL_KEYS = [
-	"summaryAimTokens", "summaryMinTokens", "summaryMaxTokens", "inputStubs", "argCap",
+	"summaryAimTokens", "summaryMinTokens", "summaryMaxTokens",
 	"preserveStubs", "preserveUser", "preserveReplies", "preserveThinking", "chainMode",
 ] as const;
+// inputStubs and argCap left this list on 2026-11-01 (they became global elision settings); they stopped
+// being per-model entries in storage too, and setModelOptions ignores a patch that still carries them.
 
 function setModelOptions(ref: string, patch: Partial<ModelOptions>): void {
-	const shared: Partial<ModelOptions> = {};
+	const shared: Partial<SharedModelOptions> = {};
 	const mine: Partial<ModelOptions> = {};
 	for (const [k, v] of Object.entries(patch) as [string, unknown][]) {
+		// inputStubs / argCap stopped being settings on 2026-11-01 (they are global elision settings now);
+		// a patch that still carries them is ignored rather than stored where nothing reads it.
+		if (k === "inputStubs" || k === "argCap") continue;
 		if ((GLOBAL_MODEL_KEYS as readonly string[]).includes(k)) (shared as Record<string, unknown>)[k] = v;
 		else (mine as Record<string, unknown>)[k] = v;
 	}
 	update((c) => {
-		// One edit, every model: the global settings are stored the same way on every entry, so the
-		// per-model map keeps only what is genuinely per-model.
+		// ONE COPY, ALWAYS STORED (2026-11-05). Writing only into the models already in the list is what
+		// lost edits: an aim changed while the session ran a model that was not in the list went nowhere, and
+		// the next read showed the code default. The shared block is stored whether or not `ref` is listed.
 		if (Object.keys(shared).length > 0) {
+			c.shared = { ...c.shared, ...shared };
+			// Keep the per-entry copies in step, so a hand-opened config file never shows two different
+			// numbers for one setting. They are not read any more.
 			for (const r of Object.keys(c.models)) c.models[r] = { ...c.models[r] ?? {}, ...shared };
 		}
 		if (Object.keys(mine).length > 0) {
-			const prev = c.models[ref] ?? {};
-			c.models[ref] = { ...prev, ...mine };
+			// A per-model setting belongs to an entry, and an entry IS membership of the Compaction models
+			// list. Creating one here, which this function used to do with `c.models[ref] ?? {}`, quietly added
+			// a model to the try order the moment someone edited a flag on a model that was merely being LOOKED
+			// at - that is how three google preview models turned up in the operator's list on 2026-11-05. The
+			// caller says so out loud now (see editModelNumber); nothing is invented here.
+			if (!c.models[ref]) return;
+			c.models[ref] = { ...c.models[ref], ...mine };
 		}
 	});
 }
 
-function rotateAdd(ref: string, options?: ModelOptions): void {
+/** Put a model (or a name pattern) at the end of the Compaction models list. Returns false, and changes
+ *  nothing, when the list is already full - the caller says so out loud. */
+function rotateAdd(ref: string, options?: ModelOptions): boolean {
+	if (!ref) return false;
+	if (!isPatternRef(ref) && !ref.includes("/")) return false; // a plain model id is a pattern's job, not an entry's
+	if (isPatternRef(ref) && patternNeedle(ref).length < 3) return false; // "*" alone or "*ab" would match half the world
+	let added = false;
 	update((c) => {
 		if (c.models[ref]) return;
-		c.models[ref] = options ?? defaultOptionsFor(ref);
+		if (Object.keys(c.models).length >= MAX_SLOTS) return;
+		// A new entry starts from the defaults PLUS the shared settings, so it never arrives with an aim and
+		// limits that differ from what every other model in the list is using.
+		c.models[ref] = { ...defaultOptionsFor(ref), ...modelOptionsFrom(undefined, c.noThinkMarker, c.shared) };
+		added = true;
 	});
+	return added;
+}
+
+/** Add by name, which is how the operator asked to work: an exact "provider/id" becomes an entry for that
+ *  model, and a piece of a name ("qwen3.8-flash-next", no slash) becomes a pattern entry that any model
+ *  whose name contains it will use - beginning, middle or end. Returns what was created, or why not. */
+function addEntryByName(ctx: any, text: string): { ok: boolean; ref?: string; kind?: "model" | "name pattern"; whyNot?: string } {
+	const t = String(text ?? "").trim();
+	if (!t) return { ok: false, whyNot: "nothing was typed" };
+	const cfg = loadConfig();
+	if (Object.keys(cfg.models).length >= MAX_SLOTS) return { ok: false, whyNot: `the list is full (${MAX_SLOTS} of ${MAX_SLOTS} places used)` };
+	// An exact ref, or one that matches a reachable model exactly: the ordinary entry, as it has always worked.
+	if (t.includes("/")) {
+		const ref = cfg.models[t] ? t : t;
+		return rotateAdd(ref) ? { ok: true, ref, kind: "model" } : { ok: false, whyNot: `that model is already in the list, or the list is full` };
+	}
+	// No slash: a name pattern. If exactly one reachable model carries that whole name, prefer the exact
+	// entry - it says the same thing and survives a rename of the server less badly than a substring.
+	const pool: any[] = [...(ctx?.modelRegistry?.getAvailable?.() ?? []), ...(ctx?.model ? [ctx.model] : [])];
+	const hits = pool.filter((m: any) => m && String(m.id ?? "").toLowerCase() === t.toLowerCase()).map((m: any) => refOf(m));
+	if (hits.length === 1 && !hits[0].toLowerCase().includes(t.toLowerCase() + "/")) {
+		if (rotateAdd(hits[0])) return { ok: true, ref: hits[0], kind: "model" };
+	}
+	const ref = `${PATTERN_PREFIX}${t}`;
+	if (cfg.models[ref]) return { ok: false, whyNot: "that name pattern is already in the list" };
+	return rotateAdd(ref) ? { ok: true, ref, kind: "name pattern" } : { ok: false, whyNot: "a name pattern needs at least three characters after the *" };
 }
 
 function rotateRemove(ref: string): void {
@@ -4125,6 +5411,11 @@ function rotationText(cfg: Config, ctx?: any): string {
 
 // ---------------------------------------------------------------- TUI: compaction models (order list)
 
+/** The key that opens "add a model by name". `+` (and `=`, the same key without Shift) because a model
+ *  name never contains either, which lets plain typing keep filtering the list. There is deliberately no
+ *  row for it in the list: see rebuild(). */
+const ADD_BY_NAME_KEY = "+";
+
 // The Compaction models screen: one list holding the selected models first (with their position
 // The full reasoning: DESIGN.md -> OrderList
 export class OrderList implements Component, Focusable {
@@ -4176,6 +5467,17 @@ export class OrderList implements Component, Focusable {
 		// (Bug fix 2026-10-01: digits used to reposition-or-add whatever was highlighted, so a
 		// digit typed to filter a name ended up adding some unrelated model to the order.)
 		const k = keyOf(data);
+		// The add-by-name shortcut, checked BEFORE the filter: letters have to keep filtering the list, so
+		// the shortcut is a character no model name contains. Enter on its row does the same thing.
+		if (k === "+" || k === "=") {
+			void this.addByName();
+			return;
+		}
+		if (k === "escape" && this.filter) {
+			this.list?.handleInput(data);
+			this.tui.requestRender();
+			return;
+		}
 		if ((k >= "1" && k <= "9") || k === "0" || k === "space") {
 			const ref = this.highlightRef();
 			if (ref && loadConfig().models[ref]) {
@@ -4195,14 +5497,49 @@ export class OrderList implements Component, Focusable {
 		this.tui.requestRender();
 	}
 
+	/** Ask for a name and add it - one model by its exact ref, or a family of models by a piece of their
+	 *  shared name. The typed text decides which, and the notice says which was created. */
+	private async addByName(): Promise<void> {
+		const typed = await this.ctx.ui?.input?.(
+			[
+				"Add a model to the Compaction models list",
+				"an exact provider/model adds that one model; a part of a name (no slash) adds a NAME PATTERN for every model that contains it",
+				"example: qwen3.8-flash-next  matches qwen3.8-flash-next-basalt-nvfp4, -gptq, -dq8 and any future variant",
+			].join(" - "),
+			this.filter ?? "",
+		);
+		const text = String(typed ?? "").trim();
+		if (!text) {
+			this.rebuild();
+			return;
+		}
+		const res = addEntryByName(this.ctx, text);
+		if (!res.ok) {
+			this.ctx.ui?.notify?.(`NOT ADDED: ${res.whyNot}.`, "warning");
+			this.rebuild();
+			return;
+		}
+		this.rebuild();
+		this.highlightRef(res.ref!);
+		this.ctx.ui?.notify?.(
+			res.kind === "name pattern"
+				? `Added the name pattern "${res.ref}" at the end of the list. Any model whose name contains "${patternNeedle(res.ref!)}" is now asked with its settings - open the row to set them.`
+				: `Added ${res.ref} at the end of the list. Open it to set its options.`,
+			"info",
+		);
+	}
+
 	/** Enter: a SELECTED model opens its options submenu; an UNSELECTED model joins the END of the
-	 *  order with default options (rotateAdd appends). */
+	 *  order, taking the shared settings plus the defaults (rotateAdd appends). */
 	private openHighlighted(initialKey?: string, openSub?: string): void {
 		const ref = this.highlightRef();
 		if (!ref) return;
 		const cfg = loadConfig();
 		if (!cfg.models[ref]) {
-			rotateAdd(ref);
+			if (!rotateAdd(ref)) {
+				this.ctx.ui?.notify?.(`NOT ADDED - the list is full (${MAX_SLOTS} places). Take one out with Space first, or press + and add a name pattern that covers several models at once.`, "warning");
+				return;
+			}
 			this.rebuild();
 			this.highlightRef(ref);
 			this.ctx.ui?.notify?.(`${ref.split("/").pop()} added to the Compaction models list (last place).`, "info");
@@ -4247,7 +5584,7 @@ export class OrderList implements Component, Focusable {
 	}
 
 	private themeHeader(): string {
-		return "Type to filter (letters and digits) · digits/Space act on SELECTED models only (1-9 place, 0 end, Space remove) · Enter: selected = options, unselected = add to end · Esc leaves";
+		return `Type to filter (letters and digits) · on SELECTED models: digit 1-9 moves to that place, 0 = last (${MAX_SLOTS} places), Space removes · Enter opens its options · + adds a model by name or by a part of a name · Esc leaves`;
 	}
 
 	// -- Focusable -------------------------------------------------------------
@@ -4274,7 +5611,10 @@ export class OrderList implements Component, Focusable {
 		if (!cfg.models[ref]) {
 			// Selecting an unlisted model: it joins the order with its default options, at the named
 			// place (or the end when the number is bigger than the list).
-			rotateAdd(ref);
+			if (!rotateAdd(ref)) {
+				this.ctx.ui?.notify?.(`NOT MOVED - the list is full (${MAX_SLOTS} places), so this model could not join it. Take one out with Space first.`, "warning");
+				return;
+			}
 			const size = Object.keys(loadConfig().models).length;
 			rotateTo(ref, Math.min(place, size - 1));
 			this.rebuild();
@@ -4335,6 +5675,11 @@ export class OrderList implements Component, Focusable {
 		const selectedRefs = Object.keys(cfg.models);
 		// Position badges follow the JSON order (the try order).
 		const items: SettingItem[] = [];
+		// NO synthetic row here (2026-11-05, after one caused a breakage). A row that is not a model, sitting
+		// above the models, moved every model down one line: the highlight opened on it, digits fell through
+		// to the filter instead of repositioning, and Space acted on the wrong row - which is how "add a name
+		// by keyboard" turned into a list that could not be ordered. The shortcut below is enough, and the
+		// footer line names it.
 		for (const ref of selectedRefs) {
 			const model = lookupRef(ref, this.ctx);
 			items.push(this.row(ref, model, orderPosition(cfg, ref), reserveTokens));
@@ -4369,13 +5714,28 @@ export class OrderList implements Component, Focusable {
 	private row(ref: string, model: any, place: number, reserveTokens: number): SettingItem {
 		const cfg = loadConfig();
 		const selected = Boolean(cfg.models[ref]);
+		// A pattern entry stands for a family, not for one model. Its row reads like every other row - the
+		// same position badge, the same parameter readout on the right - because it IS a normal entry that
+		// happens to answer to several models; the name is what differs, and it goes in the label.
+		if (isPatternRef(ref)) {
+			const hits = patternHits(cfg, ref, [...(this.ctx.modelRegistry?.getAvailable?.() ?? []), ...(this.ctx.model ? [this.ctx.model] : [])]);
+			// Ask one matching model how it looks, so the local/online defaults behind the readout are real.
+			const rep = hits.length ? lookupRef(hits[0], this.ctx) : model;
+			return {
+				id: `model:${ref}`,
+				label: `${place >= 0 ? `[${place + 1}]` : "   "} by name: ${patternNeedle(ref)}`,
+				currentValue: modelRowValue(cfg, ref, rep, reserveTokens),
+				description:
+					"A NAME PATTERN: every model whose name contains this text - at the start, middle or end - is asked with THESE settings, and this row is tried in this place of the order. Enter opens the settings the matching models use. Space removes the pattern. Digits move it in the try order. A model that also has its own exact entry in the list uses that entry instead: exact always beats a pattern.",
+			};
+		}
 		return {
 			id: `model:${ref}`,
 			label: modelRowLabel(place, ref, model),
 			currentValue: selected ? modelRowValue(cfg, ref, model, reserveTokens) : modelRowValue(cfg, ref, model, reserveTokens),
 			description: selected
 				? "Enter opens its options (thinking, timeout, summary sizes, no-think tag). Space removes it from the order. Digits move it to that place."
-				: "Not in the Compaction models order - it shows the default options. Press a digit (or 0) to add it at that place; Space on a selected model removes it. Enter opens options only for models in the order.",
+				: "Not in the Compaction models list, so it is not asked to write summaries. It shows the SHARED settings, which are what it would be asked with if it were chosen. Press a digit (1-9, or 0 for last) to add it at that place; Space on a listed model removes it; Enter adds it at the end.",
 		};
 	}
 }
@@ -4386,6 +5746,9 @@ export class OrderList implements Component, Focusable {
 // model keeps its reasoning and sampling controls here and its compaction settings sit with the rest
 // of the compaction settings.
 export const MODEL_KEEP_ROWS = ["thinking", "nothink", "timeout", "sampling"] as const;
+/** Rows that no longer live in a single model's option list. Reference by name only (a comment elsewhere
+ *  points here); "inputstubs" and "argcap" joined it on 2026-11-01 when those two elision rules moved to
+ *  the global Elision settings submenu, and "thinking-input" was never per-model at all. */
 export const MODEL_MOVED_ROWS = ["summaryAim", "summaryMin", "summaryMax", "inputstubs", "argcap", "preservestubs", "preserveuser", "preservereply", "preservethinking", "chain", "previewDesc"] as const;
 
 // One selected model's options. Every row toggles through its values on Enter/Space:
@@ -4455,22 +5818,9 @@ export function modelOptionsScreen(
 			description:
 				"Upper clamp on the summary aim - generation-time guard (a 968k region at 10% would ask for a 97k summary; the ceiling caps it) and the hard cap on the accepted summary. Free entry. Default 32,768.",
 		});
-		rows.push({
-			id: "inputstubs",
-			label: "Summarizer input:",
-			currentValue: o.inputStubs ? "stubs" : "raw",
-			values: withCurrent(["stubs", "raw"], o.inputStubs ? "stubs" : "raw"),
-			description:
-				'"stubs" = every tool result in the summarizer input becomes an informative stub (tool, key argument, output size, tail message with the exit code, re-run hint) - pi\'s 2,000-character head-only clip then has nothing important left to cut, and the request gets much smaller. "raw" = pi\'s own input (long results clipped to their first 2,000 characters, exit code lost). Default: stubs.',
-		});
-		rows.push({
-			id: "argcap",
-			label: "Tool-call arg cap:",
-			currentValue: `${charCapLabel(o.argCap)}${o.argCap === "full" ? "" : " chars"}`,
-			values: [EDIT_NUMBER, "full"],
-			description:
-				'Caps tool-call argument VALUES in the summarizer input (whole files ride inside write/edit arguments). Truncated values keep their beginning plus a marker. Enter opens a free numeric entry in chars (0 = full); cycling reaches "full". Default 500 chars (OMP\'s value).',
-		});
+		// "Summarizer input" and "Tool-call arg cap" used to live here, one copy per model. They are
+		// global elision settings now (Elision settings submenu), because what the summariser is allowed to
+		// read is a decision about the summary, not a property of the model being summarised (2026-11-01).
 		rows.push({
 			id: "preservestubs",
 			label: "Tool stubs in summary:",
@@ -4572,11 +5922,6 @@ export function modelOptionsScreen(
 					return;
 				}
 				rebuildList();
-			} else if (id === "inputstubs") {
-				setModelOptions(ref, { inputStubs: value === "stubs" });
-			} else if (id === "argcap") {
-				if (value === EDIT_NUMBER) { if (onExit) { onExit(id); return; } rebuildList(); }
-				else setModelOptions(ref, { argCap: value === "full" ? "full" : Number(String(value).replace(/[^0-9]/g, "")) });
 			} else if (id === "preservestubs") {
 				setModelOptions(ref, { preserveStubs: (PRESERVE_CYCLE as string[]).includes(value) ? (value as Preserve) : "verbatim" });
 			} else if (id === "preserveuser") {
@@ -5585,10 +6930,31 @@ class ElisionMenu implements Component, Focusable {
 		return [
 			{
 				id: "elisionOn",
-				label: "Elision on/off:",
+				label: "Auto-elision on/off:",
 				currentValue: e.enabled ? "on" : "off",
 				values: ["on", "off"],
-				description: "Old tool results are replaced by short stubs in the requests the model receives, so the context stays much lower for much longer. Your screen and the session file always keep the originals - stubs exist only on the wire. Enter/Space toggles it.",
+				description: "AUTO-ELISION - the background sweep over the LIVE session. Old tool results are replaced by short stubs in the requests the working model receives, so the context stays much lower for much longer. Your screen and the session file always keep the originals - stubs exist only on the wire. This switch says NOTHING about a summary request: that is the next row. Enter/Space toggles it.",
+			},
+			{
+				id: "elisionCompact",
+				label: "Compaction elision on/off:",
+				currentValue: e.compactEnabled ? "on" : "off",
+				values: ["on", "off"],
+				description: "COMPACTION ELISION - what the SUMMARISER gets to read. on = every tool result over the limit below reaches the summary request as a short stub (which is why a 226,000-token context can be summarised from a 94,000-token request). off = the summariser reads every tool result in full, and the summary request grows by all of that output. A model's own 'Summarizer input' option must also say stubs for stubbing to happen. Enter/Space toggles it.",
+			},
+			{
+				id: "elisionFrom",
+				label: "Elide tool call results longer than:",
+				currentValue: `${fmt(e.stubFromChars)} chars`,
+				values: ["edit"],
+				description: "The trigger for BOTH kinds of elision: a tool result of this size or less is always left in one piece, because a stub of a short answer saves nothing. A stub is also never allowed to come out longer than the text it replaces, however big this number is. It applies to the live sweep and to the summary request alike. Lower = more results stubbed = less material the summariser and the working model actually see. Enter opens a free numeric entry. Default 2,000 (pi's own clip).",
+			},
+			{
+				id: "elisionArgCap",
+				label: "Tool-call argument cap (summary + live):",
+				currentValue: `${charCapLabel(e.argCap)}${e.argCap === "full" ? "" : " chars"}`,
+				values: ["edit"],
+				description: "How much of each tool-call ARGUMENT survives, per argument value. A write or edit call carries a whole file inside its arguments, and this caps each value: HALF the budget from the beginning and HALF from the end, with a marker in between naming how many lines and characters were elided - a silent abbreviation reads like the whole text. It works on the CALL side of the wire, while the rows above work on the RESULT side, and it applies to the summary input AND to the live sweep: an over-cap call is now cut on its own merits, so a two-character answer sitting on a 4,000-character command no longer rides every request of the session. This cap is its own trigger - the result-size row above does not gate it. Enter opens a free numeric entry in characters (0 = no cap). Default 500.",
 			},
 			{
 				id: "elisionStart",
@@ -5609,7 +6975,7 @@ class ElisionMenu implements Component, Focusable {
 				label: "Preserve last x chars of results:",
 				currentValue: `${typeof e.stubTailChars === "number" ? fmt(e.stubTailChars) : "full"} chars`,
 				values: ["edit"],
-				description: "How much of each tool result's ending survives inside its stub (the outcome usually lives there). Enter opens a free numeric entry (0 = none). Default 300.",
+				description: "How much of each tool result's ending survives inside its stub - in the live session AND in the summary request (the outcome usually lives there). Only results over the elide limit above are stubbed at all. Enter opens a free numeric entry (0 = none). Default 200.",
 			},
 			{
 				id: "elisionSavings",
@@ -5617,6 +6983,27 @@ class ElisionMenu implements Component, Focusable {
 				currentValue: `${fmt(e.minSavingsTokens)} tok`,
 				values: ["edit"],
 				description: "A sweep is only taken if it actually saves at least this many tok - no busywork. Enter opens a free numeric entry. Default 2,000.",
+			},
+			{
+				id: "elisionRecallTool",
+				label: "Recall tool on/off:",
+				currentValue: e.recallTool ? "on" : "off",
+				values: ["on", "off"],
+				description: "Offer the model `recall_tool_result`, which reads back a result the harness truncated - the original never leaves the session file. Registration happens when pi starts, so this takes effect on the next pi reload. It costs one small tool declaration in the system prompt. Enter/Space toggles.",
+			},
+			{
+				id: "elisionRecallPointer",
+				label: "Put the # pointer in stubs:",
+				currentValue: e.recallPointer ? "on" : "off",
+				values: ["on", "off"],
+				description: "on (default) writes `recall_tool_result: #47` into each stub - about 15 tokens, which is the price of a pointer a model cannot misread. off keeps stubs shorter, and an elided result cannot be asked back. Enter/Space toggles.",
+			},
+			{
+				id: "elisionRecallMax",
+				label: "Recall returns at most x chars:",
+				currentValue: `${fmt(e.recallMaxChars)} chars`,
+				values: ["edit"],
+				description: "The budget of ONE recall response. This is what stops a recall tool from putting a 187,402-character result straight back into the window elision just cleared: the answer says where it stopped, and the model asks for the next part with from=. Default 20,000.",
 			},
 			{
 				id: "elisionResults",
@@ -5658,6 +7045,23 @@ class ElisionMenu implements Component, Focusable {
 			(id: string, value: string) => {
 				if (id === "elisionOn") {
 					update((c) => void (c.elision.enabled = value === "on"));
+					resetElisionBreaker();
+					this.rebuild();
+					return;
+				}
+				if (id === "elisionCompact") {
+					update((c) => void (c.elision.compactEnabled = value === "on"));
+					this.rebuild();
+					return;
+				}
+				if (id === "elisionRecallTool") {
+					update((c) => void (c.elision.recallTool = value === "on"));
+					this.ctx.ui?.notify?.(value === "on" ? "Recall on: the tool is declared when pi starts, so a restarted pi offers recall_tool_result." : "Recall off: the tool is no longer offered. Switch the pointer off too if you want stubs to stop carrying # numbers.", "info");
+					this.rebuild();
+					return;
+				}
+				if (id === "elisionRecallPointer") {
+					update((c) => void (c.elision.recallPointer = value === "on"));
 					this.rebuild();
 					return;
 				}
@@ -5686,7 +7090,7 @@ class ElisionMenu implements Component, Focusable {
 
 	render(width: number): string[] {
 		const inner = Math.max(40, width);
-		const lines: string[] = ["", "Elision - old tool results become stubs on the wire; originals stay on disk:", ""];
+		const lines: string[] = ["", "Elision - tool results become stubs on the wire; originals stay on disk.", "  Auto-elision is the live session, Compaction elision is the summary request:", ""];
 		lines.push(...(this.list?.render(inner) ?? []));
 		return lines.map((l) => truncateToWidth(l, inner));
 	}
@@ -5797,22 +7201,8 @@ class CompactionMenu implements Component, Focusable {
 				description:
 					"A summary longer than this is thrown away too. One setting for every model.",
 			},
-			{
-				id: "inputstubs",
-				label: "Summarizer input:",
-				currentValue: `${o.inputStubs ? "stubs" : "raw"}`,
-				values: ["stubs", "raw"],
-				description:
-					"What the summarizer is shown for the older tool results: informative stubs, or the raw text.",
-			},
-			{
-				id: "argcap",
-				label: "Tool-call argument cap:",
-				currentValue: `${charCapLabel(o.argCap)}`,
-				values: [EDIT_NUMBER, "full"],
-				description:
-					"How much of a tool call argument values text the summarizer sees. The tool RESULTS are separate, see the preserve rows.",
-			},
+			// Summarizer input and tool-call argument cap: moved to the global Elision settings submenu
+			// (2026-11-01), where they read as the one pair of rules they always were.
 			{
 				id: "preservestubs",
 				label: "Tool stubs in summary:",
@@ -5932,7 +7322,7 @@ class CompactionMenu implements Component, Focusable {
 					this.onAction("__exit:edit-nothinktag:menu");
 					return;
 				}
-				if (id === "summaryAim" || id === "summaryMin" || id === "summaryMax" || id === "argcap") {
+				if (id === "summaryAim" || id === "summaryMin" || id === "summaryMax") {
 					// A number: the box runs over the plain chat. This is the ALL-MODELS copy of the setting, so
 					// it asks for the first model in the order WITHOUT saying "open that model's options" - the
 					// per-model action used here is what threw the operator into the 4-item model screen after a
@@ -5940,7 +7330,6 @@ class CompactionMenu implements Component, Focusable {
 					this.onAction(`__exit:edit-allmodels-number:${id}`);
 					return;
 				}
-				else if (id === "inputstubs") setModelOptions(first, { inputStubs: value === "stubs" });
 				else if (id === "preservestubs") setModelOptions(first, { preserveStubs: value as never });
 				else if (id === "preserveuser") setModelOptions(first, { preserveUser: value as never });
 				else if (id === "preservereply") setModelOptions(first, { preserveReplies: value as never });
@@ -6149,11 +7538,13 @@ export class CompactionBoard implements Component, Focusable {
 		this.patch("elision", cfg.elision.enabled ? "on" : "off");
 		this.patch("elisionProtect", `${fmt(cfg.elision.protectRecentTokens)} tok`);
 		this.patch("elisionTail", cfg.elision.stubTailChars === "full" ? "full" : `${cfg.elision.stubTailChars} chars`);
+		this.patch("elisionArgCap", cfg.elision.argCap === "full" ? "full" : `${fmt(cfg.elision.argCap)} chars`);
 		this.patch("elisionSavings", `${fmt(cfg.elision.minSavingsTokens)} tok`);
 		this.patch("elisionResults", `${cfg.elision.minResultsToStub} results`);
 		this.patch("elisionStop", `${fmt(cfg.elision.stopGapTokens)} tok`);
 		this.patch("elisionProtect", `${fmt(cfg.elision.protectRecentTokens)} tok`);
 		this.patch("elisionTail", cfg.elision.stubTailChars === "full" ? "full" : `${cfg.elision.stubTailChars} chars`);
+		this.patch("elisionArgCap", cfg.elision.argCap === "full" ? "full" : `${fmt(cfg.elision.argCap)} chars`);
 		this.patch("retryWait", `${cfg.retryDelaySeconds} s`);
 		this.patch("extReserve", fmt(extReserve(this.ctx)));
 		this.patch("extKeep", fmt(extKeepRecent(this.ctx)));
@@ -6192,7 +7583,7 @@ export class CompactionBoard implements Component, Focusable {
 					MODEL_KEEP_ROWS,
 				) as unknown as Component,
 			description:
-				"The models that write the summary, first one first. In the list: type to filter, digits 1-9 move a model to that place (0 = the end), Space removes it from the order, Enter opens the options of a model that is IN the order. Unselected models show the default options and cannot be opened.",
+				`The models that write the summary, first one first - up to ${MAX_SLOTS} of them. In the list: type to filter; on a listed model a digit moves it to that place (0 = last) and Space takes it out; Enter opens its options. Press + to ADD BY NAME: an exact provider/model for one model, or a part of a name such as "qwen3.8-flash-next" for a NAME PATTERN that every model with those characters in its name will use - one entry for a whole family of variants. Models that are not listed show the shared settings, which are what they would be asked with.`,
 		});
 		rows.push({
 			id: "elisionMenu",
@@ -6388,7 +7779,19 @@ export class CompactionBoard implements Component, Focusable {
 			this.finish({ action: "compact-now" });
 			ctx?.compact?.({
 				onComplete: () => ctx?.ui?.notify?.("Manual compaction finished.", "info"),
-				onError: (err: any) => ctx?.ui?.notify?.(`Manual compaction failed: ${String(err?.message ?? err).slice(0, 160)}`, "error"),
+				// Two wordings that are not failures. A cancel this extension caused is already explained by
+				// its own notice, and "nothing to compact" minutes after a summary landed is a redundant second
+				// ask, not a breakdown - on 2026-11-04 it read as if the compaction that HAD worked had failed.
+				onError: (err: any) => {
+					const m = String(err?.message ?? err).slice(0, 160);
+					if (/cancel|abort|already running|declined/i.test(m)) return;
+					if (/nothing to compact|already compacted|too small/i.test(m) && landedVeryRecentlyMs()) {
+						const secs = Math.max(1, Math.round((Date.now() - lastCompactionDoneAtMs) / 1000));
+						ctx?.ui?.notify?.(`Nothing left to compact - a summary landed ${fmt(secs)} s ago and the newest ${fmt(extKeepRecent(ctx))} tok stayed word for word. The transcript on disk is unchanged.`, "info");
+						return;
+					}
+					ctx?.ui?.notify?.(`Manual compaction failed: ${m}`, "error");
+				},
 			});
 			return;
 		} else if (id === "compactNowResume") {
@@ -6728,7 +8131,7 @@ async function previewRequest(ctx: Ctx, ref: string, full = false): Promise<void
 	const kept = msgs.slice(-2);
 	const region = msgs.slice(0, -2);
 	const prevTurn = readPrevTurnInfo(ctx, {});
-	const main = serializeRegion(region, { startTurn: prevTurn.lastTurn, inputStubs: profile.inputStubs, argCap: profile.argCap });
+	const main = serializeRegion(region, { startTurn: prevTurn.lastTurn, inputStubs: compactStubsOn(), argCap: elisionArgCap() });
 	const keptText = kept.map((m: any) => `[${String(m.role)} - kept]: ${contentTextOf(m.content).slice(0, 400)}`).join("\n\n");
 	const inputTokens = Math.ceil((main.text.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
 	const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: model?.contextWindow ?? (ctx as any)?.model?.contextWindow ?? 0 }, 0);
@@ -6994,6 +8397,12 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		const factory = (tui: TUI, theme: Theme, _kb: KeybindingsManager, done: (r: BoardResult | undefined) => void): Component =>
 			new CompactionBoard(tui, theme, ctx, done, restore);
 		const result = (await ctx.ui.custom(factory)) as BoardResult | undefined;
+		// The position this board was opened at has now been USED. A handler that wants the next board to
+		// reopen somewhere sets `restore` again before it continues; everyone else leaves it empty.
+		// Without this line one flag edit pinned EVERY later visit for the rest of the command's life: change a
+		// sampling flag, step out, and selecting "Compaction models" jumped straight back to that model's
+		// flags page instead of showing the list (2026-11-05, the "it takes me to the flags menu" report).
+		restore = undefined;
 		if (!result?.action) return;
 		// pi's compaction flag is read for information only and never written by this extension.
 		// The automatic trigger here is this extension's own: it measures the live context and starts
@@ -7039,15 +8448,12 @@ async function runBoard(ctx: Ctx): Promise<void> {
 			continue;
 		}
 		if (result.action === "elision-now") {
-			const projection: any = ctx?.sessionManager?.buildSessionProjection?.();
-			const msgs: any[] = (projection?.messages ?? []).filter((m: any) => m?.role !== "system");
-			const r = applyElision(structuredClone(msgs), ctx, { force: true });
-			ctx?.ui?.notify?.(
-				r
-					? `Elision done - ${fmt(r.messages.length)} messages processed; the stubs are live from the next request.`
-					: "Nothing to elide - no eligible tool results outside the preserved tail.",
-				"info",
-			);
+			// THE MANUAL SWEEP TAKES THE SAME DOOR AS THE AUTOMATIC ONE (2026-11-06, route A): it writes pi's
+			// context edits, it does not touch any request. `appendContextEdit` is pi's own public SessionManager
+			// method - the one its boundary machinery calls - and pi rebuilds the projection for every request,
+			// so the edits are on the wire from the next request without anything having to be re-drawn here.
+			const r = runElisionSweep(ctx, { force: true });
+			ctx?.ui?.notify?.(r.text, r.kind === "nothing" ? "info" : r.ok ? "info" : "warning");
 			restore = { rowId: "elisionNow" };
 			continue;
 		}
@@ -7239,8 +8645,25 @@ async function askNumber(ctx: Ctx, title: string, current: number, lo: number, h
  *  plain chat - never while a submenu screen is mounted - and saves straight into the model's
  *  options (live config; read again on the next event). */
 async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void> {
-	const model = lookupRef(ref, ctx);
-	const o = optionsFor(loadConfig(), ref, model);
+	// Per-model settings live on an entry in the Compaction models list. Refusing here, before the box opens,
+	// is what makes the rule visible; letting it through used to CREATE an entry, which looked like the list
+	// adding models by itself.
+	if (!loadConfig().models[ref]) {
+		ctx.ui?.notify?.(`NOT SAVED - ${ref.split("/").pop()} is not in the Compaction models list, so it has no settings of its own. Add it first (a digit adds it at that place), or set the shared sizes on the Compaction settings board.`, "warning");
+		return;
+	}
+	// A pattern entry names several models; ask one of them how it looks, so the local/online defaults behind
+	// the ranges and the current values are the real ones.
+	const cfgNow = loadConfig();
+	const model =
+		lookupRef(ref, ctx) ??
+		(cfgNow.models[ref]
+			? (() => {
+					const hits = patternHits(cfgNow, ref, [...(ctx.modelRegistry?.getAvailable?.() ?? []), ...(ctx.model ? [ctx.model] : [])]);
+					return hits.length ? lookupRef(hits[0], ctx) : undefined;
+				})()
+			: undefined);
+	const o = optionsFor(cfgNow, ref, model);
 	let title = "", cur = 0, lo = 0, hi = 0, unit = "";
 	let save: (v: number) => void = () => {};
 	let shown: (v: number) => string = (v) => fmt(v);
@@ -7259,11 +8682,6 @@ async function editModelNumber(ctx: Ctx, ref: string, key: string): Promise<void
 		cur = o.summaryMaxTokens; lo = 1; hi = 1_000_000; unit = "tokens (absolute)";
 		save = (v) => setModelOptions(ref, { summaryMaxTokens: v });
 		shown = (v) => `${fmt(v)} tok`;
-	} else if (key === "argcap") {
-		title = "Tool-call arg cap — default 500 chars";
-		cur = o.argCap === "full" ? 0 : Number(o.argCap); lo = 0; hi = 1_000_000; unit = "chars (0 = full)";
-		save = (v) => setModelOptions(ref, { argCap: v === 0 ? "full" : v });
-		shown = (v) => (v === 0 ? "full" : `${fmt(v)} chars`);
 	} else if (key === "timeout") {
 		title = "Timeout period — default 10 min";
 		cur = Math.round((o.timeoutMs || 0) / 60_000); lo = 0; hi = 720; unit = "minutes (0 = unlimited)";
@@ -7323,12 +8741,15 @@ const NUMBER_EDITORS: Record<string, { title: string; lo: number; hi: number; un
 	preserveTok: { title: 'Preserve tail context', lo: 1024, hi: 10_000_000, unit: "tokens of the tail kept word for word (pi's keepRecentTokens)", def: 20_000, apply: (v) => setPiCompactionNumbers({ keepRecentTokens: v }) || undefined },
 	elisionStart: { title: "Elision start", lo: 1, hi: 99, unit: "percent of window", def: 70, apply: (v) => { update((c) => void (c.elision = { ...c.elision, softPercent: v })); return undefined; } },
 	elisionProtect: { title: "Elision protect (tool results)", lo: 0, hi: 1_000_000, unit: "tokens", def: 20_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, protectRecentTokens: v })); return undefined; } },
+	elisionFrom: { title: "Elide tool call results longer than", lo: 0, hi: 1_000_000, unit: "characters (both auto-elision and compaction elision)", def: 2_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, stubFromChars: v })); return undefined; } },
+	elisionArgCap: { title: "Tool-call argument cap (summary input and live elision)", lo: 0, hi: 1_000_000, unit: "characters per argument value (0 = no cap)", def: 500, apply: (v) => { update((c) => void (c.elision = { ...c.elision, argCap: v === 0 ? "full" : v })); return undefined; } },
 	elisionTail: { title: "Stub tail", lo: 0, hi: 100_000, unit: "chars (0 = none; 'full' is a separate row value)", def: 200, apply: (v) => { update((c) => void (c.elision = { ...c.elision, stubTailChars: v })); return undefined; } },
 	elisionSavings: { title: "Min batch savings", lo: 0, hi: 100_000, unit: "tokens (0 = fire immediately)", def: 2_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, minSavingsTokens: v })); return undefined; } },
 	elisionResults: { title: "Min stub batch", lo: 1, hi: 50, unit: "results", def: 5, apply: (v) => { update((c) => void (c.elision = { ...c.elision, minResultsToStub: v })); return undefined; } },
 	elisionStop: { title: "Elision stop gap", lo: 0, hi: 100_000, unit: "tokens", def: 4_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, stopGapTokens: v })); return undefined; } },
 	elisionBatchGap: { title: "Elision batch gap", lo: 0, hi: 86_400, unit: "seconds between sweeps", def: 300, apply: (v) => { update((c) => void (c.elision = { ...c.elision, minBatchGapSec: v })); return undefined; } },
 	elisionCap: { title: "Max tool results per batch", lo: 1, hi: 500, unit: "results", def: 40, apply: (v) => { update((c) => void (c.elision = { ...c.elision, maxResultsPerBatch: v })); return undefined; } },
+	elisionRecallMax: { title: "Recall returns at most", lo: 500, hi: 200_000, unit: "characters per recall response", def: 20_000, apply: (v) => { update((c) => void (c.elision = { ...c.elision, recallMaxChars: v })); return undefined; } },
 	chatCap: { title: "Chat max_tokens cap", lo: 0, hi: 2_000_000, unit: "tokens (0 = no cap)", def: 65_536, apply: (v) => { update((c) => void (c.chatMaxTokensCap = v)); return undefined; } },
 	retries: { title: "Retries per model", lo: 0, hi: 99, unit: "tries (0 = no retries)", def: 2, apply: (v) => { update((c) => void (c.retries = v)); return undefined; } },
 };
@@ -7344,11 +8765,14 @@ async function editNumber(ctx: Ctx, id: string): Promise<void> {
 		: id === "piReserve" ? readPiReserveTokens()
 		: id === "elisionStart" ? cfg.elision.softPercent
 		: id === "elisionProtect" ? cfg.elision.protectRecentTokens
+		: id === "elisionFrom" ? cfg.elision.stubFromChars
+		: id === "elisionArgCap" ? (cfg.elision.argCap === "full" ? 0 : Number(cfg.elision.argCap))
 		: id === "elisionTail" ? (typeof cfg.elision.stubTailChars === "number" ? cfg.elision.stubTailChars : 0)
 		: id === "elisionSavings" ? cfg.elision.minSavingsTokens
 		: id === "elisionResults" ? cfg.elision.minResultsToStub
 		: id === "elisionBatchGap" ? cfg.elision.minBatchGapSec
 		: id === "elisionCap" ? cfg.elision.maxResultsPerBatch
+		: id === "elisionRecallMax" ? cfg.elision.recallMaxChars
 		: cfg.elision.stopGapTokens;
 	const v = await askNumber(ctx, `${d.title} — default ${fmt(d.def)} ${d.unit}`, current, d.lo, d.hi, d.unit);
 	if (v === undefined) return;
@@ -7439,7 +8863,7 @@ async function orderMenuFallback(ctx: Ctx): Promise<void> {
 					"Which model should join the Compaction models list?",
 					pool.sort((a, b) => a.ref.localeCompare(b.ref)).map((p) => ({
 						label: p.model ? (isLocalModel(p.model) ? shortName(String(p.model.id)) : String(p.model.id)) : p.ref,
-						run: () => rotateAdd(p.ref),
+						run: () => void (rotateAdd(p.ref) ? ctx.ui?.notify?.(`${p.ref} added to the Compaction models list.`, "info") : ctx.ui?.notify?.(`NOT ADDED - the list is full (${MAX_SLOTS} places).`, "warning")),
 					})),
 				);
 				void chosen;
@@ -7479,7 +8903,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 			},
 			{
 				label: `Summary aim - now ${fmt(o.summaryAimTokens)} tok`,
-				hint: "THE SUMMARY AIM: this percent of the region being folded (measured after the stubbing pass). Free numeric entry, 1-99.",
+				hint: "THE SUMMARY AIM, in tokens - ONE setting for every model, changed here or on the Compaction settings board (2026-11-05: it used to be stored per model, which is how edits made while an unlisted model was active disappeared and the numbers looked reset). Free numeric entry.",
 				run: async () => {
 					const v = await askNumber(ctx, "Summary aim - tokens the summary should reach - default 22000", o.summaryAimTokens, 256, 1_000_000, "tokens");
 					if (v !== undefined) setModelOptions(ref, { summaryAimTokens: v });
@@ -7487,7 +8911,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 			},
 			{
 				label: `Summary min - now ${fmt(o.summaryMinTokens)} tok (absolute)`,
-				hint: "THE ACCEPTANCE FLOOR: a shorter summary is thrown away and the next model in the rotation is asked. Absolute tokens, whatever the model's window (default 4,096). Free numeric entry.",
+				hint: "THE ACCEPTANCE FLOOR: a shorter summary is thrown away and the next model in the rotation is asked. Absolute tokens, whatever the model's window (default 4,096). ONE setting for every model, like the aim and the ceiling. Free numeric entry.",
 				run: async () => {
 					const v = await askNumber(ctx, "Summary min \u2014 absolute tokens (default 4096)", o.summaryMinTokens, 0, 1_000_000, "tokens");
 					if (v !== undefined) setModelOptions(ref, { summaryMinTokens: v });
@@ -7495,29 +8919,15 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 			},
 			{
 				label: `Summary max - now ${fmt(o.summaryMaxTokens)} tok (absolute)`,
-				hint: "THE ACCEPTANCE CEILING: a longer summary is thrown away too. Absolute tokens - a model cannot write a 100k-token summary however big its window, which is why these two limits are absolute tokens and not percents of the window (default 30,000). Free numeric entry.",
+				hint: "THE ACCEPTANCE CEILING: a longer summary is thrown away too. Absolute tokens - a model cannot write a 100k-token summary however big its window, which is why these two limits are absolute tokens and not percents of the window (default 30,000). ONE setting for every model, like the aim and the floor. Free numeric entry.",
 				run: async () => {
 					const v = await askNumber(ctx, "Summary max \u2014 absolute tokens (default 30000)", o.summaryMaxTokens, 1, 1_000_000, "tokens");
 					if (v !== undefined) setModelOptions(ref, { summaryMaxTokens: v });
 				},
 			},
-			{
-				label: `Summarizer input - now ${o.inputStubs ? "stubs" : "raw"}`,
-				hint: '"stubs" = every tool result becomes an informative stub (tool, size, exit/tail message, re-run hint) in the summarizer input; "raw" = pi\'s own input with the 2,000-char head-only clip.',
-				run: async () => {
-					const chosen = await ctx.ui.select("Summarizer input", withCurrent(["stubs", "raw"], o.inputStubs ? "stubs" : "raw"));
-					if (chosen !== undefined) setModelOptions(ref, { inputStubs: chosen === "stubs" });
-				},
-			},
-			{
-				label: `Tool-call arg cap - now ${charCapLabel(o.argCap)}${o.argCap === "full" ? "" : " chars"}`,
-				hint: "Caps tool-call argument VALUES in the summarizer input (whole files inside write/edit). Default 500 (OMP's value).",
-				run: async () => {
-					const labels = CHAR_CAP_STEPS.map((c) => (c === "full" ? "full" : `${c} chars`));
-					const chosen = await ctx.ui.select("Tool-call arg cap", withCurrent(labels, `${charCapLabel(o.argCap)}${o.argCap === "full" ? "" : " chars"}`));
-					if (chosen !== undefined) setModelOptions(ref, { argCap: chosen === "full" ? "full" : Number(String(chosen).replace(/[^0-9]/g, "")) });
-				},
-			},
+			// Summarizer input and tool-call arg cap left this per-model list on 2026-11-01: they are global
+			// elision rules now, and one model's row silently deciding what every model's summaries were built
+			// from was the kind of surprise this menu should not contain.
 			{
 				label: `Tool stubs in summary - now ${o.preserveStubs}`,
 				hint: `verbatim | detailed | summary | brief. ${PRESERVE_SENTENCES[o.preserveStubs].stubs}`,
@@ -7625,11 +9035,24 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 				run: () => editNoThinkTag(ctx),
 			},
 			{
-				label: `Elision - now ${cfg.elision.enabled ? "ON" : "OFF"} (start ${cfg.elision.softPercent}%, protect ${fmt(cfg.elision.protectRecentTokens)} tok, stub tail ${charCapLabel(cfg.elision.stubTailChars)})`,
-				hint: "Old tool results become informative stubs in live requests; calls stay; originals stay on disk. Tune with: /compact-plus elision ...",
+				label: `Summariser reads thinking - now ${cfg.thinkingToSummariser ? "ON" : "OFF"}`,
+				hint: "ON = the assistant's thinking text rides into the summary request, so the ledger can carry WHY a fix was chosen. OFF = thinking is left out of the summary input, which on a thinking-heavy session is the largest saving there is (a real 226,000-token context: 326,004 characters of material fell to 140,000 without thinking). Nothing is deleted either way - the session file keeps every word, and this model's own 'thought' keep level still decides how the summary WRITES about thinking.",
+				run: () => update((c) => void (c.thinkingToSummariser = !c.thinkingToSummariser)),
+			},
+			{
+				label: `AUTO-ELISION - now ${cfg.elision.enabled ? "ON" : "OFF"} · compaction elision ${cfg.elision.compactEnabled ? "ON" : "OFF"} (from ${fmt(cfg.elision.stubFromChars)} chars, arg cap ${charCapLabel(cfg.elision.argCap)}, start ${cfg.elision.softPercent}%, protect ${fmt(cfg.elision.protectRecentTokens)} tok, stub tail ${charCapLabel(cfg.elision.stubTailChars)})`,
+				hint: "This row toggles AUTO-elision (the live session) only; compaction elision - what the summariser is allowed to read - has its own switch in the Elision settings submenu. OFF means MAKE NO NEW STUBS. The stubs already on the wire STAY on it: pi rebuilds every request from the raw originals, so dropping them would re-expand the context in one step (2026-11-06: 308,908 -> 404,734 tok, window overflow). The row below puts originals back, with a guard. Tune with: /compact-plus elision ...",
 				run: () => {
 					update((c) => void (c.elision = { ...c.elision, enabled: !c.elision.enabled }));
 					resetElisionBreaker();
+				},
+			},
+			{
+				label: "Release the applied stubs (put the raw originals back):",
+				hint: "The only route that discards stubs already on the wire, and it REFUSES when the released context would not fit in the window. A manual Elide now still works with auto-elision off, and stubbing can only ever shrink the wire.",
+				run: () => {
+					const r = releaseAppliedStubs(ctx);
+					ctx.ui.notify(r.text, r.ok ? "info" : "warning");
 				},
 			},
 			{ label: "Additional instruction:", hint: cfg.additionalInstruction ? "Custom text saved - Enter to edit or reset." : "Default text in use - Enter to edit a copy.", run: () => editInstruction(ctx) },
@@ -7678,7 +9101,8 @@ export function describe(cfg: Config, ctx: { modelRegistry: any; model?: any }):
 	lines.push(`retries: ${cfg.retries} per model, ${cfg.retryDelaySeconds}s apart · no-think tag: ${cfg.noThinkMarker || "(empty)"} · additional instruction: ${cfg.additionalInstruction ? "custom" : "default (turn ledger)"} · transcript pointer: ${cfg.transcriptPointer ? "on" : "off"}`);
 	const e = cfg.elision;
 	lines.push(`direct request: ${cfg.directRequest ? "ON" : "off"} (a direct failure moves to the next candidate; pi's compact() runs only after all fail) · shape gate: ${cfg.shapeGate ? "on" : "off"} · chat max_tokens cap: ${cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "off"}`);
-	lines.push(`elision: ${e.enabled ? "ON" : "off"} · start ${e.softPercent}% of window · protect ${fmt(e.protectRecentTokens)} tok · stub tail ${charCapLabel(e.stubTailChars)} chars · min batch ${e.minResultsToStub} results / ${fmt(e.minSavingsTokens)} tok · stop gap ${fmt(e.stopGapTokens)} tok (CLI: /compact-plus elision)`);
+	lines.push(`elision: auto ${e.enabled ? "ON" : "off"} · compaction ${e.compactEnabled ? "ON" : "off"} · elide results from ${fmt(e.stubFromChars)} chars · arg cap ${charCapLabel(e.argCap)} · start ${e.softPercent}% of window · protect ${fmt(e.protectRecentTokens)} tok · stub tail ${charCapLabel(e.stubTailChars)} chars · min batch ${e.minResultsToStub} results / ${fmt(e.minSavingsTokens)} tok · stop gap ${fmt(e.stopGapTokens)} tok (CLI: /compact-plus elision)`);
+	lines.push(`summary input: assistant thinking ${cfg.thinkingToSummariser ? "IS sent to the summariser" : "is NOT sent to the summariser"} (the session file keeps it either way) (CLI: /compact-plus thinking-input on|off)`);
 	return lines.join("\n");
 }
 
@@ -7964,13 +9388,22 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 	// rules through `session_before_compact`. Everything below stays for the board's figures and for a
 	// harness that sets `piOwnsTrigger` to false, but in a live session it no longer starts anything.
 	// A harness sets PCP_EXTENSION_TRIGGER to keep testing this route; a live session never sets it.
-	if (process.env.PCP_EXTENSION_TRIGGER !== "1") return;
+	// THE SAFETY NET (2026-11-05, restoring a trigger that was switched off on 2026-10-25). pi's threshold
+	// reads the token count of the LAST ANSWER, and with elision on that count is the shrunk request, not the
+	// session - so pi's figure can stay under its line for a whole session and never fire. Measured on the
+	// operator's session of 2026-11-04/05: a manual summary landed at 20:09 and re-armed the proactive
+	// trigger (log row `auto_compaction_resumed`), and then NOTHING fired for seven hours while the session
+	// grew to 300,150 tokens; the first compaction after the landing was the engine's own refusal (row
+	// `attempt`, note "overflow compaction"). So this route runs in a live session after all, but only
+	// past the margin below, which leaves pi's own trigger first call at the line itself.
+	const piOwnsTrigger = process.env.PCP_EXTENSION_TRIGGER !== "1";
 	let cfg: Config;
 	try {
 		cfg = loadConfig();
 	} catch {
 		return;
 	}
+	if (piOwnsTrigger && !cfg.watchdogAuto) return;
 	// NOTHING COMPACTION-WORTHY HAPPENS WHILE COMPACTION IS OFF (2026-10-06): the timer is stopped
 	// rather than left running on a guard, and pi's settings file is handed back, so an off extension
 	// leaves no timer, no writes and no trigger behind for anybody else to trip over.
@@ -8048,6 +9481,10 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 		}
 		return;
 	}
+		// THE MARGIN: while pi owns the trigger this net stays out of its way until the fill is past the line
+		// by `watchdogMarginTokens` - by then pi has had every chance and did not take it, because the number
+		// pi reads (the elided request) is smaller than the number measured here (the real fill).
+		if (piOwnsTrigger && !(tokens >= line + Math.max(0, cfg.watchdogMarginTokens))) return;
 		// PAST THE LINE IS A REASON TO ACT (2026-10-15, undoing 2026-10-14). Started only at a settled point, the
 		// trigger was 10,000 tokens late and too late to be useful; see the note above agentLoop. So the loop is
 		// not a veto any more: compactSafePoint now looks for the pause between rounds instead. The one case that
@@ -8098,7 +9535,7 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 		}
 		lastAutoTriggerMs = now;
 		lastWatchLogMs = now;
-		logLine(cfg, { event: "auto_trigger", estimate: tokens, wire: wireTokens, raw: rawTokens, line, window, reserve: extReserve(ctx), source, safePoint: sp.why, midRun: sp.midRun === true, urgent });
+		logLine(cfg, { event: "auto_trigger", estimate: tokens, wire: wireTokens, raw: rawTokens, line, window, reserve: extReserve(ctx), source, safePoint: sp.why, midRun: sp.midRun === true, urgent, watchdog: piOwnsTrigger, margin: piOwnsTrigger ? cfg.watchdogMarginTokens : 0, note: piOwnsTrigger ? "pi's threshold reads the last answer, not this fill - the safety net started it" : undefined });
 		lastCompactionTrigger = "auto";
 		// Nothing is armed here any more. The interruption below is real - pi's compact() aborts the running
 		// turn to write the summary - but the continuation is the operator's to send (2026-10-21).
@@ -8182,12 +9619,16 @@ let lastRotationFailures: string[] = [];
 // a candidate passes its checks and read when the summary lands, one scope apart - which is exactly how the
 // crash of 2026-10-24 happened: the read was written against a name that did not exist, every compaction
 // threw on the way out, and the trigger fired again on the next request. Declared here, defensively read there.
-const lastSummaryQuote: { quoted: number; given: number } = { quoted: 0, given: 0 };
+const lastSummaryQuote: { quoted: number; given: number; carried: number; matchable: number } = { quoted: 0, given: 0, carried: 0, matchable: 0 };
 
 /** What the winning attempt knew, kept for the one closing row. The `done` record used to be a row of
  *  its own, one second before COMPACTED; the operator asked for a single line at the end (2026-10-23), so
  *  these fields ride on that row instead. */
 let lastLandingInfo: Record<string, any> = {};
+/** The context size that was measured the second the last compaction started (2026-11-01). The DONE row
+ *  prints it as "triggered at N tok", so the STARTED and DONE pair reports ONE trigger point - the size
+ *  the session really had - instead of two readings taken eight minutes apart. */
+let lastTriggerContextFill = 0;
 
 /** ONE GLANCE AT THE SCREEN (2026-10-22, the operator's request): what a finished compaction cost, who
  *  wrote it, and how full the session was - printed as rows, because reading those facts meant opening
@@ -8540,7 +9981,15 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			}
 			if (Date.now() - lastNoOpNoticeAtMs > 900_000) {
 				lastNoOpNoticeAtMs = Date.now();
-				ctx?.ui?.notify?.(`Compaction found nothing to summarise (${error.slice(0, 60)}) - the conversation is already down to its summary plus the recent tail, and the full transcript is on disk. Nothing was retried and the automatic trigger is still armed.`, "info");
+				// Named as a redundancy when a summary has only just landed: "found nothing to summarise" read
+				// like a failure minutes after a compaction that HAD worked (2026-11-04, with two asks open).
+				const secs = landedVeryRecentlyMs() ? Math.max(1, Math.round((Date.now() - lastCompactionDoneAtMs) / 1000)) : 0;
+				ctx?.ui?.notify?.(
+					secs > 0
+						? `Nothing left to compact - a summary landed ${fmt(secs)} s ago, and this second request found only that summary and the recent tail. The transcript on disk is unchanged, nothing was retried, and the automatic trigger is still armed.`
+						: `Compaction found nothing to summarise (${error.slice(0, 60)}) - the conversation is already down to its summary plus the recent tail, and the full transcript is on disk. Nothing was retried and the automatic trigger is still armed.`,
+					"info",
+				);
 			}
 			return undefined;
 		}
@@ -8609,46 +10058,14 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				/* the trigger must never block a live request */
 			}
 		}
-		if (!cfgForHookElision()) {
-			// Returning straight here used to skip the stubber entirely, which quietly lost two
-			// things: the record that the switch was ever thrown, and the clearing of the applied-
-			// stub state. That state remembers WHICH results are already stubbed on the wire and
-			// where the prompt-cache break point sits, so stubs left in it after a switch-on saw
-			// raw originals as already stubbed (they are not - an off request goes out untouched)
-			// and it placed the break point where nothing had been changed. applyElision has its
-			// own off branch for exactly this bookkeeping and returns undefined, so the request
-			// is still handed on exactly as it arrived.
-			return applyElision(event?.messages, ctx);
-		}
-		if (elisionFailure.off) return undefined;
-		if (elisionFailure.retryAtMs > 0) {
-			if (Date.now() < elisionFailure.retryAtMs) return undefined; // waiting out the one retry
-			elisionFailure.retryAtMs = 0;
-		}
-		try {
-			const out = applyElision(event?.messages, ctx);
-			if (elisionFailure.fails) elisionFailure.fails = 0;
-			return out;
-		} catch (err: any) {
-			elisionFailure.fails += 1;
-			const msg = String(err?.message ?? err).slice(0, 300);
-			const stack = String(err?.stack ?? "").split("\n").slice(1, 4).join(" | ").slice(0, 300);
-			logLine(loadConfig(), {
-				event: "elision_error",
-				failure: elisionFailure.fails,
-				error: msg,
-				stack,
-				messages: Array.isArray(event?.messages) ? event.messages.length : -1,
-				session: String(ctx?.sessionManager?.getSessionId?.() ?? "session").slice(-8),
-				note: elisionFailure.fails >= 2 ? "ELISION OFF for this session - /compact-plus elision on to switch it back" : "elision paused, one retry allowed in 3 minutes",
-			});
-			ctx?.ui?.notify?.(elisionFailure.fails >= 2
-				? `ELISION IS OFF FOR THIS SESSION - IT FAILED TWICE AND WILL NOT TRY AGAIN UNTIL YOU TURN IT BACK ON (/compact-plus elision on). LAST ERROR: ${msg.slice(0, 120)}`
-				: `ELISION FAILED (attempt ${elisionFailure.fails}): ${msg.slice(0, 120)} - IT PAUSES NOW AND RETRIES ONCE IN 3 MINUTES. FULL DETAIL IN ~/.pi/agent/pi-compact-plus.log`, "warning");
-			if (elisionFailure.fails >= 2) elisionFailure.off = true;
-			else elisionFailure.retryAtMs = Date.now() + 180_000;
-			return undefined; // the request goes out unstubbed - elision never blocks a turn
-		}	});
+		// THIS HANDLER NO LONGER REWRITES THE REQUEST (2026-11-06, route A). Elision used to live here, redrawing
+		// its own stubs onto every outgoing message list, and every way of not doing that (switch off, breaker,
+		// retry pause, a throw) silently RELEASED all of them in one request - the 308,908 -> 404,734 tok
+		// overflow. The sweep now runs in `turn_end` and writes pi's own `context_edit` entries, so what pi
+		// sends is simply what pi's projection says, and this handler keeps only what it always owned: the
+		// trigger tick, the timer and the advisories.
+		return undefined;
+	});
 
 	// CHAT max_tokens cap: pi sizes each chat request's generation permission as
 	// window - context estimate - 4,096, which balloons on big-window models (943,718 on
@@ -8696,6 +10113,40 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		return p;
 	});
 
+	// THE AUTOMATIC SWEEP, AT THE TURN BOUNDARY (2026-11-06, route A).
+	// `turn_end` is the documented place where an extension may propose session entries, and pi validates them,
+	// commits them and rebuilds the running context afterwards (`_commitBoundaryDrafts` -> 
+	// `_refreshFinalizedContext`). Proposals chain: the event carries the entries proposed by whoever ran
+	// before us, and an answer that omitted them would silently drop them, so they are copied forward.
+	// Everything the old in-request sweep used to gate on is kept - the trigger line, the batch gap, the
+	// minimum results and savings, the batch cap - and nothing is remembered between turns: an entry that
+	// already has a context edit is skipped, so the session file itself is the record of what was elided.
+	pi.on("turn_end", (event: any, ctx: any) => {
+		try {
+			const cfg = loadConfig();
+			const el = cfg.elision;
+			if (!cfg.enabled || !el.enabled || breakerHolds()) return undefined;
+			const window = ctx?.model?.contextWindow ?? 0;
+			if (!(window > 0)) return undefined;
+			const r = runElisionSweep(ctx, {});
+			if (r.kind !== "proposed" || r.drafts.length === 0) return undefined;
+			ctx?.ui?.notify?.(r.text, "info");
+			return {
+				entries: [
+					...(Array.isArray(event?.entries) ? event.entries : []),
+					...r.drafts.map((d) => ({ type: "context_edit", targetId: d.targetId, replacement: d.replacement })),
+				],
+			};
+		} catch (err: any) {
+			// A sweep that cannot plan simply does not happen this turn; a turn boundary is not the place to
+			// take the session down over it, and nothing has been written, so nothing half-happened.
+			try {
+				logLine(loadConfig(), { event: "elision_error", where: "turn_end", error: String(err?.message ?? err).slice(0, 200), note: "the sweep could not plan its edits; nothing was written and the turn lands unchanged" });
+			} catch { /* a logger that cannot write is not a second problem */ }
+			return undefined;
+		}
+	});
+
 	pi.on("after_provider_response", (_event: any, ctx: any) => {
 		watcherCtx = ctx;
 		agentLoop.requestsOut = Math.max(0, agentLoop.requestsOut - 1);
@@ -8720,6 +10171,31 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		if (skipNextStockCompaction) {
 			skipNextStockCompaction = false;
 			return undefined;
+		}
+		// ONE COMPACTION AT A TIME (2026-11-05). A summary takes minutes, and pi can ask again while one is
+		// already being written: its threshold check re-arms, an overflow arrives from the server, or the
+		// operator presses the button because nothing seemed to be happening. Answering that second ask means
+		// a second full pass over the same context on the same single model slot, and whichever finishes last
+		// wins - which is what produced the 2026-11-04 report of "two parallel compactions, then a message
+		// that nothing was compacted": the run the operator started landed, and the redundant second ask was
+		// answered by pi with "Nothing to compact". Refuse the second ask, plainly, and say what is running.
+		// `compactionInFlight` is this extension's own summary route (the one that lands without stopping the
+		// turn); `rotationsRunning` counts a rotation however it was opened. Either one means a summary is
+		// being written, and the two doors did not know about each other until now.
+		if (rotationsRunning > 0 || compactionInFlight) {
+			const busyReason = String(event?.reason ?? "");
+			logLine(loadConfig(), {
+				event: "compaction_declined_busy",
+				reason: busyReason,
+				running: rotationsRunning,
+				inFlight: compactionInFlight,
+				fill: realContextTokens(ctx) ?? undefined,
+				note: "a summary is being written right now - this second request was refused, so nothing was started twice",
+			});
+			if (busyReason.includes("manual")) {
+				ctx?.ui?.notify?.("COMPACTION IS ALREADY RUNNING - a summary is being written right now, and it takes minutes. This request was refused; nothing was started twice. The COMPACTION STARTED line names the model that has it.", "warning");
+			}
+			return { cancel: true };
 		}
 		// PI RINGS THE DOORBELL, THIS EXTENSION OPENS THE DOOR (2026-10-21, the operator's design). pi's
 		// threshold is deliberately set earlier than our own trigger point; between the two, the compaction
@@ -8845,6 +10321,14 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 			);
 			return { ok: false, parked: true, note: `the recent tail alone is ${fmt(keptTokens)} tokens, at or over the trigger line of ${fmt(guardLine)}` };
 		}
+		// ONE COMPACTION AT A TIME (2026-11-05), this door: a summary written by pi's own path (the hook) is
+		// counted by rotationsRunning, and until now this route only looked at its own flag - so the watch
+		// timer could start a second summary over one that was already running. Refuse, and say why.
+		if (rotationsRunning > 0) {
+			logLine(loadConfig(), { event: why === "menu" ? "manual_compaction" : "auto_compaction_held", trigger: why === "menu" ? "manual" : "auto", running: rotationsRunning, note: "refused - a summary is being written by the other compaction path right now, so nothing was started twice" });
+			if (why === "menu") ctx.ui?.notify?.("COMPACTION IS ALREADY RUNNING - a summary is being written in this session. This request was refused; nothing was started twice.", "warning");
+			return { ok: false, note: "a compaction is already running" };
+		}
 		compactionInFlight = true;
 		let answer: any;
 		try {
@@ -8945,6 +10429,9 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 
 		async function handleCompaction(event: any, ctx: any, preparationOverride?: any) {
 		const cfg = loadConfig();
+		// Before any stub is written into the summariser input: the numbers must be the session's own, so a
+		// `full: #47` that survives into the summary still means the same call an hour later.
+		refreshOrdinals(ctx, cfg.elision);
 		// Who asked for this compaction: the watcher (auto) or the user (manual). A manual run always
 		// clears the pause, successful or not - it is the user proving the trigger works again.
 		// pi names its own reasons: the pre-request threshold check and the overflow recovery are both
@@ -9096,9 +10583,14 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		lastLandingInfo = {
 			ref: r.ref, trigger, seconds: r.seconds, measured: r.measured, min: r.min, target: (r as any).target,
 			max: r.max, words: r.words, via: (r as any).via, before: realContextTokens(ctx),
+			// What the summary request actually cost at the engine, and the point the compaction fired from.
+			// Both belong on the closing row now (2026-11-01): the row reads "N tok in - N tok out" and
+			// "triggered at N tok", and neither figure was carried this far before.
+			input: (r as any).input, output: (r as any).output, triggeredAt: lastTriggerContextFill || undefined,
 			window: (ctx as any)?.model?.contextWindow ?? 0, reason: event.reason,
 			// Every candidate that was tried and lost, on the row that says the compaction landed.
 			failures: lastRotationFailures, quoted: Number((lastSummaryQuote as any)?.quoted ?? 0), given: Number((lastSummaryQuote as any)?.given ?? 0),
+			carried: Number((lastSummaryQuote as any)?.carried ?? 0), matchable: Number((lastSummaryQuote as any)?.matchable ?? 0),
 		};
 		} catch (figErr: any) {
 			// The summary is already written. A lost figure must cost a figure, not the compaction: on
@@ -9128,6 +10620,53 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	}
 
 	// -------------------------------------------------------------- command line verbs
+	// THE RECALL TOOL. A stub says what was removed and gives a number; this is how the model gets the
+	// original back. It reads the session BRANCH, so it answers for results the sweep elided and for results a
+	// compaction has long since hidden from the context - the originals never leave the session file, because
+	// nothing here rewrites them.
+	//
+	// The response is budgeted (elision.recallMaxChars) and paged. An unbounded recall tool is the classic
+	// mistake in this design: it puts 187,402 characters straight back into the window that elision just
+	// cleared, and the extension ends up costing more than it saves.
+	if (loadConfig().elision.recallTool) {
+		pi.registerTool({
+			name: "recall_tool_result",
+			label: "Recall tool result",
+			description:
+				"Read back a tool result that the harness truncated. A truncated result appears in the context as " +
+				"[187,402 chars of tool call result truncated. read the result with recall_tool_result: #47. last 200 chars: \"...\"]. Pass 47 as n. " +
+				"Nothing failed and nothing was lost: the call ran, the answer was read, and only the bulk was removed to save room. " +
+				"Long results come back in parts - the answer says where it stopped, pass that number as from for the next part.",
+			parameters: Type.Object({
+				n: Type.Number({ description: "The number shown after `recall_tool_result: #` in the truncated stub" }),
+				from: Type.Optional(Type.Number({ description: "Skip this many characters of the original first. Default 0." })),
+			}),
+			async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
+				const el = loadConfig().elision;
+				const say = (text: string) => ({ content: [{ type: "text", text }], details: {} });
+				if (!el.recallTool) return say("Recall is switched off (Compaction settings > Recall tool on/off).");
+				// Counted with pointers on even when the operator switched the pointer off: the numbers in a stub
+				// written earlier still have to resolve.
+				refreshOrdinals(ctx, { ...el, recallPointer: true });
+				const n = Math.round(Number(params?.n ?? NaN));
+				if (!Number.isFinite(n) || n < 1) return say("Give the number shown after `recall_tool_result: #` in the stub, for example 47.");
+				const hit = recalledResultByOrdinal(n);
+				if (!hit) {
+					// Loud and specific, because "not found" that says nothing sends the model off guessing.
+					const top = ordinalsByCallId.size;
+					return say(`There is no tool result #${n} in this session. Available tool calls in this session are numbered ${top > 0 ? `1 to ${top}` : "not at all yet"}.`);
+				}
+				const from = Math.max(0, Math.round(Number(params?.from ?? 0)) || 0);
+				if (from >= hit.text.length) return say(`#${n} (${hit.toolName}) has ${fmt(hit.total)} chars in total, so from=${fmt(from)} is past its end. Use from=0.`);
+				const cap = Math.max(200, el.recallMaxChars);
+				const body = hit.text.slice(from, from + cap);
+				const end = from + body.length;
+				const more = end < hit.text.length ? `\n[continued: call recall_tool_result with n=${n}, from=${end}]` : "";
+				return say(`[${hit.toolName} result #${n}: characters ${fmt(from + 1)}-${fmt(end)} of ${fmt(hit.total)}]\n${body}${more}`);
+			},
+		});
+	}
+
 	pi.registerCommand("compact-plus", {
 		description: "Choose which models write compaction summaries (no argument opens the menu)",
 		handler: async (args: string, ctx: Ctx) => {
@@ -9182,9 +10721,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						rotateRemove(parts.slice(2).join("/"));
 						return say(`Removed. List: ${rotationText(loadConfig(), ctx)}`);
 					}
-					const ref = parts.slice(1).join("/");
-					rotateAdd(ref);
-					return say(`Added at the end with default options: ${rotationText(loadConfig(), ctx)}`);
+					// Same grammar as the menu's "add by name": a ref goes in as a model, a bare piece of a
+					// name goes in as a pattern that any matching model will use.
+					const res = addEntryByName(ctx, parts.slice(1).join(" "));
+					if (!res.ok) return say(`Not added: ${res.whyNot}. List: ${rotationText(loadConfig(), ctx)}`);
+					return say(`Added at the end as a ${res.kind}: ${res.ref}. List: ${rotationText(loadConfig(), ctx)}`);
 				}
 				case "move": {
 					if (!parts[1]) return say("Use: move <provider/model> <up|down|number>");
@@ -9196,11 +10737,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				}
 				case "options": {
 					const ref = refArg(parts);
-					if (!ref) return say("Use: options <provider/model> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [inputstubs on|off] [argcap <0-1000|full>] [stubs <verbatim|detailed|summary|brief>] [user <..>] [replies <..>] [thought <..>] [chain <fold|attach|skip>] [tag on|off]");
+					if (!ref) return say("Use: options <provider/model> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [stubs <verbatim|detailed|summary|brief>] [user <..>] [replies <..>] [thought <..>] [chain <fold|attach|skip>] [tag on|off]   (summariser input and arg cap are global elision settings now: /compact-plus elision)");
 					if (parts.length === 2) {
 						const model = lookupRef(ref, ctx);
 						const o = optionsFor(loadConfig(), ref, model);
-						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${fmt(o.summaryAimTokens)} tok, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, input ${o.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o.argCap)}), keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
+						return say(`${ref}: thinking ${o.thinking}, timeout ${timeoutLabel(o.timeoutMs)}, summary aim ${fmt(o.summaryAimTokens)} tok, limits min ${fmt(o.summaryMinTokens)} / max ${fmt(o.summaryMaxTokens)} tok, keeps: stubs ${o.preserveStubs} / user ${o.preserveUser} / replies ${o.preserveReplies} / thought ${o.preserveThinking}, chain ${o.chainMode}, tag ${o.noThinkMarker || "(empty)"}`);
 					}
 					const patch: Partial<ModelOptions> = {};
 					for (let i = 2; i < parts.length; i += 2) {
@@ -9213,8 +10754,6 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						else if (key === "min") patch.summaryMinTokens = clamp(Math.round(Number(value)), 0, 1_000_000);
 						else if (key === "max") patch.summaryMaxTokens = clamp(Math.round(Number(value)), 1, 1_000_000);
 						
-						else if (key === "inputstubs") patch.inputStubs = value === "on";
-						else if (key === "argcap") patch.argCap = parseCharCap(value, 500);
 						else if (key === "stubs" && isPreserve(value)) patch.preserveStubs = value;
 						else if (key === "user" && isPreserve(value)) patch.preserveUser = value;
 						else if (key === "replies" && isPreserve(value)) patch.preserveReplies = value;
@@ -9223,30 +10762,54 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						else if (key === "tag") patch.noThinkMarker = value === "on" ? DEFAULT_NO_THINK_TAG : "";
 					}
 					if (!Object.keys(patch).length) return say("Nothing to change. See: /compact-plus options <provider/model>");
-					// Adding options for a model not yet in the list selects it as well.
-					if (!loadConfig().models[ref]) rotateAdd(ref);
+					// Adding options for a model not yet in the list selects it as well - unless the list is
+					// full, which is said rather than swallowed.
+					if (!loadConfig().models[ref] && !rotateAdd(ref)) return say(`Not changed: the list is full (${MAX_SLOTS} places), and options only exist for models in it.`);
 					setModelOptions(ref, patch);
 					const o2 = optionsFor(loadConfig(), ref, lookupRef(ref, ctx));
-					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${fmt(o2.summaryAimTokens)} tok, limits min ${fmt(o2.summaryMinTokens)} / max ${fmt(o2.summaryMaxTokens)} tok, input ${o2.inputStubs ? "stubs" : "raw"} (arg cap ${charCapLabel(o2.argCap)}), keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
+					return say(`${ref}: thinking ${o2.thinking}, timeout ${timeoutLabel(o2.timeoutMs)}, summary aim ${fmt(o2.summaryAimTokens)} tok, limits min ${fmt(o2.summaryMinTokens)} / max ${fmt(o2.summaryMaxTokens)} tok, keeps: stubs ${o2.preserveStubs} / user ${o2.preserveUser} / replies ${o2.preserveReplies} / thought ${o2.preserveThinking}, chain ${o2.chainMode}, tag ${o2.noThinkMarker || "(empty)"}`);
+				}
+				case "thinking-input": {
+					const v = (parts[1] ?? "").toLowerCase();
+					if (v !== "on" && v !== "off") return say(`Assistant thinking in the summary input is ${loadConfig().thinkingToSummariser ? "ON (the summariser reads it)" : "OFF (the summariser does not see it)"}. Use: /compact-plus thinking-input on|off. Either way nothing is deleted from the session file - this only decides what rides into the summary request.`);
+					update((c) => void (c.thinkingToSummariser = v === "on"));
+					return say(`Assistant thinking ${v === "on" ? "IS sent to the summariser (full fidelity: the summary is built from the reasoning too)" : "is NOT sent to the summariser (a much smaller summary request; on a thinking-heavy session this is the largest single saving)"}.`);
 				}
 				case "elision": {
 					const sub = (parts[1] ?? "").toLowerCase();
 					const setEl = (patch: Partial<ElisionConfig>) => update((c) => void (c.elision = { ...c.elision, ...patch }));
 					if (!sub) {
 						const e = loadConfig().elision;
-						return say(`Elision: ${e.enabled ? "ON" : "OFF"} · start ${e.softPercent}% of window · protect ${fmt(e.protectRecentTokens)} tok · stub tail ${charCapLabel(e.stubTailChars)} chars · min batch savings ${fmt(e.minSavingsTokens)} tok / ${e.minResultsToStub} results · stop gap ${fmt(e.stopGapTokens)} tok.  (elision on|off|start <1-99>|tail <0..1000|full>|protect <tokens>|savings <tokens>|stop <tokens>|results <1-50>)`);
+						return say(`Elision: auto ${e.enabled ? "ON" : "OFF"} (live session) · compaction ${e.compactEnabled ? "ON" : "OFF"} (what the summariser reads) · elide results over ${fmt(e.stubFromChars)} chars · start ${e.softPercent}% of window · protect ${fmt(e.protectRecentTokens)} tok · stub tail ${charCapLabel(e.stubTailChars)} chars · min batch savings ${fmt(e.minSavingsTokens)} tok / ${e.minResultsToStub} results · stop gap ${fmt(e.stopGapTokens)} tok.  (elision on|off|release|recall on|off|pointer on|off|recallmax <chars>|auto on|off|compact on|off|from <chars>|argcap <chars|full>|start <1-99>|tail <0..1000|full>|protect <tokens>|savings <tokens>|stop <tokens>|results <1-50>)`);
+					}
+					if (sub === "release") return say(releaseAppliedStubs(ctx as Ctx).text);
+					if (sub === "recall" && (parts[2] === "on" || parts[2] === "off")) {
+						setEl({ recallTool: parts[2] === "on" });
+						return say(`Recall tool ${parts[2]} - pi offers or drops the tool on the next reload, because tools are declared when pi starts.`);
+					}
+					if (sub === "pointer" && (parts[2] === "on" || parts[2] === "off")) {
+						setEl({ recallPointer: parts[2] === "on" });
+						return say(`Stubs will ${parts[2] === "on" ? "carry" : "not carry"} the full: #N pointer.`);
+					}
+					if (sub === "recallmax" && parts[2] && Number.isFinite(Number(parts[2]))) {
+						setEl({ recallMaxChars: clamp(Math.round(Number(parts[2])), 500, 200_000) });
+						return say(`One recall response returns at most ${fmt(loadConfig().elision.recallMaxChars)} chars, then the model asks for the next part.`);
 					}
 					if (sub === "on") { setEl({ enabled: true }); resetElisionBreaker(); }
 					else if (sub === "off") { setEl({ enabled: false }); resetElisionBreaker(); }
+					else if (sub === "auto" && (parts[2] === "on" || parts[2] === "off")) { setEl({ enabled: parts[2] === "on" }); resetElisionBreaker(); }
+					else if (sub === "compact" && (parts[2] === "on" || parts[2] === "off")) setEl({ compactEnabled: parts[2] === "on" });
+					else if (sub === "from" && Number.isFinite(Number(parts[2]))) setEl({ stubFromChars: clamp(Math.round(Number(parts[2])), 0, 1_000_000) });
+					else if (sub === "argcap" && (parts[2] === "full" || Number.isFinite(Number(parts[2])))) setEl({ argCap: parseCharCap(parts[2] ?? "", ELISION_DEFAULTS.argCap) });
 					else if (sub === "start" && Number.isFinite(Number(parts[2]))) setEl({ softPercent: clamp(Math.round(Number(parts[2])), 1, 99) });
 					else if (sub === "tail") setEl({ stubTailChars: parseCharCap(parts[2] ?? "", ELISION_DEFAULTS.stubTailChars) });
 					else if (sub === "protect" && Number.isFinite(Number(parts[2]))) setEl({ protectRecentTokens: clamp(Math.round(Number(parts[2])), 0, 1_000_000) });
 					else if (sub === "savings" && Number.isFinite(Number(parts[2]))) setEl({ minSavingsTokens: clamp(Math.round(Number(parts[2])), 0, 100_000) });
 					else if (sub === "stop" && Number.isFinite(Number(parts[2]))) setEl({ stopGapTokens: clamp(Math.round(Number(parts[2])), 0, 100_000) });
 					else if (sub === "results" && Number.isFinite(Number(parts[2]))) setEl({ minResultsToStub: clamp(Math.round(Number(parts[2])), 1, 50) });
-					else return say("Use: elision [on|off] [start <1-99>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>] [stop <tokens>] [results <1-50>]");
+					else return say("Use: elision [on|off] [release] [recall on|off] [pointer on|off] [recallmax <chars>] [auto <on|off>] [compact <on|off>] [from <chars>] [argcap <chars|full>] [start <1-99>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>] [stop <tokens>] [results <1-50>]");
 					const e = loadConfig().elision;
-					return say(`Elision: ${e.enabled ? "ON" : "OFF"} · start ${e.softPercent}% · protect ${fmt(e.protectRecentTokens)} tok · stub tail ${charCapLabel(e.stubTailChars)} · min savings ${fmt(e.minSavingsTokens)} tok · min batch ${e.minResultsToStub} results · stop gap ${fmt(e.stopGapTokens)} tok`);
+					return say(`Elision: auto ${e.enabled ? "ON" : "OFF"} · compaction ${e.compactEnabled ? "ON" : "OFF"} · elide results from ${fmt(e.stubFromChars)} chars · arg cap ${charCapLabel(e.argCap)} · start ${e.softPercent}% · protect ${fmt(e.protectRecentTokens)} tok · stub tail ${charCapLabel(e.stubTailChars)} · min savings ${fmt(e.minSavingsTokens)} tok · min batch ${e.minResultsToStub} results · stop gap ${fmt(e.stopGapTokens)} tok`);
 				}
 				case "retries": {
 					const n = Number(parts[1]);
@@ -9303,7 +10866,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 						const kept = msgs.slice(-2);
 						const region = msgs.slice(0, -2);
 						const prevTurn = readPrevTurnInfo(ctx, {});
-						const main = serializeRegion(region, { startTurn: prevTurn.lastTurn, inputStubs: profile.inputStubs, argCap: profile.argCap });
+						const main = serializeRegion(region, { startTurn: prevTurn.lastTurn, inputStubs: compactStubsOn(), argCap: elisionArgCap() });
 						const keptText = kept.map((m: any) => `[${String(m.role)} - kept]: ${contentTextOf(m.content).slice(0, 200)}`).join("\n");
 						const inputTokens = Math.ceil((main.text.length * 1.3) / 4) + SUMMARISER_FRAMING_TOKENS;
 						const sizes = sizesFor(profile, { inputTokens, historyTokens: inputTokens, headroom: 0, overflow: false, windowTokens: ctx?.model?.contextWindow ?? 0 }, 0);
@@ -9346,7 +10909,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 					return say("The old words are gone. Use: /compact-plus options <provider/model> [...] — or open the menu with no argument. New: elision [on|off] [start <50-95>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>].");
 				default:
 					return say(
-						"Use /compact-plus with no argument for the menu, or:\nstatus | on | off | models [add <ref> | remove <ref>] | move <ref> <up|down|n>\noptions <ref> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [inputstubs on|off] [argcap <0-1000|full>] [stubs|user|replies|thought <verbatim|detailed|summary|brief>] [chain <fold|attach|skip>] [tag on|off]\nelision [on|off] [start <50-95>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>]\nretries <0-5> [sec] | marker <text|clear> | instruction [text | reset] | log",
+						"Use /compact-plus with no argument for the menu, or:\nstatus | on | off | models [add <ref> | remove <ref>] | move <ref> <up|down|n>\noptions <ref> [thinking <lvl>] [timeout <min|0>] [aim <1-99%>] [min <tokens>] [max <tokens>] [stubs|user|replies|thought <verbatim|detailed|summary|brief>] [chain <fold|attach|skip>] [tag on|off]\nelision [on|off] [auto <on|off>] [compact <on|off>] [from <chars>] [argcap <chars|full>] [start <50-95>] [tail <0..1000|full>] [protect <tokens>] [savings <tokens>]\nthinking-input on|off\nretries <0-5> [sec] | marker <text|clear> | instruction [text | reset] | log",
 					);
 			}
 		},
