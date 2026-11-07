@@ -8485,7 +8485,14 @@ async function runBoard(ctx: Ctx): Promise<void> {
 		}
 		if (result.action?.startsWith("edit-number:")) {
 			const id = result.action.slice("edit-number:".length);
-			await editNumber(ctx, id);
+			const needReload = await editNumber(ctx, id);
+			if (needReload === "reload") {
+				// Last thing this ctx ever does. Nothing may follow a reload - not even a return into the loop.
+				void Promise.resolve((ctx as any)?.reload?.()).catch(() => undefined);
+				return;
+			}
+			// Answering Escape on the confirm, or cancelling the number box, lands here too: the submenu
+			// simply reopens with nothing changed.
 			// Return to the submenu the row lives in (the scaling/elision rows moved into submenus).
 			if (id === "reserveTok" || id === "preserveTok") restore = { compactionMenu: true };
 			else if (id.startsWith("elision")) restore = { elisionMenu: true };
@@ -8754,9 +8761,31 @@ const NUMBER_EDITORS: Record<string, { title: string; lo: number; hi: number; un
 	retries: { title: "Retries per model", lo: 0, hi: 99, unit: "tries (0 = no retries)", def: 2, apply: (v) => { update((c) => void (c.retries = v)); return undefined; } },
 };
 
-async function editNumber(ctx: Ctx, id: string): Promise<void> {
+/** The two rows whose number lives in pi's settings.json rather than in this extension's own file. */
+const PI_FILE_NUMBER_ROWS = new Set(["reserveTok", "preserveTok"]);
+
+async function editNumber(ctx: Ctx, id: string): Promise<"reload" | undefined> {
 	const d = NUMBER_EDITORS[id];
 	if (!d) return;
+	// ASK BEFORE TAKING THE NUMBER (2026-11-07, on request). These two numbers sit in pi's settings.json,
+	// which pi reads once when it starts, so saving one only takes effect when pi reloads - and a reload
+	// closes this screen and restarts the extension. Nobody should discover that afterwards. The board has
+	// already closed by the time this runs (the row exits with `__exit:edit-number:`), so a modal dialog is
+	// safe here; opening one over a mounted list is what the 2026-10-07 focus bug was.
+	if (PI_FILE_NUMBER_ROWS.has(id)) {
+		let yes = false;
+		try {
+			yes = (await ctx.ui?.confirm?.(
+				`${d.title} - change it?`,
+				"This number is stored in pi's settings.json, and pi reads that file once when it starts. " +
+				"Saving it makes pi reload itself: this screen closes and the extension restarts. " +
+				"Enter = change it, Escape = keep the current number and go back.",
+			)) === true;
+		} catch {
+			yes = false;
+		}
+		if (!yes) return undefined;
+	}
 	const cfg = loadConfig();
 	const current =
 		id === "retryWait" ? cfg.retryDelaySeconds
@@ -8786,17 +8815,16 @@ async function editNumber(ctx: Ctx, id: string): Promise<void> {
 	// asks pi to reload itself - which is safe at exactly this moment, because the operator pressed Enter on
 	// a settings row, so the session is idle. Where pi cannot reload itself from here, it says so plainly
 	// instead of leaving a number that looks saved and is not.
-	if (id === "reserveTok" || id === "preserveTok") {
+	if (PI_FILE_NUMBER_ROWS.has(id)) {
 		const pi = readPiCompactionSettings();
-		const where = `pi's settings.json (${fmt(pi.reserveTokens)} tok of room, ${fmt(pi.keepRecentTokens)} tok kept word for word)`;
-		const reload = (ctx as any)?.reload;
-		if (typeof reload === "function") {
-			ctx.ui?.notify?.(`Saved in ${where}. Reloading pi now so the number takes effect.`, "info");
-			void Promise.resolve(reload.call(ctx)).catch(() => undefined);
-		} else {
-			ctx.ui?.notify?.(`Saved in ${where}, but pi cannot reload itself from this screen - run /reload (or restart pi) for it to take effect.`, "warning");
-		}
+		ctx.ui?.notify?.(`Saved in pi's settings.json (${fmt(pi.reserveTokens)} tok of room, ${fmt(pi.keepRecentTokens)} tok kept word for word). pi reloads now.`, "info");
+		// The caller does the reload, after this screen has fully closed. Doing it HERE was the bug: pi
+		// invalidates this ctx the moment reload starts (runner.js: invalidate), while the board loop was
+		// still running on it - the loop reopened a screen on dead context, the command never returned, and
+		// /compact-plus did nothing until pi was restarted (2026-11-07, reported).
+		return "reload";
 	}
+	return undefined;
 }
 
 /**
