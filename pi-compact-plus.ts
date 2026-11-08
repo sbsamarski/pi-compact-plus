@@ -1530,6 +1530,11 @@ const LOG_CHATTER = new Set(["user_prompts", // one per candidate that passed it
 	// stay in the file - if COMPACTED is ever missing, `done` proves the summary existed.
 	"done",
 	"accepted_with_warnings",
+	// WHAT THE LANDING BOUGHT, measured after pi rebuilt the context. It stays in the file (it is the row
+	// that proves a resume compaction actually shrank anything) but it is not a screen message: it can arrive
+	// many minutes after the compaction it describes, at the next settle boundary, where it reads like an
+	// unrelated error (2026-11-08: a landing at 21:44 printed its LANDED_SIZE row at 22:10).
+	"landed_size",
 	// Nothing writes these any more (the automatic continuation was deleted 2026-10-21), but the log file
 	// still holds years of them, and the results-only view must go on hiding them.
 	"auto_resume_waiting",
@@ -9645,7 +9650,7 @@ export function compactionNoticeLines(
 	opts: { before: number; window: number; keepRecent: number; failures: string[]; trigger: string },
 ): string[] {
 	const out: string[] = [];
-	const pct = opts.window > 0 ? Math.round((opts.before / opts.window) * 100) : 0;
+	const pct = opts.window > 0 && opts.before > 0 ? Math.round((opts.before / opts.window) * 100) : 0;
 	out.push(
 		`COMPACTION · ${opts.trigger === "manual" ? "you asked for it" : "automatic"} · summary by ${slotLabel(r.ref, r.model)}` +
 			(r.via === "direct" ? " (direct request)" : "") +
@@ -9657,7 +9662,7 @@ export function compactionNoticeLines(
 			` (accepted ${fmt(r.min)}-${fmt(r.max)})`,
 	);
 	out.push(
-		`COMPACTION · context was ${fmt(opts.before)} of ${fmt(opts.window)} tok (${pct}% full) · newest ${fmt(opts.keepRecent)} tok kept word for word`,
+		`COMPACTION · context was ${opts.before > 0 ? fmt(opts.before) : "not reported"} of ${fmt(opts.window)} tok (${pct}% full) · newest ${fmt(opts.keepRecent)} tok kept word for word`,
 	);
 	for (const f of opts.failures) out.push(`COMPACTION · tried and lost: ${String(f).slice(0, 150)}`);
 	return out;
@@ -10411,15 +10416,17 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		// The closing block on screen, the same one the interrupting route prints. Both routes announce the
 		// opening row; until now only that one route announced the end, so a compaction that landed
 		// without an interrupt left the operator reading a start row and then silence (2026-10-23).
-		announceCompaction(
-			ctx,
-			compactionNoticeLines({ ...lastLandingInfo, summary: c.summary, firstKeptEntryId: c.firstKeptEntryId }, {
-				before: realContextTokens(ctx),
-				window: ctx?.model?.contextWindow ?? 0,
-				keepRecent: extKeepRecent(ctx),
-				failures: lastRotationFailures,
-				trigger: lastLandingInfo?.trigger ?? "auto",
-			}),);
+		// ONE REPORT PER COMPACTION. `handleCompaction` above already announced this run's lines (it is the
+		// same routine the interrupting route uses, and it announces on its way out). This second block used
+		// to print its own copy, built from `lastLandingInfo` and from a context size pi could not report at
+		// that moment - which is where "COMPACTION · context was ? of 458,752 tok (0% full)" came from
+		// (2026-11-08, reported). What this route genuinely has to say is one line: the summary landed without
+		// stopping the turn, and pi cannot show it because pi only draws a compaction it appended itself
+		// (interactive-mode handles `entry_appended`, which `sessionManager.appendCompaction` does not emit).
+		ctx?.ui?.notify?.(
+			`COMPACTION LANDED WITHOUT STOPPING THE TURN · the summary is in the session · pi only draws a compaction it wrote itself, so open 'View the last compaction summary' to read it`,
+			"info",
+		);
 		} catch (reportErr: any) {
 			logLine(cfg, {
 				event: "accepted_with_warnings",
@@ -10612,7 +10619,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		announceCompaction(
 			ctx,
 			compactionNoticeLines(r, {
-				before: realContextTokens(ctx),
+				// What the context measured BEFORE this summary. pi's live figure is the best answer, but it is
+				// null when no request has answered yet in this state - and a null here printed as "context was ?
+				// of 458,752 tok (0% full)" (2026-11-08). pi's own measurement of the session it was about to
+				// summarise is the same quantity and is always present, so it is the fallback rather than zero.
+				before: realContextTokens(ctx) ?? Number(prep?.tokensBefore ?? 0),
 				window: ctx?.model?.contextWindow ?? 0,
 				keepRecent: extKeepRecent(ctx),
 				failures: lastRotationFailures,
