@@ -7149,7 +7149,7 @@ class CompactionMenu implements Component, Focusable {
 				})(),
 				values: [EDIT_NUMBER],
 				description:
-					"Room left free at the top of the window; compaction fires when the context reaches it. Stored in pi's settings.json, so changing it reloads pi.",
+					"Room left free at the top of the window; compaction fires when the context reaches it. Changing it reloads pi.",
 			},
 			{
 				id: "preserveTok",
