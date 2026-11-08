@@ -7123,7 +7123,7 @@ class CompactionMenu implements Component, Focusable {
 				currentValue: cfg.enabled ? "on" : "off",
 				values: ["on", "off"],
 				description:
-					"ON = the plugin writes the summary with the first model in the Compaction models list that answers, and the size check runs on its own (see 'When auto-compaction fires' below). OFF = this extension never compacts, and nothing of it touches pi's settings.",
+					"ON = this extension writes the summary, using the first model in the list that answers. OFF = it never compacts.",
 			},
 			{
 				id: "reserveTok",
@@ -7144,11 +7144,7 @@ class CompactionMenu implements Component, Focusable {
 				})(),
 				values: [EDIT_NUMBER],
 				description:
-					"Compaction fires once the context is this close to the top of the window: the line is the " +
-						"model's context window minus this number. Since 2026-10-25 this IS pi's " +
-						"`compaction.reserveTokens` - the one number pi times itself by and the one this extension reads, " +
-						"so there is no second setting to keep in step. Saving writes it into pi's settings.json, and " +
-						"pi reads that file when it starts, so the row reloads pi afterwards (or says to do it by hand).",
+					"Room left free at the top of the window; compaction fires when the context reaches it. Stored in pi's settings.json, so changing it reloads pi.",
 			},
 			{
 				id: "preserveTok",
@@ -7156,10 +7152,7 @@ class CompactionMenu implements Component, Focusable {
 				currentValue: `${fmt(extKeepRecent(this.ctx))} tok of the context tail kept word for word` + (readPiCompactionSettings().keepRecentTokens !== extKeepRecent(this.ctx) ? ` (pi's ${fmt(readPiCompactionSettings().keepRecentTokens)}; only ${fmt(extKeepRecent(this.ctx))} fits this window)` : ""),
 				values: [EDIT_NUMBER],
 				description:
-					"How much of the recent conversation survives a compaction word for word: pi keeps this much " +
-					"when it picks the cut point, and elision refuses to stub tool results inside it. Since " +
-					"2026-10-25 this IS pi's `compaction.keepRecentTokens`, written into pi's settings.json and read " +
-					"back from there - the extension keeps no copy of its own. Saving reloads pi (or says to).",
+					"How much of the newest context survives a compaction word for word. Stored in pi's settings.json, so changing it reloads pi.",
 			},
 		// pi's own compaction settings are read for information only. This extension never writes
 		// that file: it compacts on its own trigger with its own models, which works whether pi's
@@ -7266,12 +7259,7 @@ class CompactionMenu implements Component, Focusable {
 				})(),
 				values: [],
 				description:
-				"pi's settings.json, read only - this extension never writes it. pi asks when the context " +
-				"passes window minus reserveTokens, and since 2026-10-22 this extension's own timer is the " +
-				"trigger, so pi is the alarm: its reserveTokens should be SMALLER than the reserve above, " +
-				"which puts the alarm above the line where compaction actually happens. If an alarm still " +
-				"arrives below the line, the gate holds it (the context is not full yet), the hold is logged, " +
-				"and pi reads the file again on /reload.",
+				"pi's own alarm, read from its reserveTokens. pi only rings it as a back-up; this extension's own check is the trigger.",
 			},
 			numberRow("chatCap", "Chat max_tokens cap", cfg.chatMaxTokensCap > 0 ? fmt(cfg.chatMaxTokensCap) : "no cap", ["no cap"], "Caps the generation permission (max_tokens) on every CHAT request. pi sizes it as window minus its context estimate minus 4,096 - on big-window models that asks for absurd room (943k on glm-flash) and the whole request is rejected whenever the estimate undercounts by more than 4,096 tokens (the overflow that forced the emergency compactions). With a cap the request always fits until the real context reaches window minus cap. Enter opens a free numeric entry (0 = no cap); cycling reaches 'no cap'. Default 65,536."),
 		];
@@ -7568,7 +7556,7 @@ export class CompactionBoard implements Component, Focusable {
 					else done(action);
 				}) as unknown as Component,
 			description:
-				"THE COMPACTION SWITCHES. ONE compactor is ever on: turning this extension's compaction on turns pi's own compaction off, and the other way round; both can be off, then nothing compacts. Elision has its own submenu and runs whichever compactor is picked. pi's switch is a file on disk, so changing it does nothing until you /reload.",
+				"Switches, the trigger point, the preserved tail, the summary sizes and the content rules.",
 		});
 			rows.push({
 			id: "order",
@@ -7583,7 +7571,7 @@ export class CompactionBoard implements Component, Focusable {
 					MODEL_KEEP_ROWS,
 				) as unknown as Component,
 			description:
-				`The models that write the summary, first one first - up to ${MAX_SLOTS} of them. In the list: type to filter; on a listed model a digit moves it to that place (0 = last) and Space takes it out; Enter opens its options. Press + to ADD BY NAME: an exact provider/model for one model, or a part of a name such as "qwen3.8-flash-next" for a NAME PATTERN that every model with those characters in its name will use - one entry for a whole family of variants. Models that are not listed show the shared settings, which are what they would be asked with.`,
+				"The models that write the summary, first one first. Enter opens the list; + adds one by name or by part of a name.",
 		});
 		rows.push({
 			id: "elisionMenu",
@@ -7596,7 +7584,7 @@ export class CompactionBoard implements Component, Focusable {
 					done(action);
 				}) as unknown as Component,
 			description:
-				"Old tool results are replaced by short stubs in the requests the model receives, so the context stays much lower for much longer; your screen and the session file always keep the originals. The submenu holds the on/off toggle and all six settings. Enter opens it; Enter on a setting opens its editor (over the plain chat, with the position restored afterwards).",
+				"Stub old tool results on the wire so the context grows more slowly. The session file keeps the originals.",
 		});
 		rows.push({
 			id: "runNow",
@@ -7613,9 +7601,7 @@ export class CompactionBoard implements Component, Focusable {
 					{ enableSearch: false },
 				) as unknown as Component,
 			description:
-				"Four actions that ignore the schedules and run this second: an elision sweep, a compaction" +
-				" (the extension's rotation), the same compaction WITHOUT stopping the session, and pi's own" +
-				" built-in compaction once. The board closes so you can watch the result.",
+				"Run something this second, ignoring the schedules: an elision sweep, a compaction, or pi's own compaction.",
 		});
 		rows.push({
 			id: "lastSummary",
@@ -7623,11 +7609,7 @@ export class CompactionBoard implements Component, Focusable {
 			currentValue: "Read the summary that is now the session's memory",
 			values: ["Read the summary that is now the session's memory"],
 			description:
-				"Opens the summary the last compaction wrote, exactly as it stands in the session file, with the " +
-				"facts of that run above it: the exact time, which model wrote it, how long it took, the tokens the " +
-				"summariser read and wrote, the size it was asked for, how full the context was and which entry the " +
-				"word-for-word tail starts at. Read-only - editing it changes nothing. This is the row to use after an " +
-				"automatic compaction, when the screen still shows the older context.",
+				"Opens the summary the last compaction wrote, with the facts of that run above it. Read-only.",
 		});
 		rows.push({
 			id: "instruction",
@@ -7645,7 +7627,7 @@ export class CompactionBoard implements Component, Focusable {
 					this.restore?.templateKey,
 				) as unknown as Component,
 			description:
-				"THE SUMMARY TEMPLATE - the exact text the summarizer reads (after the size block). It contains {PLACEHOLDER} tokens the extension substitutes per model: {TOOL CALLS SUMMARY}, {USER PROMPT SUMMARY}, {ASSISTANT REPLIES SUMMARY}, {ASSISTANT THINKING SUMMARY}, {STUB EXAMPLE RULE}, {PREVIOUS SUMMARY RULE}, {PREVIOUS SUMMARY SECTION}. DO NOT reword or delete the {TOKENS} - each is replaced by the per-model option sentence (the editable wording of every token lives in the Category templates screen just below); a deleted token is auto-added at the end with a note. Everything else you write is sent word for word. Enter opens the template submenu: your template library (any number of saved templates, one of them made active), read-only previews of the active / user / extension template, and the resets (each asks first).",
+				"The text the summarizer reads, with {TOKENS} the extension fills in per model. Enter opens the editor.",
 		});
 		rows.push({
 			id: "catDesc",
@@ -7663,7 +7645,7 @@ export class CompactionBoard implements Component, Focusable {
 					this.restore?.catDesc?.level,
 				) as unknown as Component,
 			description:
-				"THE 4 x 4 CATEGORY TEMPLATES - each content category (Tool calls / User prompts / Assistant replies / Assistant thinking) has its OWN editable sentence for EACH level (verbatim / detailed / summary / brief). Enter opens the categories; Enter on a category opens its four sentences; Enter on a sentence opens the editor; Ctrl+R on a sentence resets it to the built-in default (asks here in the screen: Enter confirms, Escape cancels). These substitute into the template's {TOOL CALLS SUMMARY} / {USER PROMPT SUMMARY} / {ASSISTANT REPLIES SUMMARY} / {ASSISTANT THINKING SUMMARY} tokens for EVERY model - each model's combination is visible in its own Preview final description row.",
+				"The editable sentence behind each {TOKEN}, one per category and per level. Enter opens the categories.",
 		});
 		rows.push({
 			id: "log",
@@ -7685,7 +7667,7 @@ export class CompactionBoard implements Component, Focusable {
 			currentValue: "Run the elision now",
 			values: ["Run the elision now"],
 			description:
-			"Runs an elision sweep RIGHT NOW, regardless of the start percentage and the batch thresholds: every tool result outside the preserved tail becomes a stub (the board closes, the stubs persist in the session state, and the next request carries them). Use it when you can see the context climbing and do not want to wait for the sweep to accumulate candidates.",
+			"Sweep now, whatever the schedules say: results outside the preserved tail become stubs.",
 		});
 		items.push({
 			id: "compactNow",
@@ -7693,7 +7675,7 @@ export class CompactionBoard implements Component, Focusable {
 			currentValue: "Run the compaction now",
 			values: ["Run the compaction now"],
 			description:
-				"Starts a compaction RIGHT NOW: pi prepares the session and the Compaction models rotation answers it (the board closes so you can watch the progress). The automatic starter lives in the Auto-compaction submenu's trigger point - when the ctx crosses it while pi is idle, the same compaction starts by itself.",
+				"Compact now with the model rotation. The board closes so you can watch the progress.",
 		});
 		items.push({
 			id: "compactNowResume",
@@ -7701,11 +7683,7 @@ export class CompactionBoard implements Component, Focusable {
 			currentValue: "Run the compaction, keep the turn going",
 			values: ["Run the compaction, keep the turn going"],
 			description:
-				"Same rotation as the row above, but the summary is written at a safe point WITHOUT stopping the " +
-				"turn: the session goes on by itself on the short history, so you can leave the machine and come " +
-				"back to a running session. Use this when you want the room cleared and the work to continue; use " +
-				"the row above when you want the session to stop and wait for you. If no safe point can be used it " +
-				"says so and writes nothing - the ordinary row is right above it.",
+				"Compact now without stopping the turn: the session continues on the short history.",
 		});
 		items.push({
 			id: "compactStock",
@@ -7713,7 +7691,7 @@ export class CompactionBoard implements Component, Focusable {
 			currentValue: `Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`,
 			values: [`Run pi's built-in compaction (pi aims for summary size of 0.8 x reserveTokens = ${fmt(Math.floor(readPiReserveTokens() * 0.8))} tok)`],
 			description:
-				"Runs pi's OWN compaction once, bypassing the rotation: pi prepares the session and summarizes with the active model, aiming at 0.8 x its reserveTokens (the number on the right). Use it to compare pi's stock summary with the extension's. Everything else (the rotation, the gates) stays in place for the next compaction.",
+				"Run pi's own compaction once, with pi's model and prompt, so you can compare it with ours.",
 		});
 		return items;
 	}
