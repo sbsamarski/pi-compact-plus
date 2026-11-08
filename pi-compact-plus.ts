@@ -5726,7 +5726,7 @@ export class OrderList implements Component, Focusable {
 				label: `${place >= 0 ? `[${place + 1}]` : "   "} by name: ${patternNeedle(ref)}`,
 				currentValue: modelRowValue(cfg, ref, rep, reserveTokens),
 				description:
-					"A NAME PATTERN: every model whose name contains this text - at the start, middle or end - is asked with THESE settings, and this row is tried in this place of the order. Enter opens the settings the matching models use. Space removes the pattern. Digits move it in the try order. A model that also has its own exact entry in the list uses that entry instead: exact always beats a pattern.",
+					"A name pattern: every model whose name contains this text is asked with these settings, tried in this place of the order.",
 			};
 		}
 		return {
@@ -5784,7 +5784,7 @@ export function modelOptionsScreen(
 			// element and the row looked stuck. The ladder now uses the same words the row shows (none, minimal,
 			// low, medium, high, xhigh, max); the handler maps "none" back to the stored "off".
 			values: withCurrent(levels.map((l) => thinkingWord(l)), thinkingWord(o.thinking)),
-			description: `Enter/Space cycles: ${levels.join(" → ")}. Private reasoning before it writes - it costs time, it does not make the summary longer. "off" also writes the no-think tag (row below) into the request for local models. A level the model does not have falls back to the nearest it has.`,
+			description: `Enter/Space cycles: ${levels.join(" → ")}. Private reasoning before it writes; it costs time, not length.`,
 		});
 		rows.push({
 			id: "timeout",
@@ -5792,7 +5792,7 @@ export function modelOptionsScreen(
 			currentValue: timeoutLabel(o.timeoutMs),
 			values: [EDIT_NUMBER, "unlimited"],
 			description:
-				"Enter opens a free numeric entry in minutes (0 = unlimited); cycling reaches 'unlimited'. This is how long to wait with NOTHING arriving: every character that comes in restarts the clock, so a model that keeps writing keeps its request however slow it is. A second ceiling nobody sets - twice what this model's last measured speed says the summary should take, never under 20 minutes, never over 2 hours - stops a stream that produces forever. When either one fires the next model in the Compaction models list is asked, and the log says which clock it was.",
+				"How long to wait with nothing arriving, in minutes; every character received restarts the clock. 0 = unlimited.",
 		});
 		rows.push({
 			id: "summaryAim",
@@ -5800,7 +5800,7 @@ export function modelOptionsScreen(
 			currentValue: `${fmt(o.summaryAimTokens)} tok`,
 			values: [EDIT_NUMBER],
 			description:
-				"HOW LONG the summary should be, in tokens - a number of your own, not a share of a window that moves with every model switch. It is still clamped on the right is what this percent aims for right now (example: ctx 441k, preserve 100k, region 341k; 15% aims 51,150 tok). The acceptance bounds are the min/max rows below. Enter opens a free numeric entry (1-99). Default 10.",
+				"How long the summary should be, in tokens. Enter a number.",
 		});
 		rows.push({
 			id: "summaryMin",
@@ -5808,7 +5808,7 @@ export function modelOptionsScreen(
 			currentValue: `${fmt(o.summaryMinTokens)} tok (absolute floor)`,
 			values: [EDIT_NUMBER],
 			description:
-				"THE ACCEPTANCE MINIMUM: a summary shorter than this is thrown away and the next model is asked. Percent of the model's ctx window, so it scales when you switch models - the value on the right is what it is right now. Never rises above the max, and yields to it on tiny regions. Enter opens a free numeric entry (1-99). Default 5.",
+				"The acceptance minimum: a shorter summary is thrown away and the next model is asked. Enter a number of tokens.",
 		});
 		rows.push({
 			id: "summaryMax",
@@ -5816,7 +5816,7 @@ export function modelOptionsScreen(
 			currentValue: `${fmt(o.summaryMaxTokens)} tok (absolute ceiling)`,
 			values: [EDIT_NUMBER],
 			description:
-				"Upper clamp on the summary aim - generation-time guard (a 968k region at 10% would ask for a 97k summary; the ceiling caps it) and the hard cap on the accepted summary. Free entry. Default 32,768.",
+				"The acceptance ceiling: a longer summary is thrown away too. Enter a number of tokens.",
 		});
 		// "Summarizer input" and "Tool-call arg cap" used to live here, one copy per model. They are
 		// global elision settings now (Elision settings submenu), because what the summariser is allowed to
@@ -5827,7 +5827,7 @@ export function modelOptionsScreen(
 			currentValue: o.preserveStubs,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveStubs),
 			description:
-				`How the summary keeps tool calls. The EXACT sentence the model reads at each level: ${ladderText("stubs", o.preserveStubs)}. Switching this option switches that sentence in the template automatically. Default: verbatim (stubs are already compact).`,
+				`How the summary keeps tool calls. The sentence each level writes: ${ladderText("stubs", o.preserveStubs)}`,
 		});
 		rows.push({
 			id: "preserveuser",
@@ -5835,7 +5835,7 @@ export function modelOptionsScreen(
 			currentValue: o.preserveUser,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveUser),
 			description:
-				`How the summary keeps user prompts. The EXACT sentence the model reads at each level: ${ladderText("user", o.preserveUser)}. Default: verbatim - user feedback and reversals are the first thing a later turn must not lose.`,
+				`How the summary keeps your prompts. The sentence each level writes: ${ladderText("user", o.preserveUser)}`,
 		});
 		rows.push({
 			id: "preservereply",
@@ -5843,7 +5843,7 @@ export function modelOptionsScreen(
 			currentValue: o.preserveReplies,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveReplies),
 			description:
-				`How the summary keeps assistant replies (marked [Assistant] in the input - separate from thinking). The EXACT sentence the model reads at each level: ${ladderText("replies", o.preserveReplies)}. Default: detailed.`,
+				`How the summary keeps [Assistant] replies. The sentence each level writes: ${ladderText("replies", o.preserveReplies)}`,
 		});
 		rows.push({
 			id: "preservethinking",
@@ -5851,7 +5851,7 @@ export function modelOptionsScreen(
 			currentValue: o.preserveThinking,
 			values: withCurrent(PRESERVE_CYCLE, o.preserveThinking),
 			description:
-				`How the summary keeps assistant thinking (marked [Assistant thinking] in the input - separate from replies). The EXACT sentence the model reads at each level: ${ladderText("thinking", o.preserveThinking)}. Default: summary.`,
+				`How the summary keeps [Assistant thinking]. The sentence each level writes: ${ladderText("thinking", o.preserveThinking)}`,
 		});
 		rows.push({
 			id: "chain",
@@ -5859,7 +5859,7 @@ export function modelOptionsScreen(
 			currentValue: o.chainMode,
 			values: withCurrent(["fold", "attach", "skip"] as string[], o.chainMode),
 			description:
-				"What happens to the PREVIOUS compaction's summary. fold (default): the model integrates it and continues its turn numbering - compact but lossy. attach: the new summary must copy the previous summary VERBATIM into a '## PREVIOUS SUMMARY' section - nothing is ever lost between compactions; the size limits are raised by the previous summary's size to make room. skip: drop it - maximum compression, history before the previous compaction ends there.",
+				"What the previous summary becomes: fold = the model rewrites it into the new one; attach = the new one must copy it in full.",
 		});
 		rows.push({
 			id: "previewDesc",
@@ -5867,7 +5867,7 @@ export function modelOptionsScreen(
 			currentValue: "Press enter to preview",
 			values: ["show"],
 			description:
-				"The COMPLETE description THIS model would receive on the next compaction: the size block and the summary template with this model's {TOKENS} substituted (its thinking level, its preserve levels, its chain mode, the category sentences as customized on the board). Read-only preview - nothing is sent; edits in the editor are discarded.",
+				"The complete description this model would receive on the next compaction. Read-only.",
 		});
 		rows.push({
 			id: "nothink",
@@ -5875,7 +5875,7 @@ export function modelOptionsScreen(
 			currentValue: o.noThinkMarker || "(empty)",
 			values: withCurrent([DEFAULT_NO_THINK_TAG, "(empty)"], o.noThinkMarker || "(empty)"),
 			description:
-				"Written into the summary request when thinking is 'off'. Some local chat templates keep thinking switched on no matter what the request says; this tag in the message is what such a template obeys. Empty writes nothing. The pi-wide default tag is set on the board (No-think tag row); this row overrides it for this model only.",
+				"Written into the request when thinking is off; some local chat templates obey this tag rather than the flag. Enter to type it.",
 		});
 		rows.push({
 			id: "sampling",
@@ -5888,7 +5888,7 @@ export function modelOptionsScreen(
 			submenu: (_current: string, done: (selectedValue?: string) => void) =>
 				samplingScreen(ref, () => done(), (flag: string) => done(flag)) as unknown as Component,
 			description:
-				'Extra sampling parameters sent with THIS model\'s compaction request only (your chat requests are never touched): temperature, top_p, top_k, min_p, presence_penalty, repetition_penalty - each a number or "ignore". Enter opens the flags page (Esc comes back); Space cycles here, "ignore all" clears every flag. All flags default to ignore; the Qwen3.8-Flash-Next entry ships with its recommended non-thinking values (temp 0.7, top_p 0.8, top_k 20, min_p 0, presence 1.5, repeat 1.0). Free numeric entry: /compact-plus sampling',
+				"Sampling parameters for this model's summary request only; your chat requests are untouched. Enter opens the six values.",
 		});
 		// 2026-10-06: this screen shows only its own group (thinking, no-think, timeout, sampling). The
 		// compaction rows moved to the boards Compaction settings submenu, which asks for the same rows
@@ -6083,7 +6083,7 @@ class CategoryDescList implements Component, Focusable {
 				label: `${level} · ${layerTag(this.kind, level)}`,
 				currentValue: sentence.length > 56 ? `${sentence.slice(0, 56)}…` : sentence,
 				values: ["edit sentence"],
-				description: `${sentence}\n\nUser default: ${ud === "ext" ? "same as the extension default" : ud === "custom" ? "custom (differs from the extension default)" : "none saved - Ctrl+U falls back to the extension default"}.\n\nEnter = edit (saves as the active sentence; inside the editor submit :extension or :user alone to restart from that default).\nCtrl+S = save as user default.\nCtrl+U = reset to user default.\nCtrl+R = reset to extension default.\nAll three ask first: Enter confirms, Escape cancels.\nThe active sentence substitutes into the template's {${this.token}} token for every model set to ${level}.`,
+				description: `${sentence}\n\nEnter edits it. Ctrl+U clears your own default, Ctrl+R resets to the extension default.`,
 			};
 		});
 		if (this.pending) {
@@ -6440,21 +6440,21 @@ class UserTemplateMenu implements Component, Focusable {
 				label: "View the summary request (template, prompt, session digest)",
 				currentValue: firstRef ? firstRef.split("/").pop() ?? "?" : "no model",
 				values: ["open"],
-				description: "ENTER OPENS IT: the WHOLE text the summarizer gets, exactly as it is sent - the active template with every tag filled in for this session (the size block, the preserve rules), the previous-summary line, the cover line, the conversation region between the tags, and the system prompt that rides above it all. Read-only, nothing is sent. The name on the right is the first model in the compaction try order: it is the one that would be asked, and its settings are what fill the tags.",
+				description: "Opens the whole text the summarizer gets for this session, exactly as it is sent. Read-only.",
 			},
 			{
 				id: "__reqfull",
 				label: "View the summary request with the full conversation",
 				currentValue: firstRef ? firstRef.split("/").pop() ?? "?" : "no model",
 				values: ["open"],
-				description: "The same request as the row above, with the conversation region UNABRIDGED - every message of the region, tool calls and results included, exactly as the summarizer receives them. It is long: in a session full of code and logs this is a wall of text, which is why the digest version is the one on top.",
+				description: "The same request with the conversation region unabridged. Read-only.",
 			},
 			{
 				id: "__ext",
 				label: "View the default template",
 				currentValue: `${extActive ? "ACTIVE • " : ""}${DEFAULT_TEMPLATE_TEXT.split("\n").length} lines`,
 				values: ["open"],
-				description: "ENTER OPENS IT: the template built into the extension - fixed, the reference you can always go back to. Read-only. Ctrl+K saves its text as a new user template you can edit, Ctrl+A makes it the active template, Ctrl+Y copies it.",
+				description: "Opens the template built into the extension. Read-only; Ctrl+K saves it as a user template.",
 			},
 		];
 		for (const t of cfg.userTemplates) {
@@ -6465,7 +6465,7 @@ class UserTemplateMenu implements Component, Focusable {
 				// read differently on exactly the row you use (2026-10-07 report). One format for every row.
 				currentValue: `${!extActive && (t.name === activeName || t.text.trim() === active) ? "ACTIVE • " : ""}${t.text.split("\n").length} lines`,
 				values: ["open"],
-				description: "Enter opens it in the editor (Enter saves, Esc discards). Ctrl+P makes this the active template, Ctrl+K copies it under a new name, Ctrl+D deletes it after asking, Ctrl+Y puts its text on the clipboard.",
+				description: "Enter edits it (Enter saves, Esc discards). Ctrl+P makes it active, Ctrl+K copies it, Ctrl+D deletes it.",
 			});
 		}
 		this.items = items;
@@ -6692,7 +6692,7 @@ class TemplateMenu implements Component, Focusable {
 				label: "User templates",
 				currentValue: `${cfg.userTemplates.length} saved`,
 				values: ["open"],
-				description: "Your own templates, as many as you want, named by the extension ('User template #N'). Enter opens the list: Enter on a template opens it in the editor (Enter saves, Shift+Enter is a newline, Esc discards), Ctrl+N makes a new one and opens it, Ctrl+K duplicates the highlighted one under a new name, Ctrl+D deletes it after asking, Ctrl+A makes it the ACTIVE template, Ctrl+Y copies its text to the clipboard. The active template is a copy assigned from there - the previews below show what is being sent right now.",
+				description: "Your own templates. Enter opens the list; Enter on one opens it in the editor.",
 			},
 			// Two previews only (2026-10-07, on request): the template in use, and the built-in one. The
 			// old "preview the request a model gets" row showed the same text as the active preview, and the
@@ -6704,7 +6704,7 @@ class TemplateMenu implements Component, Focusable {
 				label: "Preview the active template:",
 				currentValue: "read-only",
 				values: ["preview"],
-				description: "ENTER OPENS IT: the template in use right now, word for word, as the summarizer reads it (the {TOKENS} are still tokens here - they are filled per model in the request). Esc closes it and brings this menu back on the same row.",
+				description: "Opens the template in use right now, word for word. Read-only.",
 			},
 			// 2026-10-07: "Keep a copy of this template" and "Restore the kept copy" removed on request -
 			// leftovers from before the library existed. Ctrl+A assigns a template as the active one, and
@@ -6789,7 +6789,7 @@ class CategoryPick implements Component, Focusable {
 				label: k.label,
 				currentValue: changedCount ? `${changedCount}/4 differ from the extension defaults` : "all match the extension defaults",
 				values: ["open"],
-				description: `The editable sentence for each level (verbatim / detailed / summary / brief) of how the summary keeps ${k.label.toLowerCase()}. Substituted into the template's {${k.token}} token. Enter opens the four sentences; the bottom two rows preview your user defaults and the extension defaults read-only.`,
+				description: `The sentence each level writes for ${k.label.toLowerCase()}, substituted into the template. Enter opens the four levels.`,
 			};
 		});
 		this.list = new SettingsList(
