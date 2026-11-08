@@ -6127,7 +6127,7 @@ class CategoryDescList implements Component, Focusable {
 				label: "Preview all user defaults",
 				currentValue: "read-only",
 				values: ["preview"],
-				description: "Your saved user defaults for this category, one per level. '(no user default saved)' means that slot falls back to the extension default.",
+				description: "Your saved user defaults for this category, one per level.",
 			},
 			{
 				id: "__previewExt",
@@ -7164,7 +7164,7 @@ class CompactionMenu implements Component, Focusable {
 				label: "No-think tag for local models:",
 				currentValue: cfg.noThinkMarker || "(empty)",
 				values: [EDIT_TEXT, "(empty)"],
-				description: "The tag a local model's summary request carries when its thinking is off, so the chat template does not re-open reasoning. A model's own No-think tag row overrides it.",
+				description: "The tag a local model's summary request carries when its thinking is off. A model can override it in its own options.",
 			},
 			// 2026-10-06: these settings used to sit behind a model list. They are ONE setting for every
 			// model in the try order, so they live here in the open. The models list keeps only what really
@@ -8909,7 +8909,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 			},
 			{
 				label: `Summary aim - now ${fmt(o.summaryAimTokens)} tok`,
-				hint: "THE SUMMARY AIM, in tokens - ONE setting for every model, changed here or on the Compaction settings board (2026-11-05: it used to be stored per model, which is how edits made while an unlisted model was active disappeared and the numbers looked reset). Free numeric entry.",
+				hint: "How long the summary should be, in tokens. One setting for every model.",
 				run: async () => {
 					const v = await askNumber(ctx, "Summary aim - tokens the summary should reach - default 22000", o.summaryAimTokens, 256, 1_000_000, "tokens");
 					if (v !== undefined) setModelOptions(ref, { summaryAimTokens: v });
@@ -8917,7 +8917,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 			},
 			{
 				label: `Summary min - now ${fmt(o.summaryMinTokens)} tok (absolute)`,
-				hint: "THE ACCEPTANCE FLOOR: a shorter summary is thrown away and the next model in the rotation is asked. Absolute tokens, whatever the model's window (default 4,096). ONE setting for every model, like the aim and the ceiling. Free numeric entry.",
+				hint: "The acceptance floor: a shorter summary is thrown away and the next model is asked.",
 				run: async () => {
 					const v = await askNumber(ctx, "Summary min \u2014 absolute tokens (default 4096)", o.summaryMinTokens, 0, 1_000_000, "tokens");
 					if (v !== undefined) setModelOptions(ref, { summaryMinTokens: v });
@@ -8925,7 +8925,7 @@ async function modelOptionsFallback(ctx: Ctx, ref: string, model: any): Promise<
 			},
 			{
 				label: `Summary max - now ${fmt(o.summaryMaxTokens)} tok (absolute)`,
-				hint: "THE ACCEPTANCE CEILING: a longer summary is thrown away too. Absolute tokens - a model cannot write a 100k-token summary however big its window, which is why these two limits are absolute tokens and not percents of the window (default 30,000). ONE setting for every model, like the aim and the floor. Free numeric entry.",
+				hint: "The acceptance ceiling: a longer summary is thrown away too.",
 				run: async () => {
 					const v = await askNumber(ctx, "Summary max \u2014 absolute tokens (default 30000)", o.summaryMaxTokens, 1, 1_000_000, "tokens");
 					if (v !== undefined) setModelOptions(ref, { summaryMaxTokens: v });
@@ -8994,7 +8994,7 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 		const rows: Row[] = [
 			{
 				label: `Compaction (this extension) - ${cfg.enabled ? "ON" : "OFF"}`,
-				hint: `Tried in this order until one writes a usable summary: ${rotationText(cfg, ctx)}. The automatic trigger is this extension's own check of the live context, and /compact works while this is off. pi running its own compaction is a separate setting in pi's own settings.json, which this menu never writes; see the row below it.`,
+				hint: `Tried in this order until one writes a usable summary: ${rotationText(cfg, ctx)}`,
 				run: () => {
 					const on = !loadConfig().enabled;
 					if (on && enableBlockedByOtherCompactor()) return; // another manager present: one at a time
@@ -9009,7 +9009,7 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 			},
 			{
 				label: `pi's own compaction (read-only) - ${readPiCompactionEnabled() ? "ENABLED in pi's settings" : "disabled in pi's settings"}`,
-				hint: "This menu never writes pi's settings. That flag only decides whether pi runs its own compaction with its own summariser on pi's own threshold check; it does not gate /compact, and it does not gate this extension's automatic compaction, which runs on this extension's own trigger with its own models. To change it, edit compaction.enabled in " + join(AGENT_DIR, "settings.json") + " by hand and /reload.",
+				hint: "pi's own compaction switch, in pi's settings.json. This menu does not change it; edit that file and reload pi.",
 				run: () => {
 					const f = join(AGENT_DIR, "settings.json");
 					ctx.ui?.notify?.(
@@ -9037,17 +9037,17 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 			},
 			{
 				label: `No-think tag - now ${cfg.noThinkMarker || "(empty)"}`,
-				hint: 'The default tag for local models when their thinking is off. Each model can override it in its options. Enter to type it; "ignore"/empty writes nothing.',
+				hint: "The default no-think tag for local models. Each model can override it. Enter to type it.",
 				run: () => editNoThinkTag(ctx),
 			},
 			{
 				label: `Summariser reads thinking - now ${cfg.thinkingToSummariser ? "ON" : "OFF"}`,
-				hint: "ON = the assistant's thinking text rides into the summary request, so the ledger can carry WHY a fix was chosen. OFF = thinking is left out of the summary input, which on a thinking-heavy session is the largest saving there is (a real 226,000-token context: 326,004 characters of material fell to 140,000 without thinking). Nothing is deleted either way - the session file keeps every word, and this model's own 'thought' keep level still decides how the summary WRITES about thinking.",
+				hint: "ON = the assistant's thinking text goes into the summary request. OFF = it is left out.",
 				run: () => update((c) => void (c.thinkingToSummariser = !c.thinkingToSummariser)),
 			},
 			{
 				label: `AUTO-ELISION - now ${cfg.elision.enabled ? "ON" : "OFF"} · compaction elision ${cfg.elision.compactEnabled ? "ON" : "OFF"} (from ${fmt(cfg.elision.stubFromChars)} chars, arg cap ${charCapLabel(cfg.elision.argCap)}, start ${cfg.elision.softPercent}%, protect ${fmt(cfg.elision.protectRecentTokens)} tok, stub tail ${charCapLabel(cfg.elision.stubTailChars)})`,
-				hint: "This row toggles AUTO-elision (the live session) only; compaction elision - what the summariser is allowed to read - has its own switch in the Elision settings submenu. OFF means MAKE NO NEW STUBS. The stubs already on the wire STAY on it: pi rebuilds every request from the raw originals, so dropping them would re-expand the context in one step (2026-11-06: 308,908 -> 404,734 tok, window overflow). The row below puts originals back, with a guard. Tune with: /compact-plus elision ...",
+				hint: "Toggles AUTO-elision in the live session only. Compaction elision has its own switch.",
 				run: () => {
 					update((c) => void (c.elision = { ...c.elision, enabled: !c.elision.enabled }));
 					resetElisionBreaker();
@@ -9055,7 +9055,7 @@ async function fallbackMenu(ctx: Ctx): Promise<void> {
 			},
 			{
 				label: "Release the applied stubs (put the raw originals back):",
-				hint: "The only route that discards stubs already on the wire, and it REFUSES when the released context would not fit in the window. A manual Elide now still works with auto-elision off, and stubbing can only ever shrink the wire.",
+				hint: "Puts the raw originals back on the wire. Refuses if the released context would not fit the window.",
 				run: () => {
 					const r = releaseAppliedStubs(ctx);
 					ctx.ui.notify(r.text, r.ok ? "info" : "warning");
