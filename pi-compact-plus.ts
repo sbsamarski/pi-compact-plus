@@ -9569,7 +9569,9 @@ function watcherTick(source: "timer" | "context" | "settled" = "timer", ctxArg?:
 			void landNoAbortHook(ctx, source)
 				.then((r) => {
 					if (r.ok) {
-						ctx.ui?.notify?.("COMPACTION · landed without stopping the turn - the next request carries the summary", "info");
+						// A queued summary prints its own line at the moment it lands, at the boundary; saying
+						// "landed" here would report it before pi has written it.
+						if (!r.queued) ctx.ui?.notify?.("COMPACTION · landed without stopping the turn - the next request carries the summary", "info");
 						return;
 					}
 					const note = String(r.note ?? "").slice(0, 160);
@@ -9747,7 +9749,7 @@ let lastCompactionDoneAtMs = 0;
  *  watcher is a top-level function and cannot see into that closure, so the landing hands itself to the
  *  module here - and if nothing ever assigned it (a rig that loads the file without installing it, or a
  *  future build where the code moved), the watcher simply uses pi's own path. */
-let landNoAbortHook: ((ctx: any, why: string) => Promise<{ ok: boolean; note?: string }>) | undefined;
+let landNoAbortHook: ((ctx: any, why: string) => Promise<{ ok: boolean; note?: string; queued?: boolean }>) | undefined;
 /** The "nothing left to summarise" notice is worth reading once per 15 minutes, not once a minute. */
 let lastNoOpNoticeAtMs = 0;
 /** The parked-and-the-room-is-running-out warning, throttled to once every ten minutes. */
@@ -9872,6 +9874,52 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	// A summary that landed without an interrupt is not believed by the running loop until pi rebuilds its
 	// message list. `pendingLandingReconcile` holds the one just written, waiting for that rebuild.
 	let pendingLandingReconcile: { atMs: number; line: number; window: number; before: number; source: string } | null = null;
+	// A WRITTEN SUMMARY WAITING FOR PI TO APPEND IT (2026-11-08, on request). pi draws the `[compaction]`
+	// block and rebuilds the running transcript only when IT appends the entry: the TUI acts on
+	// `entry_appended`, which pi emits from `_commitBoundaryDrafts()` and from its own compaction path.
+	// Our own `sessionManager.appendCompaction()` writes the file and tells nobody, which is why a summary
+	// that landed without an interrupt showed nothing on screen. So a quiet landing hands the summary to pi
+	// at the next boundary instead of appending it here.
+	let pendingCompactionDraft: {
+		summary: string; firstKeptEntryId: string; details: any; usage: any; why: string; atMs: number;
+		before: number; line: number; window: number; measured: number; summaryChars: number;
+	} | undefined;
+
+	/** Hand the waiting summary to pi as a boundary draft. Returns undefined when nothing waits, so every
+	 *  boundary handler can start with this and fall through to its own work. `continue: true` asks pi for
+	 *  one more request, which is what carries the work past the summary - and that request is the first one
+	 *  built from the compacted context. */
+	function takeCompactionDraft(chained: any[]): { entries: any[]; continue: boolean } | undefined {
+		const d = pendingCompactionDraft;
+		if (!d) return undefined;
+		pendingCompactionDraft = undefined;
+		lastCompactionDoneAtMs = Date.now();
+		pendingLandingReconcile = { atMs: Date.now(), line: d.line, window: d.window, before: d.before, source: d.why };
+		logLine(loadConfig(), {
+			event: "compaction_landed",
+			trigger: d.why === "menu" ? "manual" : "auto",
+			source: d.why,
+			measured: d.measured,
+			before: d.before,
+			summaryChars: d.summaryChars,
+			noAbort: true,
+			handoff: false,
+			via: "boundary draft",
+			queuedForMs: Date.now() - d.atMs,
+			note: "pi appended the summary at a boundary, so the block is drawn and the next request is built from it",
+		});
+		watcherCtx?.ui?.notify?.(
+			"COMPACTION LANDED · pi wrote the summary into the session at the boundary · the transcript shows it and the next request is built from it",
+			"info",
+		);
+		return {
+			entries: [
+				...(Array.isArray(chained) ? chained : []),
+				{ type: "compaction", summary: d.summary, firstKeptEntryId: d.firstKeptEntryId, ...(d.details ? { details: d.details } : {}), ...(d.usage ? { usage: d.usage } : {}) },
+			],
+			continue: true,
+		};
+	}
 	// THE REBUILD PI OWES THE SESSION AFTER A QUIET LANDING (found the evening of 2026-10-24).
 	// pi sends the model a message list it built when the run started, and it rebuilds that list -
 	// `_refreshFinalizedContext()` in pi's own code, reached through `_commitBoundaryDrafts()` - at a
@@ -9881,7 +9929,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	// reading the file, where the summary does exist - answered "nothing to compact" to every further
 	// attempt. Having any handler on this event is what makes pi rebuild at the settle boundary; this one
 	// also measures the truth afterwards, which is the only place the number means anything.
-	pi.on("agent_before_settle", () => {
+	pi.on("agent_before_settle", (event: any) => {
+		// A waiting summary lands here if no turn boundary came first. This is the last boundary pi will
+		// accept entries at, so a quiet compaction can never be written and then left out of the session.
+		const draftOut = takeCompactionDraft(Array.isArray((event as any)?.entries) ? (event as any).entries : []);
+		if (draftOut) return draftOut;
 		const wait = pendingLandingReconcile;
 		if (!wait) return undefined;
 		pendingLandingReconcile = null;
@@ -9901,6 +9953,24 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 		agentLoop.running = false;
 		agentLoop.lastSettledAtMs = Date.now();
 		if ((event as any)?.aborted) agentLoop.lastAbortAtMs = Date.now();
+		// A summary written for the boundary that never got one - the run was aborted just after it was
+		// written, or pi ended without another boundary - must not simply be lost: minutes of the GPU are in
+		// it. So at this final, notification-only boundary, if something still waits, it goes into the session
+		// directly. pi's block is not drawn that way, and the line on screen says so rather than pretending.
+		const leftover = pendingCompactionDraft;
+		if (leftover) {
+			pendingCompactionDraft = undefined;
+			try {
+				const smSettle: any = (ctx as any)?.sessionManager;
+				smSettle?.appendCompaction?.(leftover.summary, leftover.firstKeptEntryId, leftover.before, leftover.details ?? {}, true, leftover.usage);
+				lastCompactionDoneAtMs = Date.now();
+				pendingLandingReconcile = { atMs: Date.now(), line: leftover.line, window: leftover.window, before: leftover.before, source: leftover.why };
+				logLine(loadConfig(), { event: "compaction_landed", trigger: leftover.why === "menu" ? "manual" : "auto", source: leftover.why, measured: leftover.measured, before: leftover.before, via: "late direct append", queuedForMs: Date.now() - leftover.atMs, note: "no boundary came, so pi was not asked to append it; the summary is in the session, its block is not drawn" });
+				ctx?.ui?.notify?.("COMPACTION LANDED · no boundary came to hand it to pi, so it was written directly · open 'View the last compaction summary' to read it", "info");
+			} catch (err: any) {
+				logLine(loadConfig(), { event: "compaction_failed", error: String(err?.message ?? err).slice(0, 200), note: "a written summary could not be stored at the settle boundary either" });
+			}
+		}
 		// THE BEST MOMENT TO COMPACT IS THE SECOND THE TURN ENDS, and the five-second timer can miss it: a
 		// queued message starts the next turn inside that gap and the gate shuts again. So look 1.2 s after
 		// the loop settles - long enough for a follow-on turn to declare itself and be waited out, early
@@ -10133,6 +10203,11 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 	// minimum results and savings, the batch cap - and nothing is remembered between turns: an entry that
 	// already has a context edit is skipped, so the session file itself is the record of what was elided.
 	pi.on("turn_end", (event: any, ctx: any) => {
+		// A summary written to land without an interrupt goes in here, at the first boundary after it was
+		// written. It takes this boundary to itself: an elision sweep that was waiting simply gets the next
+		// one, because a sweep moving the cache break point right under a fresh summary is churn anyway.
+		const draftOut = takeCompactionDraft(Array.isArray(event?.entries) ? event.entries : []);
+		if (draftOut) return draftOut;
 		try {
 			const cfg = loadConfig();
 			const el = cfg.elision;
@@ -10270,7 +10345,7 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 
 	// LAND THE SUMMARY WITHOUT STOPPING THE TURN (2026-10-22, #43), when `landWithoutAbort` is on.
 	// The full reasoning: DESIGN.md -> ensureWatcherTimer #2
-	async function landCompactionNoAbort(ctx: any, why = "timer"): Promise<{ ok: boolean; note?: string }> {
+	async function landCompactionNoAbort(ctx: any, why = "timer"): Promise<{ ok: boolean; note?: string; queued?: boolean }> {
 		const cfg = loadConfig();
 		const sm: any = ctx?.sessionManager;
 		// `ctx` types the session manager as read-only; at runtime pi passes the real object
@@ -10379,6 +10454,38 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				note: answer?.cancel ? "the compaction was skipped or held, nothing was written" : "the summary came back without a cut point",
 			};
 		}
+		// WHICH DOOR APPENDS THE SUMMARY (2026-11-08, on request). While a run is going the summary is handed
+		// to pi at the next boundary: pi then draws the `[compaction]` block, rebuilds the message list it is
+		// sending, and - with `continue` - carries the work on from the short context. Appending it here would
+		// write the file, show nothing, and leave the running loop sending the long transcript it had already
+		// built (the 2026-10-24 case: 170k tokens went up the wire after a summary had landed). When NO run is
+		// going - the operator stopped the session with Escape and then pressed this row - there is no boundary
+		// to wait for, so it is appended here and the work is restarted with a CONTINUE message below.
+		if (agentLoop.running) {
+			pendingCompactionDraft = {
+				summary: String(c.summary),
+				firstKeptEntryId: String(c.firstKeptEntryId),
+				details: c.details,
+				usage: c.usage,
+				why,
+				atMs: Date.now(),
+				before: Number(preparation.tokensBefore ?? 0),
+				line: guardLine,
+				window: guardWindow,
+				measured: Number((lastLandingInfo as any)?.measured ?? 0),
+				summaryChars: String(c.summary).length,
+			};
+			logLine(loadConfig(), {
+				event: "compaction_written",
+				trigger: why === "menu" ? "manual" : "auto",
+				source: why,
+				before: Number(preparation.tokensBefore ?? 0),
+				summaryChars: String(c.summary).length,
+				note: "written, waiting for the next boundary so pi appends it, draws it and continues from it",
+			});
+			ctx?.ui?.notify?.("COMPACTION · the summary is written · it lands at the next turn boundary, where pi shows it and the session continues from it", "info");
+			return { ok: true, queued: true };
+		}
 		let entryId: string | undefined;
 		try {
 			entryId = sm.appendCompaction(c.summary, c.firstKeptEntryId, c.tokensBefore ?? 0, c.details ?? {}, true, c.usage);
@@ -10433,6 +10540,19 @@ export default function piCompactPlusExtension(pi: ExtensionAPI): void {
 				note: `the summary landed without an interrupt; only the report about it failed: ${String(reportErr?.message ?? reportErr).slice(0, 160)}`,
 			});
 			ctx?.ui?.notify?.(`COMPACTED · the summary stands · the report about it could not be built: ${String(reportErr?.message ?? reportErr).slice(0, 120)}`, "warning");
+		}
+		// START THE WORK AGAIN - only after a summary that actually landed, and only for the operator's own
+		// resume press while nothing was running (2026-11-08, on request). The word is CONTINUE in capitals so
+		// it is told apart from one the operator types, and nothing else is sent with it. A run that was going
+		// is served by `continue` on the boundary draft instead, so the work is never restarted twice.
+		if (why === "menu" && !agentLoop.running) {
+			const send: any = (ctx as any)?.sendUserMessage;
+			if (typeof send === "function") {
+				void Promise.resolve(send.call(ctx, "CONTINUE")).catch(() => undefined);
+				ctx?.ui?.notify?.("COMPACTION LANDED · CONTINUE sent, so the work picks up from the short history", "info");
+			} else {
+				ctx?.ui?.notify?.("The summary landed, but this pi takes no message from an extension - send anything to continue the work.", "warning");
+			}
 		}
 		return { ok: true };
 	}
